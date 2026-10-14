@@ -1,5 +1,6 @@
 """Tests for MeshCore inbound path: simulate_inbound, _on_message,
-make_text_event, metadata namespacing for inbound, and session _on_sdk_event.
+make_event/make_text_event, metadata namespacing for inbound, and
+session _on_sdk_event.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.session import MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.events import CanonicalEvent
+from medre.core.events.kinds import EventKind
 from medre_meshcore_tests.helpers.async_utils import wait_until
 
 
@@ -149,6 +151,42 @@ class TestFakeMeshCoreAdapterMakeTextEvent:
         adapter = FakeMeshCoreAdapter()
         event = adapter.make_text_event(channel=3)
         assert event.source_channel_id == "3"
+
+
+class TestFakeMeshCoreAdapterMakeEvent:
+    """make_event creates minimal canonical events (matrix-compatible)."""
+
+    def test_make_event_creates_canonical_event(self) -> None:
+        adapter = FakeMeshCoreAdapter()
+        event = adapter.make_event(text="ping")
+        assert isinstance(event, CanonicalEvent)
+        assert event.payload["body"] == "ping"
+
+    def test_make_event_passes_event_kind_through(self) -> None:
+        adapter = FakeMeshCoreAdapter()
+        event = adapter.make_event(text="ping", event_kind=EventKind.MESSAGE_TEXT)
+        assert event.event_kind == EventKind.MESSAGE_TEXT
+
+    def test_make_event_sets_configured_source_ids(self) -> None:
+        adapter = FakeMeshCoreAdapter(adapter_id="meshcore-1")
+        event = adapter.make_event(text="ping")
+        assert event.source_adapter == "meshcore-1"
+        assert event.source_transport_id == "meshcore-1"
+
+    def test_make_event_defaults_to_configured_channel(self) -> None:
+        adapter = FakeMeshCoreAdapter()
+        event = adapter.make_event(text="ping")
+        assert event.source_channel_id == "0"
+
+    def test_make_event_with_channel_override(self) -> None:
+        adapter = FakeMeshCoreAdapter()
+        event = adapter.make_event(text="ping", channel=3)
+        assert event.source_channel_id == "3"
+
+    def test_make_event_with_extra_payload(self) -> None:
+        adapter = FakeMeshCoreAdapter()
+        event = adapter.make_event(text="ping", custom_field="value")
+        assert event.payload["custom_field"] == "value"
 
 
 # ===================================================================
