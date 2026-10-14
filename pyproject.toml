@@ -1,0 +1,18 @@
+[project]
+name = "medre-adapter-meshcore"
+version = "0.1.0"
+description = "meshcore transport adapter for MEDRE"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+dependencies = ["medre>=0.1.0", 'meshcore==2.3.15']
+
+[project.entry-points."medre.adapters"]
+meshcore = "medre.adapters.meshcore.plugin:adapter_spec"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
