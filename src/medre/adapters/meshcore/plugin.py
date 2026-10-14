@@ -5,6 +5,7 @@ from medre.adapter_registry import AdapterSpec, DestinationSpec, SymbolRef
 
 def adapter_spec() -> AdapterSpec:
     return AdapterSpec(
+        sample_config=SymbolRef("medre.adapters.meshcore.sample", "sample_config"),
         destinations=(
             DestinationSpec(
                 "meshcore_contact",
