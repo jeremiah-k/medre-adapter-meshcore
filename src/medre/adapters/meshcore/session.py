@@ -961,7 +961,7 @@ class MeshCoreSession:
         """Create a real SDK client, connect, and subscribe to events."""
         if not HAS_MESHCORE:
             raise MeshCoreConnectionError(
-                "meshcore SDK not installed; pip install 'medre[meshcore]' "
+                "meshcore SDK not installed; pip install 'medre-adapter-meshcore' "
                 "or use connection_type='fake'"
             )
 

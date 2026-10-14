@@ -1,13 +1,24 @@
 """Declarative registration for the separately distributed adapter."""
 
-from medre.adapter_registry import AdapterSpec, SymbolRef
+from medre.adapter_registry import AdapterSpec, DestinationSpec, SymbolRef
 
 
 def adapter_spec() -> AdapterSpec:
     return AdapterSpec(
+        destinations=(
+            DestinationSpec(
+                "meshcore_contact",
+                SymbolRef(
+                    "medre.config.adapters.meshcore_destinations",
+                    "validate_destination",
+                ),
+            ),
+        ),
         transport="meshcore",
         config=SymbolRef("medre.config.adapters.meshcore", "MeshCoreConfig"),
-        runtime_config=SymbolRef("medre.config.model", "MeshCoreRuntimeConfig"),
+        runtime_config=SymbolRef(
+            "medre.config.adapters.meshcore_runtime", "MeshCoreRuntimeConfig"
+        ),
         adapter=SymbolRef("medre.adapters.meshcore.adapter", "MeshCoreAdapter"),
         fake_adapter=SymbolRef("medre.adapters.fakes.meshcore", "FakeMeshCoreAdapter"),
         renderer_factory=SymbolRef(
@@ -34,6 +45,5 @@ def adapter_spec() -> AdapterSpec:
             "serial_baudrate",
         ),
         support_secret_fields=("ble_pin",),
-        traits=frozenset({"radio"}),
         native_detection_priority=10,
     )
