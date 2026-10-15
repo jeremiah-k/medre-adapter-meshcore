@@ -84,7 +84,7 @@ from medre.core.supervision.diagnostic_contract import sanitize_diagnostic_mappi
 _MESHCORE_CAPS_BASE = AdapterCapabilities(
     text=True,
     title=False,
-    replies="unsupported",
+    replies="fallback",
     threads="fallback",
     reactions="unsupported",
     edits="unsupported",

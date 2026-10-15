@@ -83,10 +83,10 @@ class TestMeshCoreAdapterCapabilities:
 
         assert _FAKE_MESHCORE_CAPABILITIES.text is True
 
-    def test_capabilities_replies_unsupported(self) -> None:
+    def test_capabilities_replies_fallback(self) -> None:
         from medre.adapters.fakes.meshcore import _FAKE_MESHCORE_CAPABILITIES
 
-        assert _FAKE_MESHCORE_CAPABILITIES.replies == "unsupported"
+        assert _FAKE_MESHCORE_CAPABILITIES.replies == "fallback"
 
     def test_capabilities_reactions_unsupported(self) -> None:
         from medre.adapters.fakes.meshcore import _FAKE_MESHCORE_CAPABILITIES
@@ -1002,14 +1002,14 @@ class TestAdapterErrorMapping:
 
 
 class TestMeshCoreRelationCapabilitiesExplicit:
-    """MeshCore explicitly marks all relation capabilities as unsupported.
+    """MeshCore exposes reply/thread fallback while rejecting native mutations.
     Per W1 audit: MeshCore has no native threading, no native relation
     fields, no message dedup, no reply/reaction support."""
 
-    def test_real_adapter_replies_unsupported(self) -> None:
+    def test_real_adapter_replies_fallback(self) -> None:
         config = _make_config()
         adapter = MeshCoreAdapter(config)
-        assert adapter._capabilities.replies == "unsupported"
+        assert adapter._capabilities.replies == "fallback"
 
     def test_real_adapter_reactions_unsupported(self) -> None:
         config = _make_config()

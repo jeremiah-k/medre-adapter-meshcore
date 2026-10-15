@@ -70,6 +70,11 @@ callback injection uses `AdapterContract.publish_inbound(event)`.
 from broken/conflicting entry points. Basic CLI help and unrelated healthy
 providers remain available when another provider fails discovery.
 
+Replies and threads relay as inline fallback text. They do not emit native
+reply/thread operations. Delivery evidence identifies `fallback_text`;
+reactions, edits, and deletes remain unsupported and are suppressed.
+Fake adapters expose the same planning capabilities as their health reports.
+
 ## Tests
 
 Protocol and SDK contract tests live in this repository with adapter-owned

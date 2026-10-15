@@ -8,7 +8,8 @@ intended solely for use in unit and integration tests.
 Capabilities
 ------------
 * text messaging only
-* no replies, reactions, edits, deletes, attachments, or delivery receipts
+* inline reply/thread fallback; no native relation operations
+* no reactions, edits, deletes, attachments, or delivery receipts
 * packet classification and codec decoding (via real classifier + codec)
 
 Usage
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -129,7 +131,7 @@ class FakeMeshCoreClient:
 _FAKE_MESHCORE_CAPABILITIES = AdapterCapabilities(
     text=True,
     title=False,
-    replies="unsupported",
+    replies="fallback",
     threads="fallback",
     reactions="unsupported",
     edits="unsupported",
@@ -189,6 +191,9 @@ class FakeMeshCoreAdapter(AdapterContract):
                 adapter_id = "fake_meshcore"
             config = MeshCoreConfig(adapter_id=adapter_id)
         self._config = config
+        self._capabilities = replace(
+            _FAKE_MESHCORE_CAPABILITIES, max_text_bytes=config.max_text_bytes
+        )
         self.adapter_id = config.adapter_id
         self.ctx: AdapterContext | None = None
         self.delivered_payloads: list[RenderingResult] = []
@@ -274,7 +279,7 @@ class FakeMeshCoreAdapter(AdapterContract):
             platform=self.platform,
             role=self.role,
             version="0.1.0",
-            capabilities=_FAKE_MESHCORE_CAPABILITIES,
+            capabilities=self._capabilities,
             health="healthy" if self._started else "unknown",
         )
 
