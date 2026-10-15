@@ -6,6 +6,7 @@ and edge cases.
 from __future__ import annotations
 
 import pytest
+
 from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.config.adapters.meshcore_errors import MeshCoreConfigError
 
@@ -65,7 +66,7 @@ class TestMeshCoreConfigValid:
         assert config.identity is None
         assert config.pubkey is None
         assert config.node_config == {}
-        assert config.max_text_bytes == 512
+        assert config.max_text_bytes == 160
 
     def test_validate_returns_self_for_chaining(self) -> None:
         config = MeshCoreConfig(adapter_id="meshcore-1")
@@ -177,9 +178,9 @@ class TestMeshCoreConfigInvalid:
 class TestMeshCoreConfigMaxTextBytes:
     """max_text_bytes validation: type, range, and edge cases."""
 
-    def test_default_is_512(self) -> None:
+    def test_default_is_firmware_text_limit(self) -> None:
         config = MeshCoreConfig(adapter_id="meshcore-1")
-        assert config.max_text_bytes == 512
+        assert config.max_text_bytes == 160
 
     def test_custom_value_is_valid(self) -> None:
         config = MeshCoreConfig(adapter_id="meshcore-1", max_text_bytes=1024)

@@ -57,6 +57,8 @@ from medre.core.rendering.attribution import (
 from medre.core.rendering.relations import degrade_relations_inline
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
 
+from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
+
 if TYPE_CHECKING:
     from medre.config.adapters.meshcore import MeshCoreConfig
 
@@ -187,9 +189,14 @@ class MeshCoreRenderer:
         selected_max_text_bytes = (
             ctx.max_text_bytes
             if ctx.max_text_bytes is not None
-            else adapter_config.max_text_bytes
+            else group_text_budget(adapter_config.max_text_bytes)
         )
-        max_text_bytes = max(0, selected_max_text_bytes)
+        max_text_bytes = max(
+            0,
+            min(
+                selected_max_text_bytes, adapter_config.max_text_bytes, GROUP_TEXT_BYTES
+            ),
+        )
 
         text = str(event.payload.get("text", event.payload.get("body", "")))
 

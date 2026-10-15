@@ -10,12 +10,6 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 
 import pytest
-from medre.adapters.fakes.meshcore import FakeMeshCoreAdapter
-from medre.adapters.meshcore.adapter import MeshCoreAdapter
-from medre.adapters.meshcore.errors import MeshCoreConnectionError
-from medre.adapters.meshcore.event_shape import MESHCORE_NATIVE_SCHEMA_VERSION
-from medre.adapters.meshcore.session import MeshCoreSession
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.contracts.adapter import (
     AdapterContext,
     AdapterHandoffResult,
@@ -26,6 +20,13 @@ from medre.core.contracts.adapter import (
 from medre.core.events import CanonicalEvent, EventMetadata
 from medre.core.events.kinds import EventKind
 from medre.core.rendering.renderer import RenderingResult
+
+from medre.adapters.fakes.meshcore import FakeMeshCoreAdapter
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
+from medre.adapters.meshcore.errors import MeshCoreConnectionError
+from medre.adapters.meshcore.event_shape import MESHCORE_NATIVE_SCHEMA_VERSION
+from medre.adapters.meshcore.session import MeshCoreSession
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 
 def _make_config(**overrides) -> MeshCoreConfig:
@@ -113,10 +114,10 @@ class TestMeshCoreAdapterCapabilities:
 
         assert _FAKE_MESHCORE_CAPABILITIES.direct_messages is False
 
-    def test_capabilities_max_text_bytes_512(self) -> None:
+    def test_capabilities_max_text_bytes_conservative_wire_limit(self) -> None:
         from medre.adapters.fakes.meshcore import _FAKE_MESHCORE_CAPABILITIES
 
-        assert _FAKE_MESHCORE_CAPABILITIES.max_text_bytes == 512
+        assert _FAKE_MESHCORE_CAPABILITIES.max_text_bytes == 127
 
     def test_capabilities_max_text_chars_none(self) -> None:
         from medre.adapters.fakes.meshcore import _FAKE_MESHCORE_CAPABILITIES
@@ -148,18 +149,18 @@ class TestRealMeshCoreCapabilities:
         assert real_caps.max_text_bytes == _FAKE_MESHCORE_CAPABILITIES.max_text_bytes
         assert real_caps.max_text_chars == _FAKE_MESHCORE_CAPABILITIES.max_text_chars
 
-    def test_real_adapter_capabilities_default_512(self) -> None:
+    def test_real_adapter_capabilities_conservative_before_handshake(self) -> None:
         """Default config produces max_text_bytes=512 in capabilities."""
         config = _make_config()
         adapter = MeshCoreAdapter(config)
-        assert adapter._capabilities.max_text_bytes == 512
+        assert adapter._capabilities.max_text_bytes == 127
         assert adapter._capabilities.max_text_chars is None
 
-    def test_real_adapter_capabilities_custom_max_text_bytes(self) -> None:
+    def test_configured_budget_cannot_exceed_wire_limit(self) -> None:
         """Custom max_text_bytes in config propagates to capabilities."""
         config = _make_config(max_text_bytes=1024)
         adapter = MeshCoreAdapter(config)
-        assert adapter._capabilities.max_text_bytes == 1024
+        assert adapter._capabilities.max_text_bytes == 127
         assert adapter._capabilities.max_text_chars is None
 
     def test_real_adapter_capabilities_zero_max_text_bytes(self) -> None:

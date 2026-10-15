@@ -70,6 +70,13 @@ callback injection uses `AdapterContract.publish_inbound(event)`.
 from broken/conflicting entry points. Basic CLI help and unrelated healthy
 providers remain available when another provider fails discovery.
 
+MeshCore group messages have a 160-byte firmware text limit including the
+firmware's `<device name>: ` prefix. MEDRE reserves that space, uses a conservative
+127-byte budget before the device name is known, and refreshes the effective
+budget from the live handshake. `max_text_bytes` (default 160) is an operator
+upper bound. Rendering truncates safely at UTF-8 boundaries and records that
+fact; native sends that bypass this budget fail permanently before SDK I/O.
+
 Replies and threads relay as inline fallback text. They do not emit native
 reply/thread operations. Delivery evidence identifies `fallback_text`;
 reactions, edits, and deletes remain unsupported and are suppressed.

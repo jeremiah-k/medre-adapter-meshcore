@@ -39,6 +39,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal, Self
 
+from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES
 from medre.config.adapters.meshcore_errors import MeshCoreConfigError
 
 __all__ = ["MeshCoreConfig"]
@@ -103,8 +104,8 @@ class MeshCoreConfig:
         Opaque dict for future node-specific settings.  Must not
         contain secret/private-key fields.
     max_text_bytes:
-        Maximum UTF-8 byte budget for the final radio text after
-        rendering.  Default: ``512``.  ``0`` means the final text
+        Operator upper bound for final UTF-8 text after rendering.
+        Default: ``160``; firmware prefix overhead further reduces group text.  ``0`` means the final text
         renders as an empty string.  Must be a non-negative integer;
         ``bool`` is rejected explicitly.
     meshcore_relay_prefix:
@@ -131,7 +132,7 @@ class MeshCoreConfig:
     identity: str | None = None
     pubkey: str | None = None
     node_config: dict[str, object] = field(default_factory=dict)
-    max_text_bytes: int = 512
+    max_text_bytes: int = GROUP_TEXT_BYTES
     meshcore_relay_prefix: str = ""
 
     def validate(self) -> Self:

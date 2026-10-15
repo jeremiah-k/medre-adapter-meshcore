@@ -33,11 +33,6 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
-from medre.adapters.meshcore.adapter import increment_classifier_counters
-from medre.adapters.meshcore.codec import MeshCoreCodec
-from medre.adapters.meshcore.event_shape import MESHCORE_NATIVE_SCHEMA_VERSION
-from medre.adapters.meshcore.packet_classifier import MeshCorePacketClassifier
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.contracts.adapter import (
     AdapterCapabilities,
     AdapterContext,
@@ -52,6 +47,13 @@ from medre.core.events.canonical import CanonicalEvent
 from medre.core.events.kinds import EventKind
 from medre.core.events.metadata import EventMetadata
 from medre.core.rendering.renderer import RenderingResult
+
+from medre.adapters.meshcore.adapter import increment_classifier_counters
+from medre.adapters.meshcore.codec import MeshCoreCodec
+from medre.adapters.meshcore.event_shape import MESHCORE_NATIVE_SCHEMA_VERSION
+from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
+from medre.adapters.meshcore.packet_classifier import MeshCorePacketClassifier
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 _logger = logging.getLogger(__name__)
 
@@ -142,7 +144,7 @@ _FAKE_MESHCORE_CAPABILITIES = AdapterCapabilities(
     direct_messages=False,
     channels=True,
     mesh_routing=True,
-    max_text_bytes=512,
+    max_text_bytes=group_text_budget(GROUP_TEXT_BYTES),
     max_text_chars=None,
 )
 
@@ -192,7 +194,8 @@ class FakeMeshCoreAdapter(AdapterContract):
             config = MeshCoreConfig(adapter_id=adapter_id)
         self._config = config
         self._capabilities = replace(
-            _FAKE_MESHCORE_CAPABILITIES, max_text_bytes=config.max_text_bytes
+            _FAKE_MESHCORE_CAPABILITIES,
+            max_text_bytes=group_text_budget(config.max_text_bytes),
         )
         self.adapter_id = config.adapter_id
         self.ctx: AdapterContext | None = None

@@ -50,21 +50,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from medre.core.events.canonical import CanonicalEvent
 
-from medre.adapters.meshcore.codec import MeshCoreCodec
-from medre.adapters.meshcore.errors import (
-    MeshCoreSendError,
-)
-from medre.adapters.meshcore.event_shape import MESHCORE_NATIVE_SCHEMA_VERSION
-from medre.adapters.meshcore.identity import derive_message_identity
-from medre.adapters.meshcore.packet_classifier import (
-    REASON_ACK,
-    REASON_EMPTY_TEXT,
-    REASON_UNKNOWN,
-    ClassificationResult,
-    MeshCorePacketClassifier,
-)
-from medre.adapters.meshcore.session import MeshCoreSession
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.contracts.adapter import (
     AdapterCapabilities,
     AdapterContext,
@@ -77,6 +62,21 @@ from medre.core.contracts.adapter import (
 from medre.core.contracts.delivery import AdapterHandoffResult
 from medre.core.rendering.renderer import RenderingResult
 from medre.core.supervision.diagnostic_contract import sanitize_diagnostic_mapping
+
+from medre.adapters.meshcore.codec import MeshCoreCodec
+from medre.adapters.meshcore.errors import MeshCoreSendError
+from medre.adapters.meshcore.event_shape import MESHCORE_NATIVE_SCHEMA_VERSION
+from medre.adapters.meshcore.identity import derive_message_identity
+from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
+from medre.adapters.meshcore.packet_classifier import (
+    REASON_ACK,
+    REASON_EMPTY_TEXT,
+    REASON_UNKNOWN,
+    ClassificationResult,
+    MeshCorePacketClassifier,
+)
+from medre.adapters.meshcore.session import MeshCoreSession
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 # Base capabilities for the MeshCore transport adapter.
 # max_text_bytes is overridden per-instance from config.
@@ -98,7 +98,7 @@ _MESHCORE_CAPS_BASE = AdapterCapabilities(
     direct_messages=False,
     channels=True,
     mesh_routing=True,
-    max_text_bytes=512,
+    max_text_bytes=group_text_budget(GROUP_TEXT_BYTES),
     max_text_chars=None,
 )
 
@@ -200,11 +200,6 @@ class MeshCoreAdapter(AdapterContract):
         config.validate()
         self._config = config
         self.adapter_id = config.adapter_id
-        self._capabilities = dataclasses.replace(
-            _MESHCORE_CAPS_BASE,
-            max_text_bytes=config.max_text_bytes,
-            max_text_chars=None,
-        )
         self._codec = MeshCoreCodec(config.adapter_id, config)
         self._classifier = MeshCorePacketClassifier(config)
         self.ctx: AdapterContext | None = None
@@ -269,6 +264,18 @@ class MeshCoreAdapter(AdapterContract):
         self._classifier_packets_malformed = 0
         self._inbound_published = 0
         self._inbound_dedup.clear()
+
+    @property
+    def _capabilities(self) -> AdapterCapabilities:
+        """Use the current handshake name, including after a device rename."""
+        budget = (
+            self._session.group_text_budget
+            if self._session is not None
+            else group_text_budget(self._config.max_text_bytes)
+        )
+        return dataclasses.replace(
+            _MESHCORE_CAPS_BASE, max_text_bytes=budget, max_text_chars=None
+        )
 
     async def start(self, ctx: AdapterContext) -> None:
         """Connect to the MeshCore node and begin receiving events.

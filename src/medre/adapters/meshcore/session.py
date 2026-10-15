@@ -97,10 +97,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Protocol, cast
 
 from medre.adapters.meshcore.compat import HAS_MESHCORE
-from medre.adapters.meshcore.errors import (
-    MeshCoreConnectionError,
-    MeshCoreSendError,
-)
+from medre.adapters.meshcore.errors import MeshCoreConnectionError, MeshCoreSendError
+from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
 from medre.config.adapters.meshcore import MeshCoreConfig
 
 # ---------------------------------------------------------------------------
@@ -1461,6 +1459,11 @@ class MeshCoreSession:
     # Real outbound
     # ------------------------------------------------------------------
 
+    @property
+    def group_text_budget(self) -> int:
+        """Safe group payload bytes after the device's firmware-added prefix."""
+        return group_text_budget(self._config.max_text_bytes, self._diag.device_name)
+
     async def _send_real(
         self,
         contact_id: str,
@@ -1485,6 +1488,15 @@ class MeshCoreSession:
         """
         if self._meshcore is None:
             raise MeshCoreSendError("SDK client not initialised", transient=False)
+
+        limit = (
+            self.group_text_budget if channel_index is not None else GROUP_TEXT_BYTES
+        )
+        if len(text.encode("utf-8")) > limit:
+            raise MeshCoreSendError(
+                f"Text exceeds MeshCore wire budget of {limit} UTF-8 bytes",
+                transient=False,
+            )
 
         # Pacing + send are serialized so concurrent calls honour the
         # configured delay between transmissions.
