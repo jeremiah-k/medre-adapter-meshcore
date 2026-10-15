@@ -33,6 +33,26 @@ verify that the transport is discoverable. See
 [MEDRE adapter installation](https://github.com/jeremiah-k/medre/blob/main/docs/ops/adapter-installation.md)
 for mixed PyPI/Git/local installations and community adapters.
 
+## Getting started with MEDRE
+
+Follow the [MEDRE Getting Started guide](https://github.com/jeremiah-k/medre/blob/build/external-adapter-extraction/docs/ops/getting-started.md)
+for a Git-based uv deployment, a local fake smoke, concepts, and a first two-way
+route. The guide currently follows the pre-release extraction branch. Install
+core and every selected provider into the same locked deployment project;
+the provider's Git repository, import namespace, and package name are separate
+parts of ordinary Python packaging.
+
+Core owns routing, persistence, lifecycle, and delivery evidence. Each provider
+owns its platform connection and native semantics. Other independently maintained
+providers use the same discovery and event contracts; no core registration patch
+is needed. First-party siblings:
+[Matrix](https://github.com/jeremiah-k/medre-adapter-matrix),
+[Meshtastic](https://github.com/jeremiah-k/medre-adapter-meshtastic),
+[MeshCore](https://github.com/jeremiah-k/medre-adapter-meshcore), and
+[LXMF](https://github.com/jeremiah-k/medre-adapter-lxmf).
+Choose providers for the platforms in your deployment and review their own
+dependency and license requirements.
+
 ## Ownership and imports
 
 This distribution owns MeshCore's transport implementation, configuration models,
