@@ -18,6 +18,7 @@ These tests verify:
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from datetime import datetime, timezone
@@ -688,21 +689,20 @@ class TestMeshCoreCompatIsolation:
         import medre.config.adapters.meshcore as mod
 
         source = _read_module_source(mod)
-        import_lines = [
-            line.strip()
-            for line in source.splitlines()
-            if line.strip().startswith(("import ", "from "))
-        ]
-        for line in import_lines:
-            assert (
-                "compat" not in line
-            ), f"config must not import compat; found: {line!r}"
-            assert (
-                "meshcore" not in line.lower()
-                or "medre.adapters.meshcore.errors" in line
-                or "medre.config.adapters.errors" in line
-                or "medre.config.adapters.meshcore_errors" in line
-            ), f"config must not import meshcore SDK; found: {line!r}"
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            else:
+                continue
+            for module in modules:
+                assert "compat" not in module.split(
+                    "."
+                ), f"config must not import compat; found: {module!r}"
+                assert (
+                    module.split(".")[0] != "meshcore"
+                ), f"config must not import meshcore SDK; found: {module!r}"
 
     def test_classifier_does_not_import_compat(self) -> None:
         """packet_classifier is pure — no compat import."""
