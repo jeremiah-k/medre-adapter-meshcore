@@ -48,7 +48,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Mapping
 
-from medre.adapters._attribution_dispatch import project_source_fields
+from medre.adapters.metadata import project_source_fields
 from medre.core.events import CanonicalEvent
 from medre.core.rendering.attribution import (
     build_relay_attribution,
