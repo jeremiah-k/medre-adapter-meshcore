@@ -5,7 +5,7 @@ readme = "README.md"
 description = "meshcore transport adapter for MEDRE"
 requires-python = ">=3.11"
 classifiers = ["Typing :: Typed"]
-license = "GPL-3.0-or-later"
+license = "MIT"
 dependencies = ["medre>=0.1.0,<0.2.0", 'meshcore==2.3.15']
 
 [project.entry-points."medre.adapters"]
