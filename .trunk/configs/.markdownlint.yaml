@@ -1,0 +1,6 @@
+# Prettier friendly markdownlint config (all formatting rules disabled)
+extends: markdownlint/style/prettier
+# MD038 (spaces inside code spans) is disabled: the README quotes the
+# firmware prefix shape as `<device name>: ` whose trailing space inside
+# the span is the documented content, not a typo.
+MD038: false
