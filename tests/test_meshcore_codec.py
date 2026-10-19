@@ -72,9 +72,8 @@ def test_decode_channel_extracts_wire_sender_name_as_label() -> None:
     packet = _make_channel_packet(text="MEDRE-MC-B: hello from b")
     event = codec.decode(packet)
     assert _meshcore_data(event)["contact_label"] == "MEDRE-MC-B"
-    # Body stays verbatim — wire fidelity is pinned by the live pair
-    # suite; only the attribution label is derived.
-    assert event.payload["body"] == "MEDRE-MC-B: hello from b"
+    assert event.payload["body"] == "hello from b"
+    assert _meshcore_data(event)["wire_text"] == "MEDRE-MC-B: hello from b"
 
 
 def test_decode_channel_without_wire_name_keeps_label_none() -> None:
@@ -313,3 +312,35 @@ def test_identity_deterministic_across_codec_instances() -> None:
         first.source_native_ref.native_message_id
         == second.source_native_ref.native_message_id
     )
+
+
+@pytest.mark.parametrize(
+    "body", ["hello", "  indented café ✓", "line one\nline two", "Alice: literal body"]
+)
+def test_channel_normalization_preserves_user_text_and_wire_identity(body: str) -> None:
+    """Separate only the firmware header while retaining lossless native text."""
+    from medre.adapters.meshcore.identity import derive_message_identity
+
+    wire = "MEDRE-MC-B: " + body
+    packet = _make_channel_packet(text=wire)
+    event = MeshCoreCodec("meshcore-1", _make_config()).decode(packet)
+    assert event.payload["body"] == body
+    assert _meshcore_data(event)["wire_text"] == wire
+    assert event.source_native_ref.native_message_id == derive_message_identity(
+        sender_id="chan_sender",
+        channel_index=0,
+        sender_timestamp=42,
+        txt_type=0,
+        text=wire,
+        is_direct_message=False,
+    )
+
+
+def test_dm_colon_prefix_stays_in_user_body() -> None:
+    """Direct messages carry identity separately and never strip body prefixes."""
+    wire = "Alice: quoted text"
+    event = MeshCoreCodec("meshcore-1", _make_config()).decode(
+        _make_contact_packet(text=wire)
+    )
+    assert event.payload["body"] == wire
+    assert "wire_text" not in _meshcore_data(event)

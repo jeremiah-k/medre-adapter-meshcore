@@ -25,9 +25,10 @@ class _MeshCoreNativeEvent:
     contact_label: str | None
     contact_short_label: str | None
     classification: dict[str, object]
+    wire_text: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        data: dict[str, object] = {
             "schema_version": self.schema_version,
             "packet_id": self.packet_id,
             "sender_id": self.sender_id,
@@ -39,6 +40,9 @@ class _MeshCoreNativeEvent:
             "contact_short_label": self.contact_short_label,
             "classification": dict(self.classification),
         }
+        if self.wire_text is not None:
+            data["wire_text"] = self.wire_text
+        return data
 
 
 def build_meshcore_native_metadata(
@@ -52,6 +56,7 @@ def build_meshcore_native_metadata(
     contact_label: str | None,
     contact_short_label: str | None,
     classification: dict[str, object],
+    wire_text: str | None = None,
 ) -> dict[str, object]:
     """Build the sole supported MeshCore CanonicalEvent native shape."""
     event = _MeshCoreNativeEvent(
@@ -65,6 +70,7 @@ def build_meshcore_native_metadata(
         contact_label=contact_label,
         contact_short_label=contact_short_label,
         classification=classification,
+        wire_text=wire_text,
     )
     return {MESHCORE_NATIVE_NAMESPACE: event.to_dict()}
 

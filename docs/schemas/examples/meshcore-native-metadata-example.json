@@ -15,6 +15,7 @@
       "reason": "channel_message",
       "is_direct_message": false,
       "routeable": true
-    }
+    },
+    "wire_text": "Field Node: hello channel"
   }
 }

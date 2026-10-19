@@ -127,6 +127,16 @@ class MeshCoreCodec(AdapterCodec):
 
         # Build payload
         payload: dict[str, object] = {"body": text}
+        wire_text: str | None = None
+        if not classification.is_direct_message:
+            match = _WIRE_SENDER_NAME_RE.match(text)
+            if match is not None:
+                # Remove exactly the firmware's single separator space, not
+                # whitespace authored at the start of the actual message.
+                header = match.group(1) + ": "
+                if text.startswith(header):
+                    payload["body"] = text[len(header) :]
+                    wire_text = text
 
         # Source native ref: MeshCore provides no native message ID
         # (see identity.py for the SDK/firmware evidence).  The durable
@@ -172,6 +182,7 @@ class MeshCoreCodec(AdapterCodec):
                 is_direct_message=classification.is_direct_message,
                 contact_label=contact_label,
                 contact_short_label=contact_short_label,
+                wire_text=wire_text,
                 classification={
                     "action": classification.action,
                     "category": classification.category,
