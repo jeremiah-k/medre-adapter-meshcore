@@ -31,7 +31,7 @@
         "classification"
       ],
       "properties": {
-        "schema_version": { "const": 1 },
+        "schema_version": { "const": 2 },
         "packet_id": { "$ref": "#/$defs/Scalar" },
         "sender_id": { "type": "string" },
         "channel": { "type": ["integer", "null"], "minimum": 0 },
@@ -40,6 +40,10 @@
         "is_direct_message": { "type": "boolean" },
         "contact_label": { "type": ["string", "null"] },
         "contact_short_label": { "type": ["string", "null"] },
+        "wire_text": {
+          "type": "string",
+          "description": "Original channel text when the firmware sender header is separated from the canonical body."
+        },
         "classification": {
           "type": "object",
           "additionalProperties": false,

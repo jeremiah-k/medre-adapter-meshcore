@@ -132,9 +132,22 @@ class TestMeshCoreSessionLifecycle:
         await session.stop()
         assert session.connected is False
 
-    async def test_non_fake_raises_without_sdk(self) -> None:
-        """Non-fake mode raises MeshCoreConnectionError without SDK."""
-        config = _make_config(connection_type="tcp", host="1.2.3.4")
+    async def test_non_fake_raises_without_sdk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing SDK fails identically when the test host has it installed."""
+        monkeypatch.setattr("medre.adapters.meshcore.session.HAS_MESHCORE", False)
+
+        def unexpected_import(name: str):
+            if name == "meshcore":
+                raise AssertionError("missing-SDK guard bypassed")
+            return original_import(name)
+
+        from medre.adapters.meshcore import session as sdk_session
+
+        original_import = sdk_session.importlib.import_module
+        monkeypatch.setattr(sdk_session.importlib, "import_module", unexpected_import)
+        config = _make_config(connection_type="tcp", host="127.0.0.1")
         session = MeshCoreSession(config, "test-1")
 
         async def noop(pkt: dict) -> None:

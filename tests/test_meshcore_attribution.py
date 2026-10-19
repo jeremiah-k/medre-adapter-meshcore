@@ -166,7 +166,7 @@ def test_contact_label_projects_to_sender_label() -> None:
             "contact_label": "EA1ABC",
         }
     )
-    assert result["source_sender_label"] == "EA1ABC"
+    assert result["source_sender_label"] == "EA1ABC (unverified)"
     assert result["source_sender_id"] == "a1b2c3"
 
 
@@ -179,8 +179,8 @@ def test_contact_label_short_derived_from_first_token() -> None:
             "contact_label": "Base Station Alpha",
         }
     )
-    assert result["source_sender_label"] == "Base Station Alpha"
-    assert result["source_sender_short_label"] == "Base"
+    assert result["source_sender_label"] == "Base Station Alpha (unverified)"
+    assert result["source_sender_short_label"] == "Base (unverified)"
 
 
 def test_contact_label_single_word_short_equals_label() -> None:
@@ -192,7 +192,7 @@ def test_contact_label_single_word_short_equals_label() -> None:
             "contact_label": "EA1ABC",
         }
     )
-    assert result["source_sender_short_label"] == "EA1ABC"
+    assert result["source_sender_short_label"] == "EA1ABC (unverified)"
 
 
 def test_explicit_contact_short_label_preferred() -> None:
@@ -205,8 +205,8 @@ def test_explicit_contact_short_label_preferred() -> None:
             "contact_short_label": "BASE",
         }
     )
-    assert result["source_sender_label"] == "Base Station"
-    assert result["source_sender_short_label"] == "BASE"
+    assert result["source_sender_label"] == "Base Station (unverified)"
+    assert result["source_sender_short_label"] == "BASE (unverified)"
 
 
 def test_contact_label_empty_string_treated_as_absent() -> None:
@@ -232,8 +232,8 @@ def test_contact_short_label_empty_falls_back_to_compact() -> None:
             "contact_short_label": "",
         }
     )
-    assert result["source_sender_label"] == "Node One"
-    assert result["source_sender_short_label"] == "Node"
+    assert result["source_sender_label"] == "Node One (unverified)"
+    assert result["source_sender_short_label"] == "Node (unverified)"
 
 
 def test_non_string_contact_label_not_coerced() -> None:
@@ -307,7 +307,7 @@ def test_whitespace_contact_label_trimmed() -> None:
             "contact_label": "  Alice  ",
         }
     )
-    assert result["source_sender_label"] == "Alice"
+    assert result["source_sender_label"] == "Alice (unverified)"
 
 
 def test_none_contact_label_is_none() -> None:
@@ -453,7 +453,7 @@ def test_projection_sender_label_in_prefix_with_contact() -> None:
     )
     attr = RelayAttribution(source_platform="meshcore", **projected)
     result = format_relay_prefix("[MC] {sender}: ", attr)
-    assert result.rendered_prefix == "[MC] EA1ABC: "
+    assert result.rendered_prefix == "[MC] EA1ABC (unverified): "
     assert result.formatting_error is None
 
 
@@ -477,4 +477,4 @@ def test_projection_sender_id_shows_pubkey_prefix() -> None:
     )
     attr = RelayAttribution(source_platform="meshcore", **projected)
     result = format_relay_prefix("{sender_id} ({sender}): ", attr)
-    assert result.rendered_prefix == "deadbeef (Alice): "
+    assert result.rendered_prefix == "deadbeef (Alice (unverified)): "

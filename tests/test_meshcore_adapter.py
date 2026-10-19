@@ -276,9 +276,22 @@ class TestMeshCoreAdapterLifecycle:
         info = await adapter.health_check()
         assert info.health == "unknown"
 
-    async def test_non_fake_raises_connection_error(self, make_adapter_context) -> None:
-        """Non-fake connection raises MeshCoreConnectionError."""
-        config = _make_config(connection_type="tcp", host="1.2.3.4")
+    async def test_non_fake_raises_connection_error(
+        self, make_adapter_context, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing SDK fails without attempting a network connection."""
+        monkeypatch.setattr("medre.adapters.meshcore.session.HAS_MESHCORE", False)
+
+        def unexpected_import(name: str):
+            if name == "meshcore":
+                raise AssertionError("missing-SDK guard bypassed")
+            return original_import(name)
+
+        from medre.adapters.meshcore import session as sdk_session
+
+        original_import = sdk_session.importlib.import_module
+        monkeypatch.setattr(sdk_session.importlib, "import_module", unexpected_import)
+        config = _make_config(connection_type="tcp", host="127.0.0.1")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("meshcore-1")
         with pytest.raises(MeshCoreConnectionError):
@@ -598,7 +611,7 @@ class TestHonestDeliverySemantics:
         self, make_adapter_context
     ) -> None:
         """Real adapter with mocked session returns local_accepted metadata."""
-        config = _make_config(connection_type="tcp", host="1.2.3.4")
+        config = _make_config(connection_type="tcp", host="127.0.0.1")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("meshcore-1")
 
@@ -737,7 +750,7 @@ class TestMalformedSDKResponse:
         self, make_adapter_context
     ) -> tuple["MeshCoreAdapter", "MeshCoreSession"]:
         """Helper: create a real adapter with an injected fake session."""
-        config = _make_config(connection_type="tcp", host="1.2.3.4")
+        config = _make_config(connection_type="tcp", host="127.0.0.1")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("meshcore-1")
 
@@ -796,7 +809,7 @@ class TestAdapterErrorMapping:
     ) -> tuple[MeshCoreAdapter, MeshCoreSession]:
         """Create a real adapter with an injected fake session for error testing."""
 
-        config = _make_config(connection_type="tcp", host="1.2.3.4")
+        config = _make_config(connection_type="tcp", host="127.0.0.1")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("meshcore-1")
 
@@ -1098,7 +1111,7 @@ class TestMeshCoreDeliveryMetadataJSONSafe:
         ACK correlation — NOT a durable protocol-level message ID."""
         from unittest.mock import AsyncMock
 
-        config = _make_config(connection_type="tcp", host="1.2.3.4")
+        config = _make_config(connection_type="tcp", host="127.0.0.1")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("meshcore-1")
 
