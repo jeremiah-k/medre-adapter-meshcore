@@ -292,10 +292,10 @@ class TestMetadataNamespacingAndRedaction:
         event = inbound_collector.events[0]
         data = event.metadata.native.data
         # The native envelope carries a single ``meshcore`` namespace whose
-        # value is a versioned schema-1 dict.
+        # value is a versioned schema-2 dict.
         assert set(data.keys()) == {"meshcore"}
         mesh = data["meshcore"]
-        assert mesh["schema_version"] == 1
+        assert mesh["schema_version"] == 2
         assert mesh["channel"] == 2
         assert mesh["is_direct_message"] is False
 
@@ -314,7 +314,7 @@ class TestMetadataNamespacingAndRedaction:
         data = event.metadata.native.data
         assert set(data.keys()) == {"meshcore"}
         mesh = data["meshcore"]
-        assert mesh["schema_version"] == 1
+        assert mesh["schema_version"] == 2
         assert mesh["is_direct_message"] is True
 
     async def test_diagnostics_no_raw_metadata(self) -> None:

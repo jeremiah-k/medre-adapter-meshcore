@@ -281,6 +281,16 @@ class TestMeshCoreAdapterLifecycle:
     ) -> None:
         """A missing SDK fails without attempting a network connection."""
         monkeypatch.setattr("medre.adapters.meshcore.session.HAS_MESHCORE", False)
+
+        def unexpected_import(name: str):
+            if name == "meshcore":
+                raise AssertionError("missing-SDK guard bypassed")
+            return original_import(name)
+
+        from medre.adapters.meshcore import session as sdk_session
+
+        original_import = sdk_session.importlib.import_module
+        monkeypatch.setattr(sdk_session.importlib, "import_module", unexpected_import)
         config = _make_config(connection_type="tcp", host="127.0.0.1")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("meshcore-1")

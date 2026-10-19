@@ -169,7 +169,9 @@ class MeshCoreCodec(AdapterCodec):
         # prefixes like "{sender}/{origin_label}: " render the sender
         # instead of an empty field.  DMs carry real identity and are
         # excluded; an explicitly resolved contact label always wins.
-        if contact_label is None and not classification.is_direct_message:
+        if not classification.is_direct_message and (
+            not isinstance(contact_label, str) or not contact_label.strip()
+        ):
             contact_label = _wire_sender_name(text)
 
         native_meta = NativeMetadata(
@@ -214,11 +216,9 @@ class MeshCoreCodec(AdapterCodec):
 
 # MeshCore firmware wire convention for group texts: the sending node's
 # advertised name is prepended as "<name>: <text>" (channel messages carry
-# no protocol-level sender identity).  The name charset mirrors advertised
-# node names (letters, digits, spaces, and common separators); the
-# remainder must be non-empty.  A leading alnum character and a max length
-# keep ordinary sentences without the separator from matching.
-_WIRE_SENDER_NAME_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9 ._@\\/-]{0,30}):\s+\S")
+# no authenticated sender identity). Accept Unicode letters/digits and the
+# firmware's literal colon-space separator only. The body may be multiline.
+_WIRE_SENDER_NAME_RE = re.compile(r"^([^\W_][\w .@/-]{0,30}): (.+)$", re.DOTALL)
 
 
 def _wire_sender_name(text: str) -> str | None:

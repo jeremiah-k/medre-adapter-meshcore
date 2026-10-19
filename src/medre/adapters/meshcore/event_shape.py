@@ -10,7 +10,7 @@ from medre.adapters.metadata import current_namespace as _current_namespace
 from medre.adapters.metadata import versioned_namespace as _versioned_namespace
 
 MESHCORE_NATIVE_NAMESPACE = "meshcore"
-MESHCORE_NATIVE_SCHEMA_VERSION = 1
+MESHCORE_NATIVE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)

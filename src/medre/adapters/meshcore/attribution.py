@@ -48,6 +48,13 @@ def project_meshcore_attribution(
     contact_short_label = _contact_label_str(meshcore.get("contact_short_label"))
     sender_label = contact_label
     sender_short_label = contact_short_label or _first_token(contact_label)
+    if meshcore.get("is_direct_message") is False:
+        # Channel packets carry a sender *claim* in their text, not an
+        # authenticated sender identity. Never present it as trusted.
+        if sender_label is not None:
+            sender_label = f"{sender_label} (unverified)"
+        if sender_short_label is not None:
+            sender_short_label = f"{sender_short_label} (unverified)"
 
     return {
         "source_sender_id": sender_id,

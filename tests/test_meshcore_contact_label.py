@@ -310,7 +310,7 @@ def test_renderer_sender_shows_contact_label() -> None:
     projected = project_meshcore_attribution(
         {
             "meshcore": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "pubkey_prefix": "a1b2c3",
                 "channel": 0,
                 "packet_id": 42,
@@ -333,7 +333,7 @@ def test_renderer_sender_empty_without_contact() -> None:
     projected = project_meshcore_attribution(
         {
             "meshcore": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "pubkey_prefix": "a1b2c3",
                 "channel": 0,
             },
@@ -353,7 +353,7 @@ def test_renderer_sender_id_shows_pubkey_prefix() -> None:
     projected = project_meshcore_attribution(
         {
             "meshcore": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "pubkey_prefix": "deadbeef",
                 "channel": 0,
                 "contact_label": "Alice",
@@ -370,7 +370,7 @@ def test_renderer_sender_short_shows_first_token() -> None:
     projected = project_meshcore_attribution(
         {
             "meshcore": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "pubkey_prefix": "pk",
                 "channel": 0,
                 "contact_label": "Base Station Alpha",
@@ -387,7 +387,7 @@ def test_renderer_combined_sender_and_sender_id() -> None:
     projected = project_meshcore_attribution(
         {
             "meshcore": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "pubkey_prefix": "aabbcc",
                 "channel": 1,
                 "contact_label": "Node1",

@@ -137,6 +137,16 @@ class TestMeshCoreSessionLifecycle:
     ) -> None:
         """A missing SDK fails identically when the test host has it installed."""
         monkeypatch.setattr("medre.adapters.meshcore.session.HAS_MESHCORE", False)
+
+        def unexpected_import(name: str):
+            if name == "meshcore":
+                raise AssertionError("missing-SDK guard bypassed")
+            return original_import(name)
+
+        from medre.adapters.meshcore import session as sdk_session
+
+        original_import = sdk_session.importlib.import_module
+        monkeypatch.setattr(sdk_session.importlib, "import_module", unexpected_import)
         config = _make_config(connection_type="tcp", host="127.0.0.1")
         session = MeshCoreSession(config, "test-1")
 

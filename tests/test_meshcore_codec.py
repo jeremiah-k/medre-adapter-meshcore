@@ -76,6 +76,52 @@ def test_decode_channel_extracts_wire_sender_name_as_label() -> None:
     assert _meshcore_data(event)["wire_text"] == "MEDRE-MC-B: hello from b"
 
 
+def test_channel_unicode_wire_sender_and_unverified_attribution() -> None:
+    from medre.adapters.meshcore.attribution import project_meshcore_attribution
+
+    event = MeshCoreCodec("meshcore-1", _make_config()).decode(
+        _make_channel_packet(text="Élodie: bonjour café")
+    )
+    assert event.payload["body"] == "bonjour café"
+    native = _meshcore_data(event)
+    assert native["schema_version"] == 2
+    assert native["wire_text"] == "Élodie: bonjour café"
+    assert native["contact_label"] == "Élodie"
+    projected = project_meshcore_attribution(event.metadata.native.data)
+    assert projected["source_sender_label"] == "Élodie (unverified)"
+    assert projected["source_sender_short_label"] == "Élodie (unverified)"
+
+
+def test_even_known_contact_labels_on_channels_are_unverified() -> None:
+    from medre.adapters.meshcore.attribution import project_meshcore_attribution
+
+    event = MeshCoreCodec("meshcore-1", _make_config()).decode(
+        _make_channel_packet(text="plain channel text"), contact_label="Known Contact"
+    )
+    projected = project_meshcore_attribution(event.metadata.native.data)
+    assert projected["source_sender_label"] == "Known Contact (unverified)"
+    assert projected["source_sender_short_label"] == "Known (unverified)"
+
+
+@pytest.mark.parametrize("sep", ["\t", "\n"])
+def test_ambiguous_channel_colon_whitespace_is_not_stripped(sep: str) -> None:
+    raw = "Alice:" + sep + "body"
+    event = MeshCoreCodec("meshcore-1", _make_config()).decode(
+        _make_channel_packet(text=raw)
+    )
+    assert event.payload["body"] == raw
+    assert _meshcore_data(event)["contact_label"] is None
+    assert "wire_text" not in _meshcore_data(event)
+
+
+def test_channel_blank_contact_label_uses_wire_sender() -> None:
+    event = MeshCoreCodec("meshcore-1", _make_config()).decode(
+        _make_channel_packet(text="Alice: hello"), contact_label="   "
+    )
+    assert event.payload["body"] == "hello"
+    assert _meshcore_data(event)["contact_label"] == "Alice"
+
+
 def test_decode_channel_without_wire_name_keeps_label_none() -> None:
     """Texts that do not follow the "<name>: " convention stay None."""
     codec = MeshCoreCodec("meshcore-1", _make_config())
