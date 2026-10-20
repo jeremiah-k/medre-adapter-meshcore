@@ -170,6 +170,16 @@ class _SessionDiagnostics:
     last_contact_update_time: datetime | None = None
 
 
+class _MeshCoreFactory(Protocol):
+    """The SDK class constructor and TCP factory used by this session."""
+
+    def __call__(self, connection: Any, *, auto_reconnect: bool) -> Any: ...
+
+    async def create_tcp(
+        self, host: str, port: int, *, auto_reconnect: bool
+    ) -> Any: ...
+
+
 class _MeshCoreModule(Protocol):
     """Structural type for the optional ``meshcore`` SDK package.
 
@@ -187,7 +197,7 @@ class _MeshCoreModule(Protocol):
     deasserted; the serial factory is deliberately not consumed.
     """
 
-    MeshCore: type
+    MeshCore: _MeshCoreFactory
     SerialConnection: type
     EventType: Any
 
@@ -286,7 +296,7 @@ class MeshCoreSession:
         # Lifecycle guards.
         self._started: bool = False
         self._stop_requested: bool = False
-        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
 
         # Send serialization: ensures pacing sleeps are not bypassed when
         # multiple send_text() calls overlap via pipeline fan-out.
@@ -736,7 +746,7 @@ class MeshCoreSession:
         binary and failures are best-effort no-ops.
         """
         try:
-            from bleak import BleakClient  # type: ignore[import-untyped]
+            from bleak import BleakClient
 
             stale = BleakClient(address, timeout=3.0)
             self._logger.debug(
@@ -822,7 +832,7 @@ class MeshCoreSession:
             pass  # best-effort reap
 
     @staticmethod
-    def _consume_cleanup_task_result(task: asyncio.Future[object]) -> None:
+    def _consume_cleanup_task_result(task: asyncio.Future[Any]) -> None:
         """Own a detached best-effort cleanup task's terminal result."""
         try:
             task.exception()
@@ -851,7 +861,7 @@ class MeshCoreSession:
         Returns the discovered device object, or ``None`` on failure.
         """
         try:
-            from bleak import BleakScanner  # type: ignore[import-untyped]
+            from bleak import BleakScanner
 
             def _match(d: object, adv: object) -> bool:
                 d_addr: str = getattr(d, "address", "")
@@ -862,7 +872,10 @@ class MeshCoreSession:
                     return True
                 return False
 
-            return await BleakScanner.find_device_by_filter(_match, timeout=5.0)
+            device: object = await BleakScanner.find_device_by_filter(
+                _match, timeout=5.0
+            )
+            return device
         except Exception:
             return None
 
@@ -1302,7 +1315,7 @@ class MeshCoreSession:
                 exc,
             )
 
-    def _log_task_exception(self, task: asyncio.Task) -> None:
+    def _log_task_exception(self, task: asyncio.Task[Any]) -> None:
         """Done callback for fire-and-forget tasks — logs exceptions
         to prevent 'Task exception was never retrieved'."""
         try:

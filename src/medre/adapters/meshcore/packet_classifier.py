@@ -143,7 +143,6 @@ class MeshCorePacketClassifier:
 
         is_direct = msg_type == "PRIV"
         is_ack = code is not None
-        is_text = text is not None
 
         # --- ACK packets (code field present) → ignore --------------------
         if is_ack:
@@ -161,7 +160,7 @@ class MeshCorePacketClassifier:
             )
 
         # --- Text packets ------------------------------------------------
-        if is_text:
+        if text is not None:
             # Determine category from type; keep type distinction for empty.
             if is_direct:
                 category: ClassificationCategory = "direct_message"
