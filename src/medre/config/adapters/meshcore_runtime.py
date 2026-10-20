@@ -1,7 +1,7 @@
 """Adapter-owned runtime configuration wrapper for meshcore."""
 
 from dataclasses import dataclass
-from typing import Self
+from typing import Any, Self
 
 from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.config.model import GenericAdapterRuntimeConfig
@@ -14,7 +14,7 @@ class MeshCoreRuntimeConfig(GenericAdapterRuntimeConfig):
     config: MeshCoreConfig | None = None
 
     @classmethod
-    def from_dict(cls, instance_name: str, data: dict) -> Self:
+    def from_dict(cls, instance_name: str, data: dict[str, Any]) -> Self:
         return cls.from_transport_dict(
             instance_name, data, transport="meshcore", config_cls=MeshCoreConfig
         )

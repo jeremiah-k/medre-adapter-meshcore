@@ -204,7 +204,7 @@ class MeshCoreAdapter(AdapterContract):
         self._classifier = MeshCorePacketClassifier(config)
         self.ctx: AdapterContext | None = None
         self._started: bool = False
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
         # Aggregate in-memory classifier counters (reset on restart).
         self._classifier_packets_seen: int = 0
