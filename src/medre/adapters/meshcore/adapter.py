@@ -313,12 +313,14 @@ class MeshCoreAdapter(AdapterContract):
             logger=ctx.logger,
         )
         try:
-            await self._session.start(message_callback=self._on_message)
+            await self._session.start(
+                message_callback=self._on_message, recover_on_failure=True
+            )
         except asyncio.CancelledError:
             # Clear adapter-owned fields synchronously before re-raise.
-            self._session = None
+            # Retain the partial owner for core's bounded startup rollback.
+            # Clearing it here would make stop() unable to retire its tasks.
             self._started = False
-            self.ctx = None
             self._start_time = None
             raise
         except Exception:
@@ -353,7 +355,7 @@ class MeshCoreAdapter(AdapterContract):
         timeout:
             Maximum seconds to wait for a clean shutdown.
         """
-        if not self._started:
+        if not self._started and self._session is None:
             return
 
         # Gate callbacks immediately — prevents race between drain completing

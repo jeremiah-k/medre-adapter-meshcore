@@ -73,7 +73,7 @@ On unexpected disconnect the session attempts bounded exponential backoff:
 
 * Base delays: 1 s, 2 s, 4 s, 8 s, … capped at 30 s.
 * ±25 % jitter on each delay to avoid thundering-herd synchronisation.
-* Maximum 10 consecutive attempts.
+* Continue until connected or stopped, with one 15-second setup budget per attempt.
 * On ``stop()`` a ``_stop_requested`` guard prevents further reconnects.
 
 .. note::
@@ -108,7 +108,7 @@ from medre.config.adapters.meshcore import MeshCoreConfig
 # Reconnect backoff parameters.
 _RECONNECT_BASE_DELAY: float = 1.0  # seconds
 _RECONNECT_MAX_DELAY: float = 30.0  # seconds
-_RECONNECT_MAX_ATTEMPTS: int = 10
+_RECONNECT_MAX_ATTEMPTS: int = 0  # zero keeps long-lived recovery active until stop
 _RECONNECT_JITTER_FRACTION: float = 0.25  # ±25 %
 
 # Outbound delivery retry.
@@ -123,6 +123,7 @@ _TRANSIENT_SDK_SEND_REASONS: frozenset[str] = frozenset(
 
 # Timeout for external SDK lifecycle calls (auto-fetch start/stop).
 _SDK_LIFECYCLE_TIMEOUT: float = 5.0  # seconds
+_CONNECT_ATTEMPT_TIMEOUT: float = 15.0  # one complete native setup attempt
 
 # suggested_timeout clamping bounds (seconds).
 # The firmware returns milliseconds; we convert to seconds and clamp.
@@ -304,6 +305,7 @@ class MeshCoreSession:
         # capture a running loop reference — asyncio.Lock() lazy-binds on
         # first use in Python 3.10+.
         self._send_lock = asyncio.Lock()
+        self._connection_lock = asyncio.Lock()
 
         # Per-contact cached SDK suggested_timeout for DM retry delays.
         # Keyed by contact_id so that each contact's timeout is tracked
@@ -358,7 +360,9 @@ class MeshCoreSession:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def start(self, message_callback: MessageCallback) -> None:
+    async def start(
+        self, message_callback: MessageCallback, *, recover_on_failure: bool = False
+    ) -> None:
         """Connect to MeshCore and begin receiving events.
 
         Parameters
@@ -370,11 +374,14 @@ class MeshCoreSession:
             ``type``, ``channel_idx``, etc.) — **not** the SDK ``Event``
             object.
 
+        ``recover_on_failure`` is enabled by the long-lived adapter. A native
+        reachability failure then starts degraded with one owned recovery loop;
+        strict one-shot session/probe callers retain failure propagation.
+
         Raises
         ------
         MeshCoreConnectionError
-            If the SDK is not installed (non-fake mode) or the connection
-            fails.
+            If the SDK is unavailable, or a strict initial connection fails.
         """
         if self._started:
             return
@@ -386,13 +393,26 @@ class MeshCoreSession:
             # Fake mode: no real SDK client needed.
             self._diag.connected = True
         else:
-            try:
-                await self._connect_real()
-            except Exception:
-                # Connect failed — full cleanup so diagnostics and
-                # late SDK events don't reference stale state.
+            if not HAS_MESHCORE:
                 await self._cleanup_failed_start()
-                raise
+                raise MeshCoreConnectionError(
+                    "meshcore SDK not installed; install medre-adapter-meshcore and restart"
+                )
+            try:
+                await self._connection_attempt()
+            except Exception as exc:
+                if not recover_on_failure:
+                    await self._cleanup_failed_start()
+                    raise
+                self._diag.connected = False
+                self._diag.last_error = self._sanitize_ble_exc(exc)
+                self._logger.warning(
+                    "MeshCoreSession %s initial connection unavailable; "
+                    "starting degraded with recovery active: %s",
+                    self._adapter_id,
+                    self._diag.last_error,
+                )
+                self._ensure_recovery_task()
 
         self._started = True
         self._logger.info(
@@ -408,10 +428,16 @@ class MeshCoreSession:
         Sets ``_stop_requested`` to prevent reconnect loops.
         Idempotent — safe to call multiple times.
         """
-        if not self._started:
-            return
-
         self._stop_requested = True
+        if (
+            not self._started
+            and self._meshcore is None
+            and self._reconnect_task is None
+        ):
+            self._message_callback = None
+            self._diag.connected = False
+            self._diag.reconnecting = False
+            return
 
         # Cancel reconnect task if running.
         if self._reconnect_task is not None and not self._reconnect_task.done():
@@ -420,7 +446,7 @@ class MeshCoreSession:
                 await self._reconnect_task
             except asyncio.CancelledError:
                 pass
-            self._reconnect_task = None
+        self._reconnect_task = None
 
         # Unsubscribe all callbacks.
         await self._unsubscribe_all()
@@ -538,7 +564,11 @@ class MeshCoreSession:
             On permanent failure or after exhausting retries.
         """
         if not self._diag.connected:
-            raise MeshCoreSendError("Session is not connected", transient=False)
+            recovering = self._started and not self._stop_requested
+            raise MeshCoreSendError(
+                "Session is not connected; native handoff has not occurred",
+                transient=recovering,
+            )
 
         if self._config.connection_type == "fake":
             # Fake mode — no real send.
@@ -634,6 +664,47 @@ class MeshCoreSession:
     # ==================================================================
     # Private — real connection
     # ==================================================================
+
+    async def _connection_attempt(self) -> None:
+        """Own one bounded setup attempt and retire partial state before retry.
+
+        Serializing setup prevents SDK disconnect callbacks from overlapping
+        another connection attempt. The pinned SDK closes factory-created
+        transports when its connect coroutine is cancelled.
+        """
+        async with self._connection_lock:
+            if self._stop_requested:
+                raise asyncio.CancelledError
+            deadline = asyncio.timeout(_CONNECT_ATTEMPT_TIMEOUT)
+            try:
+                async with deadline:
+                    await self._connect_real()
+                if deadline.expired():
+                    raise TimeoutError("native setup exceeded its deadline")
+            except asyncio.CancelledError:
+                self._stop_requested = True
+                await self._cleanup_stale_sdk()
+                self._diag.connected = False
+                raise
+            except Exception as exc:
+                await self._cleanup_stale_sdk()
+                self._diag.connected = False
+                if deadline.expired():
+                    raise MeshCoreConnectionError(
+                        f"Native connection attempt exceeded {_CONNECT_ATTEMPT_TIMEOUT:g}s"
+                    ) from None
+                raise exc
+
+    def _ensure_recovery_task(self) -> None:
+        """Keep a single cancellable recovery owner for the session."""
+        if self._stop_requested:
+            return
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._diag.reconnecting = True
+            self._reconnect_task = asyncio.create_task(
+                self._reconnect_loop(), name=f"meshcore-recovery:{self._adapter_id}"
+            )
+            self._reconnect_task.add_done_callback(self._log_task_exception)
 
     async def _cleanup_failed_start(self) -> None:
         """Full cleanup after a failed start().
@@ -910,6 +981,18 @@ class MeshCoreSession:
                     _ble_kwargs["pin"] = pin
                 # MEDRE owns reconnect and always creates a fresh SDK client.
                 _ble_kwargs["auto_reconnect"] = False
+                self._logger.info(
+                    "MeshCoreSession %s: BLE setup attempt %d/%d for %s (%s)",
+                    self._adapter_id,
+                    attempt,
+                    _max_attempts,
+                    address,
+                    (
+                        "discovered device"
+                        if ble_device is not None
+                        else "address fallback"
+                    ),
+                )
                 result = await meshcore_module.MeshCore.create_ble(
                     **_ble_kwargs,
                 )
@@ -1139,6 +1222,10 @@ class MeshCoreSession:
         # subsequent SELF_INFO callbacks refresh diagnostics.
         self._capture_self_info(getattr(self._meshcore, "self_info", None))
 
+        # The handshake/subscription has succeeded. A disconnect during the
+        # following await must stay observable rather than being overwritten.
+        self._diag.connected = True
+
         # Start auto message fetching to drain buffered messages from the device.
         # Best-effort: failure is logged but does not prevent connection.
         try:
@@ -1159,8 +1246,8 @@ class MeshCoreSession:
                 exc,
             )
 
-        # Only mark connected after factory connect/APP_START and subscriptions succeed.
-        self._diag.connected = True
+        if not self._diag.connected:
+            raise MeshCoreConnectionError("Native transport disconnected during setup")
 
     def _subscribe_events(self, mc: Any) -> None:
         """Subscribe to SDK event types for inbound messages + disconnects.
@@ -1324,7 +1411,7 @@ class MeshCoreSession:
             pass
         except Exception as exc:
             self._logger.warning(
-                "MeshCoreSession %s: unhandled exception in inbound callback task: %s",
+                "MeshCoreSession %s: unhandled exception in background task: %s",
                 self._adapter_id,
                 exc,
             )
@@ -1334,12 +1421,12 @@ class MeshCoreSession:
         self._diag.connected = False
         self._logger.warning("MeshCoreSession %s: SDK disconnected", self._adapter_id)
 
-        if self._stop_requested:
+        if self._stop_requested or not self._started:
+            # Initial setup owns its result; it starts recovery explicitly
+            # after any failure, rather than racing another setup task.
             return
 
-        # Start reconnect loop in background if not already running.
-        if self._reconnect_task is None or self._reconnect_task.done():
-            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        self._ensure_recovery_task()
 
     async def _on_contacts_event(self, event: Any) -> None:
         """Handle SDK CONTACTS event — diagnostics-only contact list update.
@@ -1404,30 +1491,32 @@ class MeshCoreSession:
         """Bounded exponential backoff reconnect loop.
 
         Delays: 1 s → 2 s → 4 s → 8 s → … capped at 30 s.
-        ±25 % jitter.  Max 10 attempts.
+        ±25 % jitter with a hard 30-second delay cap. Retry until stopped by
+        default; a positive internal attempt cap is retained for strict probes.
         """
         self._diag.reconnecting = True
         self._diag.reconnect_attempts = 0
 
         try:
-            while (
-                not self._stop_requested
-                and self._diag.reconnect_attempts < _RECONNECT_MAX_ATTEMPTS
+            while not self._stop_requested and (
+                _RECONNECT_MAX_ATTEMPTS == 0
+                or self._diag.reconnect_attempts < _RECONNECT_MAX_ATTEMPTS
             ):
                 delay = min(
-                    _RECONNECT_BASE_DELAY * (2**self._diag.reconnect_attempts),
+                    _RECONNECT_BASE_DELAY
+                    * (2 ** min(self._diag.reconnect_attempts, 30)),
                     _RECONNECT_MAX_DELAY,
                 )
                 # Apply jitter.
                 jitter = delay * _RECONNECT_JITTER_FRACTION
                 delay = delay + random.uniform(-jitter, jitter)
-                delay = max(0.0, delay)
+                delay = min(_RECONNECT_MAX_DELAY, max(0.0, delay))
 
                 self._logger.info(
-                    "MeshCoreSession %s: reconnect attempt %d/%d in %.1fs",
+                    "MeshCoreSession %s: reconnect attempt %d%s in %.1fs",
                     self._adapter_id,
                     self._diag.reconnect_attempts + 1,
-                    _RECONNECT_MAX_ATTEMPTS,
+                    f"/{_RECONNECT_MAX_ATTEMPTS}" if _RECONNECT_MAX_ATTEMPTS else "",
                     delay,
                 )
 
@@ -1437,7 +1526,7 @@ class MeshCoreSession:
                     break
 
                 try:
-                    await self._connect_real()
+                    await self._connection_attempt()
                     self._contact_retry_delays.clear()
                     self._logger.info(
                         "MeshCoreSession %s: reconnected successfully",
@@ -1456,7 +1545,10 @@ class MeshCoreSession:
                         exc,
                     )
 
-            # Exhausted attempts.
+            if self._stop_requested:
+                self._diag.reconnecting = False
+                return
+            # A positive attempt cap is supported for strict internal callers.
             self._diag.last_error = (
                 f"Reconnect exhausted after {self._diag.reconnect_attempts} attempts"
             )
