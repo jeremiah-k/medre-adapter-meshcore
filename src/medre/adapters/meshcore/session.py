@@ -73,7 +73,8 @@ On unexpected disconnect the session attempts bounded exponential backoff:
 
 * Base delays: 1 s, 2 s, 4 s, 8 s, … capped at 30 s.
 * ±25 % jitter on each delay to avoid thundering-herd synchronisation.
-* Continue until connected or stopped, with one 15-second setup budget per attempt.
+* Continue until connected or stopped, with 15-second TCP/serial or 45-second
+  BLE setup budgets per attempt.
 * On ``stop()`` a ``_stop_requested`` guard prevents further reconnects.
 
 .. note::
@@ -123,7 +124,8 @@ _TRANSIENT_SDK_SEND_REASONS: frozenset[str] = frozenset(
 
 # Timeout for external SDK lifecycle calls (auto-fetch start/stop).
 _SDK_LIFECYCLE_TIMEOUT: float = 5.0  # seconds
-_CONNECT_ATTEMPT_TIMEOUT: float = 15.0  # one complete native setup attempt
+_CONNECT_ATTEMPT_TIMEOUT: float = 15.0  # TCP / serial setup attempt
+_BLE_CONNECT_ATTEMPT_TIMEOUT: float = 45.0  # includes BlueZ cleanup and discovery
 
 # suggested_timeout clamping bounds (seconds).
 # The firmware returns milliseconds; we convert to seconds and clamp.
@@ -298,6 +300,7 @@ class MeshCoreSession:
         self._started: bool = False
         self._stop_requested: bool = False
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._initial_start_task: asyncio.Task[Any] | None = None
 
         # Send serialization: ensures pacing sleeps are not bypassed when
         # multiple send_text() calls overlap via pipeline fan-out.
@@ -398,22 +401,28 @@ class MeshCoreSession:
                 raise MeshCoreConnectionError(
                     "meshcore SDK not installed; install medre-adapter-meshcore and restart"
                 )
+            self._initial_start_task = asyncio.current_task()
             try:
-                await self._connection_attempt()
-            except Exception as exc:
-                if not recover_on_failure:
-                    await self._cleanup_failed_start()
-                    raise
-                self._diag.connected = False
-                self._diag.last_error = self._sanitize_ble_exc(exc)
-                self._logger.warning(
-                    "MeshCoreSession %s initial connection unavailable; "
-                    "starting degraded with recovery active: %s",
-                    self._adapter_id,
-                    self._diag.last_error,
-                )
-                self._ensure_recovery_task()
+                try:
+                    await self._connection_attempt()
+                except Exception as exc:
+                    if not recover_on_failure:
+                        await self._cleanup_failed_start()
+                        raise
+                    self._diag.connected = False
+                    self._diag.last_error = self._sanitize_ble_exc(exc)
+                    self._logger.warning(
+                        "MeshCoreSession %s initial connection unavailable; "
+                        "starting degraded with recovery active: %s",
+                        self._adapter_id,
+                        self._diag.last_error,
+                    )
+                    self._ensure_recovery_task()
+            finally:
+                self._initial_start_task = None
 
+        if self._stop_requested:
+            return
         self._started = True
         self._logger.info(
             "MeshCoreSession %s started (mode=%s, connected=%s)",
@@ -429,6 +438,19 @@ class MeshCoreSession:
         Idempotent — safe to call multiple times.
         """
         self._stop_requested = True
+        # Initial setup runs in the caller task, not the recovery task. Retire
+        # it before cleanup so it cannot reconnect after stop() returns.
+        initial = self._initial_start_task
+        if (
+            initial is not None
+            and initial is not asyncio.current_task()
+            and not initial.done()
+        ):
+            initial.cancel()
+            try:
+                await initial
+            except asyncio.CancelledError:
+                pass
         if (
             not self._started
             and self._meshcore is None
@@ -469,15 +491,17 @@ class MeshCoreSession:
                     self._logger.debug(
                         "MeshCoreSession %s: error stopping auto_message_fetching: %s",
                         self._adapter_id,
-                        exc,
+                        self._sanitize_ble_exc(exc),
                     )
             try:
-                await self._meshcore.disconnect()
+                await asyncio.wait_for(
+                    self._meshcore.disconnect(), timeout=_SDK_LIFECYCLE_TIMEOUT
+                )
             except Exception as exc:
                 self._logger.warning(
                     "MeshCoreSession %s: error during disconnect: %s",
                     self._adapter_id,
-                    exc,
+                    self._sanitize_ble_exc(exc),
                 )
             self._meshcore = None
 
@@ -675,7 +699,12 @@ class MeshCoreSession:
         async with self._connection_lock:
             if self._stop_requested:
                 raise asyncio.CancelledError
-            deadline = asyncio.timeout(_CONNECT_ATTEMPT_TIMEOUT)
+            attempt_timeout = (
+                _BLE_CONNECT_ATTEMPT_TIMEOUT
+                if self._config.connection_type == "ble"
+                else _CONNECT_ATTEMPT_TIMEOUT
+            )
+            deadline = asyncio.timeout(attempt_timeout)
             try:
                 async with deadline:
                     await self._connect_real()
@@ -691,7 +720,7 @@ class MeshCoreSession:
                 self._diag.connected = False
                 if deadline.expired():
                     raise MeshCoreConnectionError(
-                        f"Native connection attempt exceeded {_CONNECT_ATTEMPT_TIMEOUT:g}s"
+                        f"Native connection attempt exceeded {attempt_timeout:g}s"
                     ) from None
                 raise exc
 
@@ -720,12 +749,14 @@ class MeshCoreSession:
         self._contact_retry_delays.clear()
         if self._meshcore is not None:
             try:
-                await self._meshcore.disconnect()
+                await asyncio.wait_for(
+                    self._meshcore.disconnect(), timeout=_SDK_LIFECYCLE_TIMEOUT
+                )
             except Exception as exc:
                 self._logger.debug(
                     "MeshCoreSession %s: error during cleanup disconnect: %s",
                     self._adapter_id,
-                    exc,
+                    self._sanitize_ble_exc(exc),
                 )
             self._meshcore = None
 
@@ -779,12 +810,14 @@ class MeshCoreSession:
 
         # Disconnect the old client.
         try:
-            await self._meshcore.disconnect()
+            await asyncio.wait_for(
+                self._meshcore.disconnect(), timeout=_SDK_LIFECYCLE_TIMEOUT
+            )
         except Exception as exc:
             self._logger.debug(
                 "MeshCoreSession %s: error disconnecting stale client: %s",
                 self._adapter_id,
-                exc,
+                self._sanitize_ble_exc(exc),
             )
         self._meshcore = None
 
@@ -1159,12 +1192,14 @@ class MeshCoreSession:
             # Clean up partially-initialised SDK client on failure.
             if self._meshcore is not None:
                 try:
-                    await self._meshcore.disconnect()
+                    await asyncio.wait_for(
+                        self._meshcore.disconnect(), timeout=_SDK_LIFECYCLE_TIMEOUT
+                    )
                 except Exception as disconnect_exc:
                     self._logger.debug(
                         "MeshCoreSession %s: error during cleanup disconnect: %s",
                         self._adapter_id,
-                        disconnect_exc,
+                        self._sanitize_ble_exc(disconnect_exc),
                     )
                 self._meshcore = None
             raise
@@ -1172,12 +1207,14 @@ class MeshCoreSession:
             # Clean up partially-initialised SDK client on failure.
             if self._meshcore is not None:
                 try:
-                    await self._meshcore.disconnect()
+                    await asyncio.wait_for(
+                        self._meshcore.disconnect(), timeout=_SDK_LIFECYCLE_TIMEOUT
+                    )
                 except Exception as disconnect_exc:
                     self._logger.debug(
                         "MeshCoreSession %s: error during cleanup disconnect: %s",
                         self._adapter_id,
-                        disconnect_exc,
+                        self._sanitize_ble_exc(disconnect_exc),
                     )
                 self._meshcore = None
             _safe_reason = (
@@ -1199,20 +1236,22 @@ class MeshCoreSession:
             self._subscribe_events(mc)
         except Exception as exc:
             # Subscription failure after successful client creation.
-            self._diag.last_error = str(exc)
+            self._diag.last_error = self._sanitize_ble_exc(exc)
             if self._meshcore is not None:
                 try:
-                    await self._meshcore.disconnect()
+                    await asyncio.wait_for(
+                        self._meshcore.disconnect(), timeout=_SDK_LIFECYCLE_TIMEOUT
+                    )
                 except Exception as disconnect_exc:
                     self._logger.debug(
                         "MeshCoreSession %s: error during cleanup disconnect: %s",
                         self._adapter_id,
-                        disconnect_exc,
+                        self._sanitize_ble_exc(disconnect_exc),
                     )
                 self._meshcore = None
             self._subscriptions.clear()
             raise MeshCoreConnectionError(
-                f"Failed to subscribe to events: {exc}"
+                f"Failed to subscribe to events: {self._diag.last_error}"
             ) from exc
 
         # MeshCore.create_*() already performs connect() and its required
@@ -1537,12 +1576,12 @@ class MeshCoreSession:
                     return
                 except Exception as exc:
                     self._diag.reconnect_attempts += 1
-                    self._diag.last_error = str(exc)
+                    self._diag.last_error = self._sanitize_ble_exc(exc)
                     self._logger.warning(
                         "MeshCoreSession %s: reconnect failed (attempt %d): %s",
                         self._adapter_id,
                         self._diag.reconnect_attempts,
-                        exc,
+                        self._diag.last_error,
                     )
 
             if self._stop_requested:

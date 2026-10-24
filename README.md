@@ -190,7 +190,8 @@ The native adapter package includes its own `py.typed` marker.
 
 A long-lived MEDRE adapter returns from initial setup in degraded health when
 its configured radio is unavailable. Each complete native connection attempt
-has a 15-second budget. One session-owned recovery loop then retries with
+has a 15-second TCP/serial budget or a 45-second BLE budget (including BlueZ
+cleanup and discovery). One session-owned recovery loop then retries with
 exponential backoff and jitter, capped at 30 seconds between attempts, until the
 radio connects or the adapter stops. The SDK's own auto-reconnect stays disabled.
 Initial unavailability and later disconnects use the same serialized setup path.

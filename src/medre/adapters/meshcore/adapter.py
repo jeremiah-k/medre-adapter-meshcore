@@ -291,7 +291,8 @@ class MeshCoreAdapter(AdapterContract):
         ------
         MeshCoreConnectionError
             If ``meshcore`` SDK is not installed and connection_type is
-            not ``"fake"``, or if the real connection fails.
+            not ``"fake"``, or if strict startup cannot connect. The long-lived
+            adapter starts degraded and retries when radio reachability fails.
         """
         if self._started:
             return

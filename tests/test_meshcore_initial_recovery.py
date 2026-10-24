@@ -66,6 +66,7 @@ async def test_initial_offline_adapter_becomes_healthy_and_keeps_inbound_callbac
         assert await wait_until(lambda: session.connected)
         assert (await adapter.health_check()).health == "healthy"
         assert attempts == 2
+        assert session._message_callback is not None
     finally:
         await adapter.stop()
     assert not session.connected
@@ -175,3 +176,105 @@ async def test_missing_sdk_never_enters_background_recovery(
     with pytest.raises(MeshCoreConnectionError, match="not installed"):
         await session.start(lambda _: None, recover_on_failure=True)
     assert session._reconnect_task is None
+
+
+async def test_stop_retires_initial_setup_before_it_can_connect(
+    recovering_session, monkeypatch
+):
+    """stop() must cancel a separately running initial SDK setup owner."""
+    session = recovering_session
+    entered, retired = asyncio.Event(), asyncio.Event()
+
+    async def connect():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retired.set()
+
+    monkeypatch.setattr(session, "_connect_real", connect)
+    startup = asyncio.create_task(
+        session.start(lambda _: None, recover_on_failure=True)
+    )
+    await entered.wait()
+    await session.stop()
+    assert retired.is_set()
+    assert startup.done()
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    assert session._initial_start_task is None
+    assert not session.connected
+    assert not session._started
+    assert session._reconnect_task is None
+
+
+async def test_stalled_stale_disconnect_is_bounded(recovering_session, monkeypatch):
+    """A wedged SDK disconnect cannot trap recovery or shutdown forever."""
+    from types import SimpleNamespace
+
+    session = recovering_session
+    monkeypatch.setattr(session_module, "_SDK_LIFECYCLE_TIMEOUT", 0.01)
+    cancelled = asyncio.Event()
+
+    async def disconnect():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    session._meshcore = SimpleNamespace(disconnect=disconnect)
+    await asyncio.wait_for(session._cleanup_stale_sdk(), timeout=0.2)
+    assert cancelled.is_set()
+    assert session._meshcore is None
+
+
+async def test_deadline_does_not_disable_background_recovery(
+    recovering_session, monkeypatch
+):
+    """An expired setup deadline is a retryable failure, not a stop request."""
+    session = recovering_session
+    monkeypatch.setattr(session_module, "_CONNECT_ATTEMPT_TIMEOUT", 0.01)
+    attempted = 0
+
+    async def connect():
+        nonlocal attempted
+        attempted += 1
+        if attempted == 1:
+            await asyncio.Event().wait()
+        session._diag.connected = True
+
+    monkeypatch.setattr(session, "_connect_real", connect)
+    await session.start(lambda _: None, recover_on_failure=True)
+    try:
+        assert not session._stop_requested
+        assert await wait_until(lambda: session.connected)
+        assert attempted >= 2
+    finally:
+        await session.stop()
+
+
+async def test_ble_subscribe_error_never_logs_pin(
+    recovering_session, monkeypatch, caplog
+):
+    """A post-connect subscription error must redact BLE secrets on retry."""
+    from dataclasses import replace
+
+    session = recovering_session
+    session._config = replace(
+        session._config,
+        connection_type="ble",
+        ble_address="test-device",
+        ble_pin="123456",
+    )
+
+    async def fail():
+        raise MeshCoreConnectionError("private pin 123456")
+
+    monkeypatch.setattr(session, "_connect_real", fail)
+    await session.start(lambda _: None, recover_on_failure=True)
+    try:
+        assert await wait_until(lambda: session.reconnect_attempts >= 1)
+        assert "123456" not in caplog.text
+        assert "123456" not in (session.last_error or "")
+    finally:
+        await session.stop()
