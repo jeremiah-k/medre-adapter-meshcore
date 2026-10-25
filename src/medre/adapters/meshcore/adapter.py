@@ -472,12 +472,6 @@ class MeshCoreAdapter(AdapterContract):
         if self._session is None:
             raise AdapterPermanentError("Session not initialised")
 
-        payload = result.payload
-        if not isinstance(payload, dict):
-            raise AdapterPermanentError(
-                "MeshCore renderer produced a non-mapping payload"
-            )
-
         text = payload["text"]
         channel_index = payload.get("channel_index")
         contact_id = str(payload.get("contact_id", ""))
