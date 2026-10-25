@@ -75,6 +75,8 @@ On unexpected disconnect the session attempts bounded exponential backoff:
 * ±25 % jitter on each delay to avoid thundering-herd synchronisation.
 * Continue until connected or stopped, with 15-second TCP/serial or 45-second
   BLE setup budgets per attempt.
+* Known configuration and SDK contract errors stop recovery; transient transport
+  failures continue retrying. Error text is never used to classify failures.
 * On ``stop()`` a ``_stop_requested`` guard prevents further reconnects.
 
 .. note::
@@ -363,6 +365,20 @@ class MeshCoreSession:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _permanent_setup_error(exc: Exception) -> bool:
+        """Recognize explicit contract failures without parsing SDK error text.
+
+        BLE names, MAC addresses and platform UUIDs are all supported discovery
+        selectors. A missing discovery result is reachability, not invalid syntax.
+        """
+        if isinstance(exc, MeshCoreConnectionError):
+            return not exc.transient
+        return isinstance(
+            exc,
+            (ValueError, TypeError, AttributeError, ImportError, NotImplementedError),
+        )
+
     async def start(
         self, message_callback: MessageCallback, *, recover_on_failure: bool = False
     ) -> None:
@@ -406,7 +422,7 @@ class MeshCoreSession:
                 try:
                     await self._connection_attempt()
                 except Exception as exc:
-                    if not recover_on_failure:
+                    if not recover_on_failure or self._permanent_setup_error(exc):
                         await self._cleanup_failed_start()
                         raise
                     self._diag.connected = False
@@ -1043,6 +1059,10 @@ class MeshCoreSession:
                 )
             except Exception as exc:
                 _last_reason = self._sanitize_ble_exc(exc)
+                if self._permanent_setup_error(exc):
+                    raise MeshCoreConnectionError(
+                        f"BLE setup contract failed: {_last_reason}", transient=False
+                    ) from exc
                 if attempt == _max_attempts:
                     raise MeshCoreConnectionError(
                         f"BLE connection failed after {_max_attempts} "
@@ -1225,7 +1245,8 @@ class MeshCoreSession:
             self._diag.last_error = _safe_reason
             raise MeshCoreConnectionError(
                 f"Failed to connect ({self._config.connection_type}): "
-                f"{_safe_reason}"
+                f"{_safe_reason}",
+                transient=not self._permanent_setup_error(exc),
             ) from exc
 
         # Connection succeeded — now subscribe to events.
@@ -1251,7 +1272,8 @@ class MeshCoreSession:
                 self._meshcore = None
             self._subscriptions.clear()
             raise MeshCoreConnectionError(
-                f"Failed to subscribe to events: {self._diag.last_error}"
+                f"Failed to subscribe to events: {self._diag.last_error}",
+                transient=not self._permanent_setup_error(exc),
             ) from exc
 
         # MeshCore.create_*() already performs connect() and its required
@@ -1577,6 +1599,15 @@ class MeshCoreSession:
                 except Exception as exc:
                     self._diag.reconnect_attempts += 1
                     self._diag.last_error = self._sanitize_ble_exc(exc)
+                    if self._permanent_setup_error(exc):
+                        self._diag.reconnecting = False
+                        self._logger.error(
+                            "MeshCoreSession %s: recovery stopped after permanent "
+                            "setup failure: %s",
+                            self._adapter_id,
+                            self._diag.last_error,
+                        )
+                        return
                     self._logger.warning(
                         "MeshCoreSession %s: reconnect failed (attempt %d): %s",
                         self._adapter_id,

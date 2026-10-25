@@ -31,7 +31,7 @@ def recovering_session(monkeypatch):
 
 
 async def test_initial_offline_adapter_becomes_healthy_and_keeps_inbound_callback(
-    recovering_session, monkeypatch, make_adapter_context
+    recovering_session, monkeypatch, make_adapter_context, inbound_collector
 ):
     """The production adapter opts into recovery and preserves its session owner."""
     session = recovering_session
@@ -67,6 +67,19 @@ async def test_initial_offline_adapter_becomes_healthy_and_keeps_inbound_callbac
         assert (await adapter.health_check()).health == "healthy"
         assert attempts == 2
         assert session._message_callback is not None
+        result = session._message_callback(
+            {
+                "type": "CHAN",
+                "channel_idx": 0,
+                "sender_timestamp": 42,
+                "text": "Peer: received after recovery",
+                "txt_type": 0,
+            }
+        )
+        if result is not None:
+            await result
+        assert await wait_until(lambda: len(inbound_collector.events) == 1)
+        assert inbound_collector.events[0].payload["body"] == "received after recovery"
     finally:
         await adapter.stop()
     assert not session.connected
