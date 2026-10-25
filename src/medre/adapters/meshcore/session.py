@@ -101,7 +101,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Protocol, cast
 
 from medre.adapters.meshcore.compat import HAS_MESHCORE
-from medre.adapters.meshcore.errors import MeshCoreConnectionError, MeshCoreSendError
+from medre.adapters.meshcore.errors import (
+    MeshCoreBluetoothUnavailableError,
+    MeshCoreConnectionError,
+    MeshCoreSendError,
+)
 from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
 from medre.config.adapters.meshcore import MeshCoreConfig
 
@@ -970,6 +974,9 @@ class MeshCoreSession:
         the exception class name and a redaction notice so that logs,
         diagnostics, and error messages never leak the PIN.
         """
+        if isinstance(exc, MeshCoreBluetoothUnavailableError):
+            # Recreate the fixed message instead of trusting mutable SDK args.
+            return str(MeshCoreBluetoothUnavailableError())
         if self._config.ble_pin is not None:
             return f"{type(exc).__name__}: [details redacted]"
         return str(exc)
@@ -1003,10 +1010,7 @@ class MeshCoreSession:
             return device
         except Exception as exc:
             if type(exc).__name__ == "BleakBluetoothNotAvailableError":
-                raise MeshCoreConnectionError(
-                    "Bluetooth unavailable on this host; enable the controller "
-                    "and recovery will retry automatically"
-                ) from exc
+                raise MeshCoreBluetoothUnavailableError() from exc
             return None
 
     async def _create_ble_with_retries(
@@ -1038,7 +1042,7 @@ class MeshCoreSession:
                     "address": address,
                     "device": ble_device,
                 }
-                if pin is not None:
+                if pin is not None and not self._diag.reconnecting:
                     _ble_kwargs["pin"] = pin
                 # MEDRE owns reconnect and always creates a fresh SDK client.
                 _ble_kwargs["auto_reconnect"] = False
@@ -1072,10 +1076,7 @@ class MeshCoreSession:
             except Exception as exc:
                 _last_reason = self._sanitize_ble_exc(exc)
                 if type(exc).__name__ == "BleakBluetoothNotAvailableError":
-                    raise MeshCoreConnectionError(
-                        "Bluetooth unavailable on this host; enable the controller "
-                        "and recovery will retry automatically"
-                    ) from exc
+                    raise MeshCoreBluetoothUnavailableError() from exc
                 if self._permanent_setup_error(exc):
                     raise MeshCoreConnectionError(
                         f"BLE setup contract failed: {_last_reason}", transient=False

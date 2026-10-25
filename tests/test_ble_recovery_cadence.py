@@ -1,6 +1,7 @@
 """Recovery attempts remain paced and distinguish a host outage from a missing node."""
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,6 +10,7 @@ import pytest
 from medre.adapters.meshcore.errors import MeshCoreConnectionError
 from medre.adapters.meshcore.session import MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
+from medre_meshcore_tests.helpers.meshcore_session import build_mock_meshcore_module
 
 
 def session():
@@ -51,9 +53,55 @@ async def test_powered_off_controller_is_not_an_address_fallback(monkeypatch):
             BleakScanner=SimpleNamespace(find_device_by_filter=scan),
         ),
     )
+    owner = session()
+    owner._config = replace(owner._config, ble_pin="123456")
+    sdk, _ = build_mock_meshcore_module()
+    monkeypatch.setattr("medre.adapters.meshcore.session.HAS_MESHCORE", True)
+    monkeypatch.setitem(sys.modules, "meshcore", sdk)
+    monkeypatch.setattr(owner, "_disconnect_stale_ble_client", AsyncMock())
+    monkeypatch.setattr("medre.adapters.meshcore.session.asyncio.sleep", AsyncMock())
     with pytest.raises(MeshCoreConnectionError, match="Bluetooth unavailable"):
-        await session()._find_ble_device("AA:BB:CC:DD:EE:FF")
+        await owner._connect_real()
     scan.assert_awaited_once()
+    sdk.MeshCore.create_ble.assert_not_awaited()
+    assert "enable the controller" in owner.last_error
+    assert "123456" not in owner.last_error
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+async def test_pairing_pin_is_used_only_for_initial_setup(monkeypatch, recovering):
+    """Automatic retries reuse existing bonds without initiating PIN-based pairing."""
+    owner = session()
+    owner._diag.reconnecting = recovering
+    sdk, _ = build_mock_meshcore_module()
+    await owner._create_ble_with_retries(
+        sdk, owner._config.ble_address, None, pin="123456"
+    )
+    kwargs = sdk.MeshCore.create_ble.await_args.kwargs
+    assert ("pin" in kwargs) is (not recovering)
+
+
+async def test_factory_controller_failure_keeps_safe_guidance_with_a_pin(monkeypatch):
+    """A late host outage must retain actionable text without exposing SDK error args."""
+
+    class BleakBluetoothNotAvailableError(Exception):
+        """Model a typed backend outage whose details may contain private values."""
+
+    owner = session()
+    owner._config = replace(owner._config, ble_pin="123456")
+    owner._diag.reconnecting = True
+    sdk, _ = build_mock_meshcore_module()
+    sdk.MeshCore.create_ble.side_effect = BleakBluetoothNotAvailableError(
+        "private 123456"
+    )
+    with pytest.raises(MeshCoreConnectionError) as failure:
+        await owner._create_ble_with_retries(
+            sdk, owner._config.ble_address, None, pin="123456"
+        )
+    public = owner._sanitize_ble_exc(failure.value)
+    assert "enable the controller" in public
+    assert "123456" not in public
+    sdk.MeshCore.create_ble.assert_awaited_once()
 
 
 async def test_outage_backoff_has_a_floor_and_grows_to_five_minutes(monkeypatch):
@@ -76,6 +124,4 @@ async def test_outage_backoff_has_a_floor_and_grows_to_five_minutes(monkeypatch)
         AsyncMock(side_effect=MeshCoreConnectionError("offline")),
     )
     await owner._reconnect_loop()
-    assert delays[0] >= 10
-    assert delays[-1] == 300
-    assert delays == sorted(delays)
+    assert delays == [10, 20, 40, 80, 160, 300, 300, 300, 300, 300]

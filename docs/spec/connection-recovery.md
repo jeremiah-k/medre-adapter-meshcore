@@ -30,3 +30,8 @@ fallback and remaining immediate setup attempts. The operator receives a concise
 instruction to enable the host controller; the session remains degraded and
 recovers automatically when Bluetooth returns. No retry may power on the
 controller or alter pairing state. Cancellation MUST still interrupt backoff.
+
+The configured pairing PIN MAY be used during explicit initial setup. Background
+recovery MUST omit it from SDK factory calls and reuse only existing bonds.
+Typed host-controller errors MUST retain fixed, secret-free recovery guidance
+even when a PIN is configured; arbitrary SDK exception text remains redacted.
