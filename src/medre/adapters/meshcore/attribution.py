@@ -63,6 +63,12 @@ def project_meshcore_attribution(
         "source_sender_label": sender_label,
         "source_sender_short_label": sender_short_label,
         "source_sender_handle": None,
+        "source_sender_label_raw": contact_label,
+        "source_sender_short_label_raw": contact_short_label
+        or _first_token(contact_label),
+        "source_sender_verification": (
+            "unverified" if meshcore.get("is_direct_message") is False else "unknown"
+        ),
     }
 
 

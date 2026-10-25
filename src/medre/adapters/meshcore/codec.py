@@ -59,6 +59,7 @@ class MeshCoreCodec(AdapterCodec):
         *,
         contact_label: str | None = None,
         contact_short_label: str | None = None,
+        local_node_name: str | None = None,
     ) -> CanonicalEvent:
         """Convert a native MeshCore event payload dict into a canonical event.
 
@@ -77,6 +78,11 @@ class MeshCoreCodec(AdapterCodec):
             when no wire name is present, or for direct messages, no
             label is injected. Opaque pubkey prefixes are never passed
             here and are never derived.
+        local_node_name:
+            Provider-owned local bridge name. A leading automatic address to
+            that exact node is removed from group display text only. The wire
+            text and derived message identity are preserved; no reply relation
+            is inferred from an address alone.
         contact_short_label:
             Optional abbreviated contact label.  When ``None``, the
             projection derives a compact form from *contact_label*.
@@ -136,6 +142,21 @@ class MeshCoreCodec(AdapterCodec):
                 header = match.group(1) + ": "
                 if text.startswith(header):
                     payload["body"] = text[len(header) :]
+                    wire_text = text
+
+        # MeshCore reply UI addresses the sending bridge node by name, but
+        # supplies no original-message ID. Remove only our own leading address;
+        # retain raw wire evidence and do not invent a canonical reply target.
+        if not classification.is_direct_message and isinstance(local_node_name, str):
+            own_name = local_node_name.strip()
+            body = str(payload["body"])
+            marker = f"@[{own_name}]" if own_name else ""
+            if marker and body.startswith(marker):
+                remainder = body[len(marker) :]
+                if remainder.startswith(":"):
+                    remainder = remainder[1:]
+                if remainder.startswith((" ", "\t")) and remainder[1:].strip():
+                    payload["body"] = remainder[1:]
                     wire_text = text
 
         # Source native ref: MeshCore provides no native message ID
