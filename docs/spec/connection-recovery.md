@@ -17,8 +17,9 @@ would incorrectly reject supported selectors. Missing SDK support fails startup.
 
 ## Recovery cadence and host availability
 
-Background recovery MUST wait ten seconds before its first retry, then use
-exponential backoff capped at 300 seconds. Jitter MUST stay within the initial
+Background BLE recovery MUST wait ten seconds before its first retry, then use
+exponential backoff capped at 300 seconds. TCP and serial MUST retain their existing
+one-to-thirty-second policy. BLE jitter MUST stay within the initial
 delay and cap. Retry ownership MUST remain with the session, with one BLE SDK
 factory call per background attempt. Initial strict setup may retain its bounded
 three-call probe sequence; background recovery MUST NOT repeat that inner burst.

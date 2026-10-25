@@ -71,8 +71,8 @@ Reconnect Policy
 ----------------
 On unexpected disconnect the session attempts bounded exponential backoff:
 
-* Base delays: 10 s, 20 s, 40 s, 80 s, … capped at 300 s.
-* ±25 % jitter, bounded by a 10-second floor and 300-second ceiling.
+* BLE delays: 10 s, 20 s, 40 s, … capped at 300 s, with a 10-second floor.
+* TCP/serial retain their 1 s → 30 s policy. Both policies apply ±25 % jitter.
 * Background BLE recovery makes one native factory call per backoff interval.
 * Continue until connected or stopped, with 15-second TCP/serial or 45-second
   BLE setup budgets per attempt.
@@ -110,8 +110,10 @@ from medre.config.adapters.meshcore import MeshCoreConfig
 # ---------------------------------------------------------------------------
 
 # Reconnect backoff parameters.
-_RECONNECT_BASE_DELAY: float = 10.0  # seconds
-_RECONNECT_MAX_DELAY: float = 300.0  # seconds
+_RECONNECT_BASE_DELAY: float = 1.0  # TCP/serial seconds
+_RECONNECT_MAX_DELAY: float = 30.0  # TCP/serial seconds
+_BLE_RECONNECT_BASE_DELAY: float = 10.0
+_BLE_RECONNECT_MAX_DELAY: float = 300.0
 _RECONNECT_MAX_ATTEMPTS: int = 0  # zero keeps long-lived recovery active until stop
 _RECONNECT_JITTER_FRACTION: float = 0.25  # ±25 %
 
@@ -1568,12 +1570,16 @@ class MeshCoreSession:
     async def _reconnect_loop(self) -> None:
         """Bounded exponential backoff reconnect loop.
 
-        Delays: 10 s → 20 s → 40 s → … capped at 300 s.
-        ±25 % jitter stays between the initial delay and the cap. Retry until stopped by
+        BLE delays grow from ten seconds to five minutes, with jitter bounded by
+        those limits. TCP/serial retain the existing one-to-thirty-second policy.
+        Retry until stopped by
         default; a positive internal attempt cap is retained for strict probes.
         """
         self._diag.reconnecting = True
         self._diag.reconnect_attempts = 0
+        ble = self._config.connection_type == "ble"
+        base_delay = _BLE_RECONNECT_BASE_DELAY if ble else _RECONNECT_BASE_DELAY
+        max_delay = _BLE_RECONNECT_MAX_DELAY if ble else _RECONNECT_MAX_DELAY
 
         try:
             while not self._stop_requested and (
@@ -1581,14 +1587,13 @@ class MeshCoreSession:
                 or self._diag.reconnect_attempts < _RECONNECT_MAX_ATTEMPTS
             ):
                 delay = min(
-                    _RECONNECT_BASE_DELAY
-                    * (2 ** min(self._diag.reconnect_attempts, 30)),
-                    _RECONNECT_MAX_DELAY,
+                    base_delay * (2 ** min(self._diag.reconnect_attempts, 30)),
+                    max_delay,
                 )
                 # Apply jitter.
                 jitter = delay * _RECONNECT_JITTER_FRACTION
                 delay = delay + random.uniform(-jitter, jitter)
-                delay = min(_RECONNECT_MAX_DELAY, max(_RECONNECT_BASE_DELAY, delay))
+                delay = min(max_delay, max(base_delay if ble else 0.0, delay))
 
                 self._logger.info(
                     "MeshCoreSession %s: reconnect attempt %d%s in %.1fs",
