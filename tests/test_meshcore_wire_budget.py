@@ -138,7 +138,9 @@ async def test_delivery_rejects_non_string_rendered_text_before_native_send(inva
 
     adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id="mc", connection_type="fake"))
     malformed = RenderingResult(
-        event_id="invalid-wire", target_adapter="mc", target_channel="0",
+        event_id="invalid-wire",
+        target_adapter="mc",
+        target_channel="0",
         payload={"text": invalid, "channel_index": 0},
     )
     with pytest.raises(AdapterPermanentError, match="must be a string"):
