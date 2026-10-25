@@ -185,3 +185,25 @@ SDK-free tier. Native schemas and validated examples live in `docs/schemas` here
 This repository declares its own Ruff/Black policy. CI checks all Python source
 and tests, plus commit whitespace, alongside the fake/native qualification tiers.
 The native adapter package includes its own `py.typed` marker.
+
+## Offline startup and recovery
+
+A long-lived MEDRE adapter returns from initial setup in degraded health when
+its configured radio is unavailable. Each complete native connection attempt
+has a 15-second TCP/serial budget or a 45-second BLE budget (including BlueZ
+cleanup and discovery). One session-owned recovery loop then retries with
+exponential backoff and jitter, capped at 30 seconds between attempts, until the
+radio connects or the adapter stops. The SDK's own auto-reconnect stays disabled.
+Initial unavailability and later disconnects use the same serialized setup path.
+Missing SDKs and invalid configuration still fail explicitly.
+
+A disconnected started session reports transient send failure before any native
+handoff. MEDRE owns delivery retries and their configured limits; connection
+recovery does not guarantee unlimited message retention or native delivery.
+Stopping the adapter cancels recovery before native teardown. Native cancellation
+still depends on the pinned SDK and driver cooperating; this is not a process
+isolation boundary.
+
+Direct one-shot `MeshCoreSession.start()` callers retain strict connection
+failure by default; the production adapter explicitly requests degraded startup
+with `recover_on_failure=True`.

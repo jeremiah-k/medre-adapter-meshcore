@@ -212,7 +212,7 @@ async def test_session_start_raises_runtime_error_preserved() -> None:
 
 
 async def test_session_start_cancelled_error_propagates() -> None:
-    """CancelledError from session.start propagates and clears fields."""
+    """Cancellation preserves partial ownership until core invokes stop()."""
     adapter = MeshCoreAdapter(_make_config(connection_type="tcp", host="127.0.0.1"))
 
     with patch("medre.adapters.meshcore.adapter.MeshCoreSession") as MockSession:
@@ -223,10 +223,14 @@ async def test_session_start_cancelled_error_propagates() -> None:
         with pytest.raises(asyncio.CancelledError):
             await adapter.start(_make_ctx())
 
-    assert adapter._session is None
+    assert adapter._session is mock_inst
     assert adapter._started is False
-    assert adapter.ctx is None
+    assert adapter.ctx is not None
     assert adapter._start_time is None
+    mock_inst.stop.assert_not_awaited()
+    await adapter.stop()
+    mock_inst.stop.assert_awaited_once()
+    assert adapter._session is None
 
 
 async def test_cleanup_stop_raises_on_runtime_error_path() -> None:

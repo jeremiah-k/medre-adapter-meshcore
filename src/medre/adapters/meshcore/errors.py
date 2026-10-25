@@ -21,7 +21,18 @@ class MeshCoreError(Exception):
 
 
 class MeshCoreConnectionError(MeshCoreError):
-    """Raised when the adapter cannot connect to a MeshCore node."""
+    """Connection failure with explicit recoverability for lifecycle supervision.
+
+    ``transient=False`` denotes an SDK contract or configuration failure that
+    another connection attempt cannot repair. Transport failures default to
+    transient so an unavailable radio can recover without restarting MEDRE.
+    """
+
+    transient: bool
+
+    def __init__(self, *args: object, transient: bool = True) -> None:
+        self.transient = transient
+        super().__init__(*args)
 
 
 class MeshCoreSendError(MeshCoreError):
