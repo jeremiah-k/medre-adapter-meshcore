@@ -69,16 +69,62 @@ async def test_meshcore_renderer_uses_shared_text_authority(payload, expected):
 
     config = MeshCoreConfig(adapter_id="mc", meshcore_relay_prefix="")
     event = CanonicalEvent(
-        event_id="text-source", event_kind="message.created", schema_version=1,
-        timestamp=datetime.now(UTC), source_adapter="source",
-        source_transport_id="node", source_channel_id="0", parent_event_id=None,
-        lineage=(), relations=(), payload=payload, metadata=EventMetadata(),
+        event_id="text-source",
+        event_kind="message.created",
+        schema_version=1,
+        timestamp=datetime.now(UTC),
+        source_adapter="source",
+        source_transport_id="node",
+        source_channel_id="0",
+        parent_event_id=None,
+        lineage=(),
+        relations=(),
+        payload=payload,
+        metadata=EventMetadata(),
     )
     result = await MeshCoreRenderer(configs={"mc": config}).render(
         event,
         RenderingContext(
-            target_adapter="mc", target_channel="0",
-            target_platform="meshcore", delivery_strategy="direct",
+            target_adapter="mc",
+            target_channel="0",
+            target_platform="meshcore",
+            delivery_strategy="direct",
         ),
     )
     assert result.payload["text"] == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"body": "valid body", "text": 42},
+        {"body": 42, "text": "legacy"},
+        {"body": None, "text": "legacy", "formatting": {"version": 1, "spans": []}},
+    ],
+)
+async def test_malformed_canonical_text_never_becomes_radio_content(payload):
+    """Reject malformed source text before packet rendering or native dispatch."""
+    from datetime import UTC, datetime
+    from medre.adapters.meshcore.renderer import MeshCoreRenderer
+    from medre.core.events import CanonicalEvent, EventMetadata
+    from medre.core.rendering.renderer import RenderingContext
+
+    event = CanonicalEvent(
+        event_id="invalid-source",
+        event_kind="message.created",
+        schema_version=1,
+        timestamp=datetime.now(UTC),
+        source_adapter="source",
+        source_transport_id="node",
+        source_channel_id="0",
+        parent_event_id=None,
+        lineage=(),
+        relations=(),
+        payload=payload,
+        metadata=EventMetadata(),
+    )
+    renderer = MeshCoreRenderer(
+        configs={"mc": MeshCoreConfig(adapter_id="mc", meshcore_relay_prefix="")}
+    )
+    with pytest.raises(ValueError, match="must be text"):
+        await renderer.render(event, RenderingContext("direct", "mc", "0", "meshcore"))
