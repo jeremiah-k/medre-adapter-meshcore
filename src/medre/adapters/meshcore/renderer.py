@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 from medre.adapters.metadata import project_source_fields
 from medre.core.events import CanonicalEvent
+from medre.core.rendering.text_helpers import extract_message_body
 from medre.core.rendering.attribution import (
     build_relay_attribution,
     format_relay_prefix,
@@ -198,7 +199,7 @@ class MeshCoreRenderer:
             ),
         )
 
-        text = str(event.payload.get("text", event.payload.get("body", "")))
+        text = extract_message_body(event)
 
         # Parse channel index from ctx.target_channel
         try:
