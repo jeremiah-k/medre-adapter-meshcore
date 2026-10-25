@@ -128,3 +128,18 @@ async def test_malformed_canonical_text_never_becomes_radio_content(payload):
     )
     with pytest.raises(ValueError, match="must be text"):
         await renderer.render(event, RenderingContext("direct", "mc", "0", "meshcore"))
+
+
+@pytest.mark.parametrize("invalid", [42, None, False, ["hi"]])
+async def test_delivery_rejects_non_string_rendered_text_before_native_send(invalid):
+    """A caller-created RenderingResult cannot bypass source text validation."""
+    from medre.core.contracts.adapter import AdapterPermanentError
+    from medre.core.rendering.renderer import RenderingResult
+
+    adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id="mc", connection_type="fake"))
+    malformed = RenderingResult(
+        event_id="invalid-wire", target_adapter="mc", target_channel="0",
+        payload={"text": invalid, "channel_index": 0},
+    )
+    with pytest.raises(AdapterPermanentError, match="must be a string"):
+        await adapter.deliver(malformed)

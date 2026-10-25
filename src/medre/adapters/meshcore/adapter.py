@@ -455,6 +455,12 @@ class MeshCoreAdapter(AdapterContract):
                 f"the inbound path."
             )
 
+        # A caller may bypass the renderer with a prebuilt RenderingResult.
+        # Never stringify malformed content into a native radio packet.
+        payload = result.payload
+        if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+            raise AdapterPermanentError("MeshCore rendered text must be a string")
+
         # Fake mode explicitly models a successful synthetic transport hand-off.
         if self._config.connection_type == "fake":
             return AdapterHandoffResult(
@@ -472,7 +478,7 @@ class MeshCoreAdapter(AdapterContract):
                 "MeshCore renderer produced a non-mapping payload"
             )
 
-        text = payload.get("text", "")
+        text = payload["text"]
         channel_index = payload.get("channel_index")
         contact_id = str(payload.get("contact_id", ""))
 
@@ -485,7 +491,7 @@ class MeshCoreAdapter(AdapterContract):
         try:
             native_id = await self._session.send_text(
                 contact_id=contact_id,
-                text=str(text),
+                text=text,
                 channel_index=resolved_channel_index,
             )
         except asyncio.CancelledError:
