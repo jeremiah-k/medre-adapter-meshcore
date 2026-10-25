@@ -8,6 +8,7 @@ Hierarchy::
 
     MeshCoreError
     ├── MeshCoreConnectionError — connection failures
+    │   └── MeshCoreBluetoothUnavailableError — fixed host-controller guidance
     ├── MeshCoreSendError       — message send failures
     ├── MeshCoreCodecError      — encode / decode failures
     └── MeshCorePacketError     — malformed or unparseable packets
@@ -33,6 +34,21 @@ class MeshCoreConnectionError(MeshCoreError):
     def __init__(self, *args: object, transient: bool = True) -> None:
         self.transient = transient
         super().__init__(*args)
+
+
+class MeshCoreBluetoothUnavailableError(MeshCoreConnectionError):
+    """A host-controller outage with fixed, secret-free operator guidance.
+
+    SDK exception arguments stay in the cause chain for debugging. Public
+    diagnostics use this module-owned text even when a pairing PIN is configured.
+    The outage remains transient so existing background recovery stays active.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Bluetooth unavailable on this host; enable the controller "
+            "and recovery will retry automatically"
+        )
 
 
 class MeshCoreSendError(MeshCoreError):

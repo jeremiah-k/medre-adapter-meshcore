@@ -21,6 +21,8 @@ def recovering_session(monkeypatch):
     monkeypatch.setattr(session_module, "HAS_MESHCORE", True)
     monkeypatch.setattr(session_module, "_RECONNECT_BASE_DELAY", 0.0)
     monkeypatch.setattr(session_module, "_RECONNECT_MAX_DELAY", 0.0)
+    monkeypatch.setattr(session_module, "_BLE_RECONNECT_BASE_DELAY", 0.0)
+    monkeypatch.setattr(session_module, "_BLE_RECONNECT_MAX_DELAY", 0.0)
     monkeypatch.setattr(session_module, "_RECONNECT_JITTER_FRACTION", 0.0)
     return MeshCoreSession(
         MeshCoreConfig(

@@ -71,8 +71,9 @@ Reconnect Policy
 ----------------
 On unexpected disconnect the session attempts bounded exponential backoff:
 
-* Base delays: 1 s, 2 s, 4 s, 8 s, … capped at 30 s.
-* ±25 % jitter on each delay to avoid thundering-herd synchronisation.
+* BLE delays: 10 s, 20 s, 40 s, … capped at 300 s, with a 10-second floor.
+* TCP/serial retain their 1 s → 30 s policy. Both policies apply ±25 % jitter.
+* Background BLE recovery makes one native factory call per backoff interval.
 * Continue until connected or stopped, with 15-second TCP/serial or 45-second
   BLE setup budgets per attempt.
 * Known configuration and SDK contract errors stop recovery; transient transport
@@ -100,7 +101,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Protocol, cast
 
 from medre.adapters.meshcore.compat import HAS_MESHCORE
-from medre.adapters.meshcore.errors import MeshCoreConnectionError, MeshCoreSendError
+from medre.adapters.meshcore.errors import (
+    MeshCoreBluetoothUnavailableError,
+    MeshCoreConnectionError,
+    MeshCoreSendError,
+)
 from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
 from medre.config.adapters.meshcore import MeshCoreConfig
 
@@ -109,8 +114,10 @@ from medre.config.adapters.meshcore import MeshCoreConfig
 # ---------------------------------------------------------------------------
 
 # Reconnect backoff parameters.
-_RECONNECT_BASE_DELAY: float = 1.0  # seconds
-_RECONNECT_MAX_DELAY: float = 30.0  # seconds
+_RECONNECT_BASE_DELAY: float = 1.0  # TCP/serial seconds
+_RECONNECT_MAX_DELAY: float = 30.0  # TCP/serial seconds
+_BLE_RECONNECT_BASE_DELAY: float = 10.0
+_BLE_RECONNECT_MAX_DELAY: float = 300.0
 _RECONNECT_MAX_ATTEMPTS: int = 0  # zero keeps long-lived recovery active until stop
 _RECONNECT_JITTER_FRACTION: float = 0.25  # ±25 %
 
@@ -967,6 +974,9 @@ class MeshCoreSession:
         the exception class name and a redaction notice so that logs,
         diagnostics, and error messages never leak the PIN.
         """
+        if isinstance(exc, MeshCoreBluetoothUnavailableError):
+            # Recreate the fixed message instead of trusting mutable SDK args.
+            return str(MeshCoreBluetoothUnavailableError())
         if self._config.ble_pin is not None:
             return f"{type(exc).__name__}: [details redacted]"
         return str(exc)
@@ -978,7 +988,9 @@ class MeshCoreSession:
         with ``le-connection-abort-by-local`` while passing a
         ``BLEDevice`` from a live scan succeeds.
 
-        Returns the discovered device object, or ``None`` on failure.
+        Return the device, or ``None`` for an ordinary discovery miss. A typed
+        host Bluetooth outage is transient but must reach the session recovery
+        owner rather than triggering address-only connection attempts.
         """
         try:
             from bleak import BleakScanner
@@ -996,7 +1008,9 @@ class MeshCoreSession:
                 _match, timeout=5.0
             )
             return device
-        except Exception:
+        except Exception as exc:
+            if type(exc).__name__ == "BleakBluetoothNotAvailableError":
+                raise MeshCoreBluetoothUnavailableError() from exc
             return None
 
     async def _create_ble_with_retries(
@@ -1007,17 +1021,19 @@ class MeshCoreSession:
         *,
         pin: str | None = None,
     ) -> Any:
-        """Attempt ``MeshCore.create_ble()`` up to 3 times.
+        """Make one recovery factory call, or up to three initial probe calls.
 
         Both exceptions and ``None`` returns from ``create_ble()`` are
-        treated as retryable failures.  Between attempts the method
-        sleeps 2 s and re-scans for the BLE device.
+        treated as retryable failures. Initial setup may retry after a two-second
+        delay and fresh scan. Background recovery delegates retry timing to its
+        existing outer owner, avoiding nested bursts. Host unavailability skips
+        the remaining initial attempts too.
 
         Returns the connected MeshCore instance on success.
         Raises :class:`MeshCoreConnectionError` after all attempts
         are exhausted.
         """
-        _max_attempts = 3
+        _max_attempts = 1 if self._diag.reconnecting else 3
         _last_reason: str = "unknown"
 
         for attempt in range(1, _max_attempts + 1):
@@ -1026,7 +1042,7 @@ class MeshCoreSession:
                     "address": address,
                     "device": ble_device,
                 }
-                if pin is not None:
+                if pin is not None and not self._diag.reconnecting:
                     _ble_kwargs["pin"] = pin
                 # MEDRE owns reconnect and always creates a fresh SDK client.
                 _ble_kwargs["auto_reconnect"] = False
@@ -1059,6 +1075,8 @@ class MeshCoreSession:
                 )
             except Exception as exc:
                 _last_reason = self._sanitize_ble_exc(exc)
+                if type(exc).__name__ == "BleakBluetoothNotAvailableError":
+                    raise MeshCoreBluetoothUnavailableError() from exc
                 if self._permanent_setup_error(exc):
                     raise MeshCoreConnectionError(
                         f"BLE setup contract failed: {_last_reason}", transient=False
@@ -1096,6 +1114,8 @@ class MeshCoreSession:
                 # fallback on the next create_ble().
                 try:
                     ble_device = await self._find_ble_device(address)
+                except MeshCoreConnectionError:
+                    raise
                 except Exception:
                     ble_device = None
 
@@ -1551,12 +1571,16 @@ class MeshCoreSession:
     async def _reconnect_loop(self) -> None:
         """Bounded exponential backoff reconnect loop.
 
-        Delays: 1 s → 2 s → 4 s → 8 s → … capped at 30 s.
-        ±25 % jitter with a hard 30-second delay cap. Retry until stopped by
+        BLE delays grow from ten seconds to five minutes, with jitter bounded by
+        those limits. TCP/serial retain the existing one-to-thirty-second policy.
+        Retry until stopped by
         default; a positive internal attempt cap is retained for strict probes.
         """
         self._diag.reconnecting = True
         self._diag.reconnect_attempts = 0
+        ble = self._config.connection_type == "ble"
+        base_delay = _BLE_RECONNECT_BASE_DELAY if ble else _RECONNECT_BASE_DELAY
+        max_delay = _BLE_RECONNECT_MAX_DELAY if ble else _RECONNECT_MAX_DELAY
 
         try:
             while not self._stop_requested and (
@@ -1564,14 +1588,13 @@ class MeshCoreSession:
                 or self._diag.reconnect_attempts < _RECONNECT_MAX_ATTEMPTS
             ):
                 delay = min(
-                    _RECONNECT_BASE_DELAY
-                    * (2 ** min(self._diag.reconnect_attempts, 30)),
-                    _RECONNECT_MAX_DELAY,
+                    base_delay * (2 ** min(self._diag.reconnect_attempts, 30)),
+                    max_delay,
                 )
                 # Apply jitter.
                 jitter = delay * _RECONNECT_JITTER_FRACTION
                 delay = delay + random.uniform(-jitter, jitter)
-                delay = min(_RECONNECT_MAX_DELAY, max(0.0, delay))
+                delay = min(max_delay, max(base_delay if ble else 0.0, delay))
 
                 self._logger.info(
                     "MeshCoreSession %s: reconnect attempt %d%s in %.1fs",
