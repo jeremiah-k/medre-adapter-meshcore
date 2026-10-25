@@ -1635,6 +1635,11 @@ class MeshCoreSession:
     # ------------------------------------------------------------------
 
     @property
+    def local_node_name(self) -> str | None:
+        """Own advertised node name captured from SDK self-info, with config fallback."""
+        return self._diag.device_name or self._config.identity
+
+    @property
     def group_text_budget(self) -> int:
         """Safe group payload bytes after the device's firmware-added prefix."""
         return group_text_budget(self._config.max_text_bytes, self._diag.device_name)

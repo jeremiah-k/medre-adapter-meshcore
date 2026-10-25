@@ -527,6 +527,13 @@ class MeshCoreAdapter(AdapterContract):
 
     # -- Inbound callback ---------------------------------------------------
 
+    def _local_node_name(self) -> str | None:
+        """Resolve only this adapter's own name; never infer it from incoming text."""
+        name = getattr(self._session, "local_node_name", None)
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return self._config.identity
+
     def _on_message(self, packet: dict[str, Any]) -> None:
         """Process an inbound MeshCore event payload from the session.
 
@@ -580,7 +587,11 @@ class MeshCoreAdapter(AdapterContract):
             # Decode before committing dedup key so that decode failures
             # do not suppress redelivery of the same packet.
             contact_label = self._resolve_contact_label(classification.sender_id)
-            canonical = self._codec.decode(packet, contact_label=contact_label)
+            canonical = self._codec.decode(
+                packet,
+                contact_label=contact_label,
+                local_node_name=self._local_node_name(),
+            )
 
             # Commit dedup key only after successful decode.  The key
             # guards the async publish window against concurrent
@@ -693,7 +704,11 @@ class MeshCoreAdapter(AdapterContract):
         # Decode and publish before committing dedup key so that
         # failures do not suppress redelivery.
         contact_label = self._resolve_contact_label(classification.sender_id)
-        canonical = self._codec.decode(packet, contact_label=contact_label)
+        canonical = self._codec.decode(
+            packet,
+            contact_label=contact_label,
+            local_node_name=self._local_node_name(),
+        )
         await self.publish_inbound(canonical)
         self._inbound_published += 1
 
