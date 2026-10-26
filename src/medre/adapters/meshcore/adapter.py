@@ -193,6 +193,7 @@ class MeshCoreAdapter(AdapterContract):
 
     adapter_id: str
     platform: str = "meshcore"
+    supports_radio_multipart: bool = True
     role: AdapterRole = AdapterRole.TRANSPORT
 
     def __init__(self, config: MeshCoreConfig) -> None:
@@ -455,14 +456,24 @@ class MeshCoreAdapter(AdapterContract):
                 f"the inbound path."
             )
 
+        if result.radio_plan is not None:
+            raise AdapterPermanentError(
+                "MeshCore radio plans require core-owned packet dispatch"
+            )
+
         # A caller may bypass the renderer with a prebuilt RenderingResult.
         # Never stringify malformed content into a native radio packet.
         payload = result.payload
-        if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+        if not isinstance(payload, dict):
+            raise AdapterPermanentError("MeshCore rendered text must be a string")
+        text = payload.get("text")
+        if not isinstance(text, str):
             raise AdapterPermanentError("MeshCore rendered text must be a string")
 
         # Fake mode explicitly models a successful synthetic transport hand-off.
         if self._config.connection_type == "fake":
+            if result.before_native_send is not None:
+                await result.before_native_send()
             return AdapterHandoffResult(
                 confirmation_level="unknown",
                 note="fake MeshCore transport hand-off",
@@ -472,7 +483,6 @@ class MeshCoreAdapter(AdapterContract):
         if self._session is None:
             raise AdapterPermanentError("Session not initialised")
 
-        text = payload["text"]
         channel_index = payload.get("channel_index")
         contact_id = str(payload.get("contact_id", ""))
 
@@ -483,11 +493,19 @@ class MeshCoreAdapter(AdapterContract):
         )
 
         try:
-            native_id = await self._session.send_text(
-                contact_id=contact_id,
-                text=text,
-                channel_index=resolved_channel_index,
-            )
+            if result.before_native_send is None:
+                native_id = await self._session.send_text(
+                    contact_id=contact_id,
+                    text=text,
+                    channel_index=resolved_channel_index,
+                )
+            else:
+                native_id = await self._session.send_text(
+                    contact_id=contact_id,
+                    text=text,
+                    channel_index=resolved_channel_index,
+                    before_native_send=result.before_native_send,
+                )
         except asyncio.CancelledError:
             raise
         except MeshCoreSendError as exc:

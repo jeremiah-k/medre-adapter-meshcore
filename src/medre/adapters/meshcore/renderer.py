@@ -35,11 +35,11 @@ Contact/channel/destination semantics and target
 addressing are retained in the native MeshCore structure.  The result
 carries ``fallback_applied="strategy_fallback_text"``.
 
-Text messages are supported.  UTF-8 byte-budget truncation is applied
-after final text rendering using :attr:`MeshCoreConfig.max_text_bytes`.
-Multi-byte UTF-8 codepoints are never split.  Truncation metadata and
-the ``RenderingResult.truncated`` flag report whether the text was
-trimmed.
+Text messages use bounded single-packet rendering by default. Explicit
+``max_text_parts > 1`` opts long ordinary messages into the shared immutable
+radio planner; core owns durable packet handoffs. Attribution, numbering and
+UTF-8 code points respect every effective per-packet budget. Plans exceeding
+the part cap fail as a whole rather than clipping an incomplete message.
 
 **Important**: local send acceptance is not delivery confirmation.
 """
@@ -55,6 +55,7 @@ from medre.core.rendering.attribution import (
     build_relay_attribution,
     format_relay_prefix,
 )
+from medre.core.rendering.radio_text import plan_radio_text
 from medre.core.rendering.relations import degrade_relations_inline
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
 
@@ -145,8 +146,8 @@ class MeshCoreRenderer:
 
         The rendered payload includes:
 
-        * ``text``: extracted text from the event payload, truncated
-          to the configured ``max_text_bytes`` UTF-8 byte budget.
+        * ``text``: the bounded single packet, or the first exact packet
+          of an opted-in ``radio_plan`` containing the complete message.
         * ``channel_index``: parsed from ``ctx.target_channel`` or
           ``config.default_channel``.
 
@@ -213,6 +214,9 @@ class MeshCoreRenderer:
         if is_fallback:
             text = self._degrade_relations_inline(event, text)
 
+        body = text
+        wire_prefix = ""
+
         # -- Optional relay prefix (prepended before truncation) ---------
         prefix_template = adapter_config.meshcore_relay_prefix
         rendered_prefix = ""
@@ -263,12 +267,31 @@ class MeshCoreRenderer:
                 prefix_formatting_error
                 and prefix_formatting_error.startswith("formatting_exception:")
             ):
+                wire_prefix = rendered_prefix
                 text = rendered_prefix + text
 
-        # -- UTF-8 byte-budget truncation after final rendering ------
-        truncated_text, was_truncated, original_bytes, rendered_bytes = (
-            self._truncate_utf8_bytes(text, max_text_bytes)
-        )
+        # Long ordinary messages use the exact shared wire plan only when the
+        # operator opts in. Reactions retain the established single-packet path.
+        radio_plan = None
+        if (
+            adapter_config.max_text_parts > 1
+            and event.event_kind == "message.created"
+            and len(text.encode("utf-8")) > max_text_bytes
+        ):
+            radio_plan = plan_radio_text(
+                body,
+                prefix=wire_prefix,
+                max_text_bytes=max_text_bytes,
+                max_parts=adapter_config.max_text_parts,
+            )
+            truncated_text = radio_plan.parts[0].wire_text
+            was_truncated = False
+            original_bytes = len(text.encode("utf-8"))
+            rendered_bytes = sum(part.wire_bytes for part in radio_plan.parts)
+        else:
+            truncated_text, was_truncated, original_bytes, rendered_bytes = (
+                self._truncate_utf8_bytes(text, max_text_bytes)
+            )
 
         content: dict[str, object] = {
             "text": truncated_text,
@@ -278,12 +301,23 @@ class MeshCoreRenderer:
         metadata: dict[str, object] = {
             "renderer": self.name,
             "original_length": len(text),
-            "rendered_length": len(truncated_text),
+            "rendered_length": (
+                sum(len(part.wire_text) for part in radio_plan.parts)
+                if radio_plan is not None
+                else len(truncated_text)
+            ),
             "original_text_bytes": original_bytes,
             "rendered_text_bytes": rendered_bytes,
             "max_text_bytes": max_text_bytes,
             "truncated": was_truncated,
         }
+
+        if radio_plan is not None:
+            metadata["rendered_text_chars"] = sum(
+                len(part.wire_text) for part in radio_plan.parts
+            )
+            metadata["radio_part_count"] = len(radio_plan.parts)
+            metadata["radio_plan_fingerprint"] = radio_plan.fingerprint
 
         # Prefix-specific metadata (only when prefix is configured).
         if prefix_template:
@@ -301,6 +335,7 @@ class MeshCoreRenderer:
             payload=content,
             metadata=metadata,
             truncated=was_truncated,
+            radio_plan=radio_plan,
             fallback_applied="strategy_fallback_text" if is_fallback else None,
         )
 
