@@ -275,6 +275,7 @@ class MeshCoreRenderer:
         radio_plan = None
         if (
             adapter_config.max_text_parts > 1
+            and max_text_bytes > 0
             and event.event_kind == "message.created"
             and len(text.encode("utf-8")) > max_text_bytes
         ):

@@ -1710,6 +1710,9 @@ class MeshCoreSession:
         """
         if self._meshcore is None:
             raise MeshCoreSendError("SDK client not initialised", transient=False)
+        # Keep the exact native client identity across the storage grant await.
+        # A reconnect must never redirect an already-consumed grant to its new SDK.
+        sdk_client = self._meshcore
 
         limit = (
             self.group_text_budget if channel_index is not None else GROUP_TEXT_BYTES
@@ -1730,11 +1733,27 @@ class MeshCoreSession:
                 await asyncio.sleep(self._config.message_delay_seconds)
 
             if before_native_send is not None:
-                if self._stop_requested or not self._diag.connected:
+                if (
+                    self._stop_requested
+                    or not self._diag.connected
+                    or self._meshcore is not sdk_client
+                ):
                     raise MeshCoreSendError(
                         "Session unavailable before native handoff", transient=True
                     )
                 await before_native_send()
+                # The grant awaited SQLite while stop()/reconnect may have
+                # changed the session. It is now consumed, so abort without
+                # any native call; core retains this packet as uncertain.
+                if (
+                    self._stop_requested
+                    or not self._diag.connected
+                    or self._meshcore is not sdk_client
+                ):
+                    raise MeshCoreSendError(
+                        "Session changed after native handoff grant",
+                        transient=False,
+                    )
             attempt_limit = 1 if before_native_send is not None else _SEND_MAX_RETRIES
             last_exc: Exception | None = None
             for attempt in range(1, attempt_limit + 1):
