@@ -92,6 +92,7 @@ On unexpected disconnect the session attempts bounded exponential backoff:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 import importlib
 import logging
 import math
@@ -585,6 +586,7 @@ class MeshCoreSession:
         text: str,
         *,
         channel_index: int | None = None,
+        before_native_send: Callable[[], Awaitable[None]] | None = None,
     ) -> str | None:
         """Send a text message via the MeshCore SDK.
 
@@ -599,6 +601,11 @@ class MeshCoreSession:
         channel_index:
             If provided, sends a channel message on this index instead
             of a DM.
+        before_native_send:
+            Optional one-use core grant for a planned packet. Called under the
+            send lock after pacing, immediately before one SDK invocation.
+            Guarded packets disable internal retries so ambiguous native
+            acceptance cannot be replayed without durable evidence.
 
         Returns
         -------
@@ -621,7 +628,14 @@ class MeshCoreSession:
             # Fake mode — no real send.
             return None
 
-        return await self._send_real(contact_id, text, channel_index=channel_index)
+        if before_native_send is None:
+            return await self._send_real(contact_id, text, channel_index=channel_index)
+        return await self._send_real(
+            contact_id,
+            text,
+            channel_index=channel_index,
+            before_native_send=before_native_send,
+        )
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -1673,8 +1687,13 @@ class MeshCoreSession:
         text: str,
         *,
         channel_index: int | None = None,
+        before_native_send: Callable[[], Awaitable[None]] | None = None,
     ) -> str | None:
-        """Send via real SDK with bounded retry.
+        """Send via the paced owner; guarded packets permit one native call.
+
+        ``before_native_send`` commits the core packet boundary inside this
+        lock. Its exceptions propagate before SDK use. Ordinary, unguarded
+        calls retain the legacy bounded retry policy described below.
 
         .. warning::
 
@@ -1710,8 +1729,15 @@ class MeshCoreSession:
             if self._config.message_delay_seconds > 0:
                 await asyncio.sleep(self._config.message_delay_seconds)
 
+            if before_native_send is not None:
+                if self._stop_requested or not self._diag.connected:
+                    raise MeshCoreSendError(
+                        "Session unavailable before native handoff", transient=True
+                    )
+                await before_native_send()
+            attempt_limit = 1 if before_native_send is not None else _SEND_MAX_RETRIES
             last_exc: Exception | None = None
-            for attempt in range(1, _SEND_MAX_RETRIES + 1):
+            for attempt in range(1, attempt_limit + 1):
                 try:
                     if channel_index is not None:
                         result = await self._meshcore.commands.send_chan_msg(
@@ -1824,10 +1850,10 @@ class MeshCoreSession:
                         "MeshCoreSession %s: send attempt %d/%d failed: %s",
                         self._adapter_id,
                         attempt,
-                        _SEND_MAX_RETRIES,
+                        attempt_limit,
                         exc,
                     )
-                    if attempt < _SEND_MAX_RETRIES:
+                    if attempt < attempt_limit:
                         # Use cached SDK suggested_timeout for DM retries
                         # when available, otherwise fall back to linear backoff.
                         # Only DM sends (channel_index is None) use cached delays.
@@ -1844,5 +1870,5 @@ class MeshCoreSession:
 
             self._diag.permanent_delivery_failures += 1
             raise MeshCoreSendError(
-                f"Send failed after {_SEND_MAX_RETRIES} attempts: {last_exc}"
+                f"Send failed after {attempt_limit} attempts: {last_exc}"
             ) from last_exc

@@ -103,6 +103,10 @@ class MeshCoreConfig:
     node_config:
         Opaque dict for future node-specific settings.  Must not
         contain secret/private-key fields.
+    max_text_parts:
+        Opt into guarded multipart text with a limit from 2 to 128. The default
+        1 retains bounded single-packet rendering. Multipart requires a durable
+        core attempt and preserves uncertainty without automatic resend.
     max_text_bytes:
         Operator upper bound for final UTF-8 text after rendering.
         Default: ``160``; firmware prefix overhead further reduces group text.  ``0`` means the final text
@@ -132,6 +136,7 @@ class MeshCoreConfig:
     identity: str | None = None
     pubkey: str | None = None
     node_config: dict[str, object] = field(default_factory=dict)
+    max_text_parts: int = 1
     max_text_bytes: int = GROUP_TEXT_BYTES
     meshcore_relay_prefix: str = ""
 
@@ -176,6 +181,10 @@ class MeshCoreConfig:
         if self.default_channel < 0:
             raise MeshCoreConfigError(
                 f"default_channel must be >= 0, got {self.default_channel}"
+            )
+        if type(self.max_text_parts) is not int or not 1 <= self.max_text_parts <= 128:
+            raise MeshCoreConfigError(
+                "max_text_parts must be an integer between 1 and 128"
             )
         if isinstance(self.max_text_bytes, bool):
             raise MeshCoreConfigError("max_text_bytes must be an int, got bool")
