@@ -14,7 +14,6 @@ BLE discovery selectors may be advertised names, addresses or platform UUIDs.
 A selector absent from discovery is a reachability failure; a MAC-only validator
 would incorrectly reject supported selectors. Missing SDK support fails startup.
 
-
 ## Recovery cadence and host availability
 
 Background BLE recovery MUST wait ten seconds before its first retry, then use
@@ -35,3 +34,18 @@ The configured pairing PIN MAY be used during explicit initial setup. Background
 recovery MUST omit it from SDK factory calls and reuse only existing bonds.
 Typed host-controller errors MUST retain fixed, secret-free recovery guidance
 even when a PIN is configured; arbitrary SDK exception text remains redacted.
+
+## Native health observations
+
+A successful native handshake and event subscription MUST make connected health
+healthy, including after degraded startup. Disconnects and completed recovery
+MUST update cached diagnostics without requiring a health probe. The adapter MAY
+publish the same `AdapterInfo` through the runtime's optional `report_health`
+context sink. The session MUST publish connection transitions only after updating
+its owned connection state, and MUST suppress duplicate connection notifications.
+Retired session callbacks MUST NOT publish a replacement lifetime's health.
+A diagnostic observer failure MUST NOT fail native startup, cleanup or delivery.
+
+Native health reports do not change packet acceptance or confirmation levels.
+The core runtime preserves startup history and publishes current health
+separately. A runtime without a report sink continues to use health probes.

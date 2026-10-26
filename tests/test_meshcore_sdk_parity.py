@@ -64,8 +64,9 @@ def _make_session_with_mock() -> tuple[MeshCoreSession, AsyncMock]:
 class TestHealthLifecycleParity:
     """Diagnostics health follows the lifecycle rule.
 
-    - None before first health_check per lifecycle.
-    - Clears on start/stop/restart.
+    - None before start and after stop.
+    - Published from the session's connection state once start()
+      completes, without waiting for a health probe.
     - health_lifecycle_epoch increments on transitions.
     """
 
@@ -82,16 +83,17 @@ class TestHealthLifecycleParity:
         adapter = MeshCoreAdapter(config)
         assert adapter._health_lifecycle_epoch == 0
 
-    async def test_health_none_after_start_before_health_check(
+    async def test_health_published_after_start_without_probe(
         self, make_adapter_context
     ) -> None:
-        """After start(), health remains None until health_check() is called."""
+        """start() publishes health from the completed connection, before
+        any health_check() call."""
         config = _make_config(connection_type="fake")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("health-test")
         await adapter.start(ctx)
         diag = adapter.diagnostics()
-        assert diag["health"] is None
+        assert diag["health"] == "healthy"
         # Epoch should have incremented on start.
         assert diag["health_lifecycle_epoch"] == 1
 
@@ -120,7 +122,8 @@ class TestHealthLifecycleParity:
         assert adapter.diagnostics()["health_lifecycle_epoch"] == 2
 
     async def test_health_clears_on_restart(self, make_adapter_context) -> None:
-        """Restart (stop + start) resets health to None."""
+        """Restart (stop + start) clears health at the stop boundary and
+        republishes the new session's state on start."""
         config = _make_config(connection_type="fake")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("health-test")
@@ -130,8 +133,12 @@ class TestHealthLifecycleParity:
         assert adapter.diagnostics()["health"] == "healthy"
 
         await adapter.stop()
-        await adapter.start(ctx)
         assert adapter.diagnostics()["health"] is None
+        # Simulate a stale value leaking in between lifetimes.
+        adapter._last_health = "failed"
+
+        await adapter.start(ctx)
+        assert adapter.diagnostics()["health"] == "healthy"
         # Epoch: 1 (start) + 1 (stop) + 1 (start) = 3
         assert adapter.diagnostics()["health_lifecycle_epoch"] == 3
 
