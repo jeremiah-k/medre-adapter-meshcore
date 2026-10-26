@@ -291,6 +291,7 @@ class MeshCoreSession:
         platform: str = "meshcore",
         *,
         logger: logging.Logger | None = None,
+        on_connection_change: Callable[[bool], None] | None = None,
     ) -> None:
         self._config = config
         self._adapter_id = adapter_id
@@ -305,6 +306,7 @@ class MeshCoreSession:
 
         # Inbound callback set via start().
         self._message_callback: MessageCallback | None = None
+        self._on_connection_change = on_connection_change
 
         # Lifecycle guards.
         self._started: bool = False
@@ -333,6 +335,24 @@ class MeshCoreSession:
     # ------------------------------------------------------------------
     # Public properties
     # ------------------------------------------------------------------
+
+    def _set_connected(self, connected: bool) -> None:
+        """Publish actual native connection transitions after updating diagnostics.
+
+        Recovery and disconnects share this path. Callback failures cannot
+        change native ownership or interrupt session cleanup.
+        """
+        changed = self._diag.connected != connected
+        self._diag.connected = connected
+        if changed and self._on_connection_change is not None:
+            try:
+                self._on_connection_change(connected)
+            except Exception as exc:
+                self._logger.warning(
+                    "MeshCoreSession %s: connection notification failed (%s)",
+                    self._adapter_id,
+                    type(exc).__name__,
+                )
 
     @property
     def connected(self) -> bool:
@@ -418,7 +438,7 @@ class MeshCoreSession:
 
         if self._config.connection_type == "fake":
             # Fake mode: no real SDK client needed.
-            self._diag.connected = True
+            self._set_connected(True)
         else:
             if not HAS_MESHCORE:
                 await self._cleanup_failed_start()
@@ -433,7 +453,7 @@ class MeshCoreSession:
                     if not recover_on_failure or self._permanent_setup_error(exc):
                         await self._cleanup_failed_start()
                         raise
-                    self._diag.connected = False
+                    self._set_connected(False)
                     self._diag.last_error = self._sanitize_ble_exc(exc)
                     self._logger.warning(
                         "MeshCoreSession %s initial connection unavailable; "
@@ -481,7 +501,7 @@ class MeshCoreSession:
             and self._reconnect_task is None
         ):
             self._message_callback = None
-            self._diag.connected = False
+            self._set_connected(False)
             self._diag.reconnecting = False
             return
 
@@ -560,7 +580,7 @@ class MeshCoreSession:
                     _SDK_LIFECYCLE_TIMEOUT,
                 )
 
-        self._diag.connected = False
+        self._set_connected(False)
         self._diag.reconnecting = False
         # Reset observability counters on stop so they don't leak across
         # lifecycles.  Contact/self-info data is per-session.
@@ -750,11 +770,11 @@ class MeshCoreSession:
             except asyncio.CancelledError:
                 self._stop_requested = True
                 await self._cleanup_stale_sdk()
-                self._diag.connected = False
+                self._set_connected(False)
                 raise
             except Exception as exc:
                 await self._cleanup_stale_sdk()
-                self._diag.connected = False
+                self._set_connected(False)
                 if deadline.expired():
                     raise MeshCoreConnectionError(
                         f"Native connection attempt exceeded {attempt_timeout:g}s"
@@ -780,7 +800,7 @@ class MeshCoreSession:
         ``last_error`` for diagnostics.
         """
         self._message_callback = None
-        self._diag.connected = False
+        self._set_connected(False)
         self._diag.reconnecting = False
         self._subscriptions.clear()
         self._contact_retry_delays.clear()
@@ -1319,7 +1339,7 @@ class MeshCoreSession:
 
         # The handshake/subscription has succeeded. A disconnect during the
         # following await must stay observable rather than being overwritten.
-        self._diag.connected = True
+        self._set_connected(True)
 
         # Start auto message fetching to drain buffered messages from the device.
         # Best-effort: failure is logged but does not prevent connection.
@@ -1513,7 +1533,7 @@ class MeshCoreSession:
 
     async def _on_disconnect_event(self, event: Any) -> None:
         """Handle SDK disconnect event — trigger reconnect if appropriate."""
-        self._diag.connected = False
+        self._set_connected(False)
         self._logger.warning("MeshCoreSession %s: SDK disconnected", self._adapter_id)
 
         if self._stop_requested or not self._started:

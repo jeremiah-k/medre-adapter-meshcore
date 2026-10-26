@@ -1199,16 +1199,17 @@ class TestMeshCoreLifecycleGuardOnMessageAsync:
 
 
 class TestMeshCoreLastHealthLifecycleBoundary:
-    """_last_health is cleared at start/stop boundaries.
+    """_last_health is replaced at start/stop boundaries.
 
-    Regression: cached _last_health must be reset to None on start()
-    and stop() so diagnostics never reports a stale health string from
-    a previous session.
+    Regression: cached _last_health must never expose a stale health
+    string from a previous session. start() discards it and publishes a
+    fresh observation from the new session's connection state; stop()
+    clears it to None.
     """
 
-    async def test_last_health_cleared_on_start(self, make_adapter_context) -> None:
-        """start() clears _last_health so a stale value from a prior
-        session does not leak into diagnostics."""
+    async def test_last_health_replaced_on_start(self, make_adapter_context) -> None:
+        """start() discards stale _last_health and publishes the new
+        session's connection state instead."""
         config = _make_config(connection_type="fake")
         adapter = MeshCoreAdapter(config)
         ctx = make_adapter_context("meshcore-1")
@@ -1217,7 +1218,7 @@ class TestMeshCoreLastHealthLifecycleBoundary:
         adapter._last_health = "failed"
 
         await adapter.start(ctx)
-        assert adapter._last_health is None
+        assert adapter._last_health == "healthy"
 
         await adapter.stop()
 

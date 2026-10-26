@@ -307,12 +307,14 @@ class MeshCoreAdapter(AdapterContract):
 
         self.ctx = ctx
 
+        health_epoch = self._health_lifecycle_epoch
         # Create and start the session.
         self._session = MeshCoreSession(
             config=self._config,
             adapter_id=self.adapter_id,
             platform=self.platform,
             logger=ctx.logger,
+            on_connection_change=lambda _: self._report_native_health(health_epoch),
         )
         try:
             await self._session.start(
@@ -340,6 +342,7 @@ class MeshCoreAdapter(AdapterContract):
 
         self._mark_started(ctx)
         self._started = True
+        self._report_native_health(health_epoch)
         ctx.logger.info(
             "MeshCoreAdapter %s started (mode=%s)",
             self.adapter_id,
@@ -394,6 +397,27 @@ class MeshCoreAdapter(AdapterContract):
             - ``"degraded"`` — adapter started but session disconnected.
             - ``"unknown"`` — adapter not yet started.
         """
+        return self._health_info()
+
+    def _report_native_health(self, epoch: int) -> None:
+        """Keep native diagnostics current and notify only this adapter lifetime."""
+        if epoch != self._health_lifecycle_epoch or not self._started:
+            return
+        info = self._health_info()
+        report = getattr(self.ctx, "report_health", None)
+        if report is not None:
+            try:
+                report(info)
+            except Exception as exc:
+                if self.ctx is not None:
+                    self.ctx.logger.warning(
+                        "MeshCoreAdapter %s: health notification failed (%s)",
+                        self.adapter_id,
+                        type(exc).__name__,
+                    )
+
+    def _health_info(self) -> AdapterInfo:
+        """Share one readiness calculation between probes and native transitions."""
         if self._started:
             if self._session is not None and self._session.connected:
                 health = "healthy"
