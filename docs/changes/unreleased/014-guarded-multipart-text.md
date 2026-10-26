@@ -7,8 +7,12 @@ rejects the complete message before sending.
 
 The coordinated core PR persists plans and local progress. Each packet receives
 a one-use grant inside the existing paced send owner and permits only one native
-call. Ambiguous handoffs stop rather than retry, and a partial message cannot
-complete the parent or create an arbitrary whole-message native reply target.
+call. If shutdown or reconnection changes the session while the grant awaits
+storage, the consumed grant does not enter a native command and its packet stays
+uncertain. Ambiguous handoffs stop rather than retry, and a partial message
+cannot complete the parent or create an arbitrary whole-message native reply
+target. Zero-byte budgets retain empty single-packet rendering, and the new
+part-count option follows existing positional configuration fields.
 
 Package version stays 0.1.0. Deterministic tests are separate from installed-SDK
 and physical-radio qualification; no hardware campaign is claimed here.

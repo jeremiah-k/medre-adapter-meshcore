@@ -92,6 +92,44 @@ async def test_single_packet_defaults_remain_bounded_and_opt_in_rejects_overflow
     assert short.payload["text"] == "[North] short"
 
 
+async def test_zero_byte_budget_stays_on_bounded_single_packet_path():
+    """No multi-part planner may turn a zero-byte budget into a send attempt."""
+    config = MeshCoreConfig(
+        adapter_id="mc",
+        max_text_bytes=0,
+        max_text_parts=16,
+        meshcore_relay_prefix="[North] ",
+    )
+    result = await MeshCoreRenderer(configs={"mc": config}).render(
+        event("radio body"),
+        RenderingContext(
+            target_adapter="mc",
+            target_channel="0",
+            target_platform="meshcore",
+            delivery_strategy="direct",
+        ),
+    )
+    assert result.radio_plan is None
+    assert result.payload["text"] == ""
+    assert result.truncated is True
+
+
+def test_part_limit_appends_after_existing_positional_fields():
+    """Adding the opt-in must not change preexisting positional config values."""
+    from dataclasses import fields
+
+    defaults = MeshCoreConfig(adapter_id="mc")
+    names = [field.name for field in fields(defaults)]
+    assert names.index("max_text_parts") > names.index("meshcore_relay_prefix")
+    args = [getattr(defaults, name) for name in names[: names.index("max_text_parts")]]
+    args[names.index("max_text_bytes")] = 40
+    args[names.index("meshcore_relay_prefix")] = "[North] "
+    config = MeshCoreConfig(*args)
+    assert config.max_text_bytes == 40
+    assert config.meshcore_relay_prefix == "[North] "
+    assert config.max_text_parts == 1
+
+
 @pytest.mark.parametrize("value", [True, False, 0, 129, 2.5, "2", None])
 def test_part_limit_rejects_invalid_config(value):
     """The explicit opt-in is bounded and does not interpret bool as an integer."""
@@ -202,6 +240,53 @@ async def test_stop_while_waiting_for_send_owner_blocks_grant_and_native():
         await task
     grant.assert_not_awaited()
     native.assert_not_awaited()
+
+
+@pytest.mark.parametrize("interruption", ["stop", "disconnect", "replace_sdk"])
+async def test_session_changes_during_guard_never_reach_native(interruption):
+    """A committed grant cannot send through a stopped or replaced SDK client."""
+    config = MeshCoreConfig(
+        adapter_id="mc",
+        connection_type="tcp",
+        host="localhost",
+        message_delay_seconds=0,
+    )
+    session = MeshCoreSession(config, "mc")
+    session._diag.connected = True
+    original_native = AsyncMock()
+    replacement_native = AsyncMock()
+    original_client = SimpleNamespace(
+        commands=SimpleNamespace(send_chan_msg=original_native)
+    )
+    session._meshcore = original_client
+    grant_entered = asyncio.Event()
+    release_grant = asyncio.Event()
+    grants = []
+
+    async def grant():
+        assert session._send_lock.locked()
+        grants.append(True)
+        grant_entered.set()
+        await release_grant.wait()  # storage I/O yields to stop or reconnect
+
+    task = asyncio.create_task(
+        session.send_text("", "packet", channel_index=0, before_native_send=grant)
+    )
+    await grant_entered.wait()
+    if interruption == "stop":
+        session._stop_requested = True
+    elif interruption == "disconnect":
+        session._diag.connected = False
+    else:
+        session._meshcore = SimpleNamespace(
+            commands=SimpleNamespace(send_chan_msg=replacement_native)
+        )
+    release_grant.set()
+    with pytest.raises(MeshCoreSendError, match="changed after native handoff grant"):
+        await task
+    assert grants == [True]
+    original_native.assert_not_awaited()
+    replacement_native.assert_not_awaited()
 
 
 async def test_actual_adapter_and_session_persist_each_native_handoff(temp_storage):

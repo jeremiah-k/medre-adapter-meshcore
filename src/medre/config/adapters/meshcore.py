@@ -136,9 +136,9 @@ class MeshCoreConfig:
     identity: str | None = None
     pubkey: str | None = None
     node_config: dict[str, object] = field(default_factory=dict)
-    max_text_parts: int = 1
     max_text_bytes: int = GROUP_TEXT_BYTES
     meshcore_relay_prefix: str = ""
+    max_text_parts: int = 1
 
     def validate(self) -> Self:
         """Validate the configuration and return *self* for chaining.

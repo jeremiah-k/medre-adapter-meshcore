@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       core_ref:
-        description: MEDRE revision (defaults to MEDRE_CORE_REF variable or main)
+        description: MEDRE revision (overrides the candidate PR baseline or main)
         type: string
 permissions:
   contents: read
@@ -27,7 +27,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: jeremiah-k/medre
-          ref: ${{ inputs.core_ref || vars.MEDRE_CORE_REF || 'main' }}
+          # This feature branch imports a core contract not on main until #343 lands.
+          # Keep normal branches on main; explicit dispatch and repo pins win.
+          ref: ${{ inputs.core_ref || vars.MEDRE_CORE_REF || ((github.head_ref == 'feat/durable-multipart-handoff' || github.ref == 'refs/heads/feat/durable-multipart-handoff') && 'a050f81e2f5733d7f15ed5d4fd1aa52e4ddc7367' || 'main') }}
           path: .core
           persist-credentials: false
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0

@@ -20,8 +20,12 @@ The callback MUST run once inside the existing send lock after pacing and
 immediately before the SDK command. Each guarded invocation MUST make at most
 one native call; ordinary unguarded sends retain their existing retry policy.
 
-Shutdown/connection state MUST be checked again inside the send owner before
-the grant. A refused or expired grant MUST prevent native use. Native timeout
+Shutdown/connection state and native SDK client identity MUST be checked inside
+the send owner before the grant and rechecked after the grant returns. If the
+session stops, disconnects or replaces its SDK client while the grant awaits
+storage, the consumed grant MUST NOT reach a native command and its packet
+MUST remain uncertain rather than be automatically retried. A refused or
+expired grant MUST prevent native use. Native timeout
 or cancellation after a grant MUST stop the plan and retain uncertainty in
 core; no internal retry may consume that grant again. The default path and
 other concurrent sends MUST share the same lock and pacing.
