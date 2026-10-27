@@ -49,6 +49,9 @@ def adapter_spec() -> AdapterSpec:
     return AdapterSpec(
         **native_setup,
         sample_config=SymbolRef("medre.adapters.meshcore.sample", "sample_config"),
+        stopped_state_declaration=SymbolRef(
+            "medre.adapters.meshcore.stopped_declaration", "declaration"
+        ),
         destinations=(
             DestinationSpec(
                 "meshcore_contact",
