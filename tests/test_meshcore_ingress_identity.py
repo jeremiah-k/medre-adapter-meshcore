@@ -26,7 +26,6 @@ observable identity contract at durable admission:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -44,6 +43,7 @@ from medre.core.planning.relation_resolution import RelationResolver
 from medre.core.rendering.renderer import RenderingPipeline
 from medre.core.rendering.text import TextRenderer
 from medre.core.routing import Route, Router, RouteSource, RouteTarget
+from medre.core.storage.backend import EventFilter
 from medre.core.storage.sqlite.storage import SQLiteStorage
 
 MC_IN = "mc-identity-in"
@@ -182,8 +182,7 @@ async def _inbound_native_rows(storage: SQLiteStorage) -> list[dict[str, Any]]:
 
 
 async def _stored_bodies(storage: SQLiteStorage) -> set[str]:
-    rows = await storage._read_all("SELECT payload FROM canonical_events")
-    return {json.loads(row["payload"])["body"] for row in rows}
+    return {event.payload["body"] async for event in storage.query(EventFilter())}
 
 
 def _delivered_texts(out_adapter: FakeMeshCoreAdapter) -> list[str]:
