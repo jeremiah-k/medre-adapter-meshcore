@@ -292,11 +292,13 @@ async def test_session_changes_during_guard_never_reach_native(interruption):
 async def test_actual_adapter_and_session_persist_each_native_handoff(temp_storage):
     """The production adapter path runs the core plan through the real send owner."""
     from dataclasses import replace
+    from datetime import datetime, timezone
 
     result = await render("café α " * 14)
     item = replace(
         make_outbox_item(
-            status="in_progress",
+            status="pending",
+            attempt_number=0,
             event_id=result.event_id,
             target_adapter="mc",
             target_channel="0",
@@ -304,6 +306,11 @@ async def test_actual_adapter_and_session_persist_each_native_handoff(temp_stora
         worker_id="owner",
     )
     item = await create_outbox_item_with_parent(temp_storage, item)
+    claims = await temp_storage.claim_due_outbox_items(
+        datetime.now(timezone.utc).isoformat(), "owner"
+    )
+    assert any(row.outbox_id == item.outbox_id for row in claims)
+    assert await temp_storage.reserve_outbox_attempt(item.outbox_id, "owner", 0) == 1
     claim = DeliveryAttemptProvenance(
         event_id=item.event_id,
         delivery_plan_id=item.delivery_plan_id,
