@@ -182,7 +182,14 @@ async def _inbound_native_rows(storage: SQLiteStorage) -> list[dict[str, Any]]:
 
 
 async def _stored_bodies(storage: SQLiteStorage) -> set[str]:
-    return {event.payload["body"] async for event in storage.query(EventFilter())}
+    bodies = set()
+    async for event in storage.query(EventFilter()):
+        read = await storage.read_event_for_replay(
+            event.event_id, now=datetime.now(timezone.utc)
+        )
+        assert read.status == "retained" and read.event is not None
+        bodies.add(read.event.payload["body"])
+    return bodies
 
 
 def _delivered_texts(out_adapter: FakeMeshCoreAdapter) -> list[str]:
