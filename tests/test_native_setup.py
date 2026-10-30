@@ -7,8 +7,6 @@ from medre.adapters.meshcore.plugin import adapter_spec
 
 
 def test_native_setup_fields_are_sdk_free_and_named_for_the_config_model():
-    if not hasattr(registration, "NativeSetupField"):
-        pytest.skip("Core has no optional native form contract")
     spec = adapter_spec()
     fields = spec.native_setup_fields
     names = {field.name for field in fields}
@@ -24,16 +22,13 @@ def test_native_setup_fields_are_sdk_free_and_named_for_the_config_model():
             assert field.active_when is not None
 
 
-def test_provider_discovery_works_without_optional_native_forms(monkeypatch):
+def test_provider_requires_declared_native_form_contract(monkeypatch):
     monkeypatch.delattr(registration, "NativeSetupField", raising=False)
-    spec = adapter_spec()
-    assert spec.transport == "meshcore"
-    assert not getattr(spec, "native_setup_fields", ())
+    with pytest.raises(AttributeError, match="NativeSetupField"):
+        adapter_spec()
 
 
 def test_tcp_port_can_use_the_protocol_default():
-    if not hasattr(registration, "NativeSetupField"):
-        pytest.skip("Core has no optional native form contract")
     port = next(
         field for field in adapter_spec().native_setup_fields if field.name == "port"
     )
@@ -41,8 +36,6 @@ def test_tcp_port_can_use_the_protocol_default():
 
 
 def test_ble_pin_uses_hidden_optional_input():
-    if not hasattr(registration, "NativeSetupField"):
-        pytest.skip("Core has no optional native form contract")
     pin = next(
         field for field in adapter_spec().native_setup_fields if field.name == "ble_pin"
     )
@@ -52,11 +45,8 @@ def test_ble_pin_uses_hidden_optional_input():
 
 def _run_native_form(monkeypatch, tmp_path, answers, secret=""):
     import io
-    import importlib.util
     from argparse import Namespace
 
-    if importlib.util.find_spec("medre.cli.native_commands") is None:
-        pytest.skip("Core has no optional native authoring command")
     from medre.cli import native_commands
     from medre.config._yaml import parse_yaml_config
 
