@@ -224,6 +224,11 @@ class LocalMeshCoreNode:
             self.send_commands.append(payload)
             self.send_receipts.put_nowait(payload)
             self.send_seen.set()
+            if self.disconnect_on_next_send:
+                self.disconnect_on_next_send = False
+                writer.close()
+                await writer.wait_closed()
+                return
             if self.stall_sends:
                 return
             if self.hold_sends:

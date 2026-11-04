@@ -76,6 +76,12 @@ budget from the live handshake. `max_text_bytes` (default 160) is an operator
 upper bound. Rendering truncates safely at UTF-8 boundaries and records that
 fact; native sends that bypass this budget fail permanently before SDK I/O.
 
+All core-rendered native messages use the durable packet grant, including short
+and clipped single packets. A timeout, disconnect or cancellation after submission
+retains uncertainty and does not trigger an internal resend. Empty native wire
+text is rejected before dispatch. Direct session calls keep their legacy retry
+policy and do not provide this guarantee. See [guarded native text](docs/spec/multipart-text.md).
+
 Replies and threads relay as inline fallback text. They do not emit native
 reply/thread operations. Delivery evidence identifies `fallback_text`;
 reactions, edits, and deletes remain unsupported and are suppressed.

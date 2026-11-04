@@ -16,32 +16,13 @@ from medre.config.adapters.meshcore import MeshCoreConfig, MeshCoreConfigError
 from medre.core.contracts.adapter import AdapterPermanentError
 from medre.core.contracts.delivery import AdapterHandoffResult
 from medre.core.engine.pipeline.radio_delivery import deliver_radio_plan
-from medre.core.events import CanonicalEvent, DeliveryAttemptProvenance, EventMetadata
+from medre.core.events import DeliveryAttemptProvenance
 from medre.core.rendering.renderer import RenderingContext
+from medre_meshcore_tests.helpers.radio_event import radio_event as event
 from medre_meshcore_tests.helpers.storage_outbox import (
     create_outbox_item_with_parent,
     make_outbox_item,
 )
-
-
-def event(text):
-    """Build a canonical message with a fixed native scope and Unicode source text."""
-    from datetime import UTC, datetime
-
-    return CanonicalEvent(
-        event_id="multipart-event",
-        event_kind="message.created",
-        schema_version=1,
-        timestamp=datetime.now(UTC),
-        source_adapter="source",
-        source_transport_id="peer",
-        source_channel_id="0",
-        parent_event_id=None,
-        lineage=(),
-        relations=(),
-        payload={"text": text},
-        metadata=EventMetadata(),
-    )
 
 
 async def render(text, *, max_parts=16):

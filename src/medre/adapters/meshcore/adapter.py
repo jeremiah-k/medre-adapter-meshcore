@@ -503,6 +503,13 @@ class MeshCoreAdapter(AdapterContract):
                 note="fake MeshCore transport hand-off",
             )
 
+        # Core-bound packets must pass the durable checkpoint inside the native
+        # send owner, including prebuilt results that bypass the renderer.
+        if result.attempt_provenance is not None and result.before_native_send is None:
+            raise AdapterPermanentError(
+                "Core-bound MeshCore delivery requires a native handoff grant"
+            )
+
         # Real mode: delegate to session.
         if self._session is None:
             raise AdapterPermanentError("Session not initialised")
