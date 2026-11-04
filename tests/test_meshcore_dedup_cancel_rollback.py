@@ -122,6 +122,34 @@ def _single_pending_task(adapter: MeshCoreAdapter) -> asyncio.Task:
 # ===================================================================
 
 
+async def test_cancelled_before_first_step_releases_provisional_key() -> None:
+    """The task's done callback releases a reservation even if never stepped."""
+    publisher = _HeldPublisher(entry_count=1)
+    adapter = MeshCoreAdapter(_make_config(adapter_id="mc-cancel-unstepped"))
+    await _start(adapter, publisher)
+    try:
+        packet = _meshcore_text_packet()
+        key = _dedup_key(packet)
+        assert key is not None
+        adapter._on_message(packet)
+        task = _single_pending_task(adapter)
+        assert key in adapter._inbound_dedup
+        task.cancel()  # No await: the coroutine has not begun execution.
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert key not in adapter._inbound_dedup
+        assert publisher._entered == 0
+        adapter._on_message(packet)
+        assert len(adapter._background_tasks) == 1
+        publisher.gate.set()
+        await asyncio.wait_for(asyncio.gather(*tuple(adapter._background_tasks)), 5)
+        assert len(publisher.published) == 1
+        assert key in adapter._inbound_dedup
+    finally:
+        publisher.gate.set()
+        await adapter.stop()
+
+
 async def test_cancelled_pending_publication_releases_provisional_key() -> None:
     """A publication task cancelled before admission must release its key."""
     publisher = _HeldPublisher(entry_count=2)
@@ -410,4 +438,53 @@ async def test_lru_cap_eviction_unchanged_with_tokens() -> None:
         assert len(adapter._inbound_dedup) == _DEDUP_MAX_SIZE
     finally:
         publisher.gate.set()
+        await adapter.stop()
+
+
+async def test_cancellation_as_publish_returns_keeps_admitted_key(monkeypatch) -> None:
+    """Task cancellation at completion cannot undo a successful publication."""
+    publisher = _HeldPublisher(entry_count=1)
+    adapter = MeshCoreAdapter(_make_config())
+    await _start(adapter, publisher)
+
+    async def admitted_then_cancelled(event):
+        publisher.published.append(event.event_id)
+        asyncio.current_task().cancel()
+
+    monkeypatch.setattr(adapter, "publish_inbound", admitted_then_cancelled)
+    try:
+        packet = _meshcore_text_packet()
+        key = _dedup_key(packet)
+        adapter._on_message(packet)
+        task = _single_pending_task(adapter)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert adapter.diagnostics()["inbound_published"] == 1
+        assert key in adapter._inbound_dedup
+        adapter._on_message(packet)
+        assert not adapter._background_tasks
+        assert len(publisher.published) == 1
+    finally:
+        await adapter.stop()
+
+
+async def test_stale_failed_handler_keeps_recommitted_key(monkeypatch) -> None:
+    """An ordinary publish error obeys the same reservation ownership fence."""
+    publisher = _HeldPublisher(entry_count=1)
+    adapter = MeshCoreAdapter(_make_config())
+    await _start(adapter, publisher)
+    try:
+        packet = _meshcore_text_packet()
+        key = _dedup_key(packet)
+        assert key is not None
+        stale = adapter._commit_dedup_key(key)
+        replacement = adapter._commit_dedup_key(key)
+
+        async def fail(_event):
+            raise RuntimeError("publication failed")
+
+        monkeypatch.setattr(adapter, "publish_inbound", fail)
+        await adapter._on_message_async(adapter.get_codec().decode(packet), key, stale)
+        assert adapter._inbound_dedup[key] is replacement
+    finally:
         await adapter.stop()

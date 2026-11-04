@@ -16,3 +16,12 @@ therefore leaves the newer reservation intact. Cancellation after
 admitted at that point and its identity must keep suppressing redelivery.
 Shutdown behavior is unchanged — stop() still drains pending publication
 tasks and clears the cache at the session boundary.
+
+Publication tasks cancelled before their coroutine first step also release
+their owned provisional key from the task completion callback, preserving
+re-admission for identical redeliveries.
+
+Completion-callback cleanup applies only to publications that never started.
+A cancellation requested as a successful publication returns keeps the admitted
+identity. Ordinary publication errors also release only their own token, so a
+stale failure cannot remove a replacement reservation.

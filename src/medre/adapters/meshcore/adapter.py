@@ -700,10 +700,29 @@ class MeshCoreAdapter(AdapterContract):
 
             # Schedule the async publish — _on_message is synchronous
             # so we create a tracked task that is cleaned up on stop().
-            task = asyncio.create_task(
-                self._on_message_async(canonical, dedup_key, dedup_token)
-            )
-            task.add_done_callback(self._background_tasks.discard)
+            publication_started = False
+
+            async def publish() -> None:
+                nonlocal publication_started
+                publication_started = True
+                await self._on_message_async(canonical, dedup_key, dedup_token)
+
+            task = asyncio.create_task(publish())
+
+            # A task cancelled before its coroutine first steps never enters
+            # _on_message_async's cancellation handler. Retire that still-
+            # provisional identity here as well; ownership protects a later
+            # redelivery that committed the same identity with a new token.
+            def retire_publication(done: asyncio.Task[Any]) -> None:
+                self._background_tasks.discard(done)
+                if (
+                    done.cancelled()
+                    and not publication_started
+                    and dedup_key is not None
+                ):
+                    self._release_dedup_key(dedup_key, dedup_token)
+
+            task.add_done_callback(retire_publication)
             self._background_tasks.add(task)
         except Exception:
             if self.ctx is not None:
@@ -766,7 +785,7 @@ class MeshCoreAdapter(AdapterContract):
         except Exception:
             # Roll back dedup key so redelivery is not suppressed.
             if dedup_key is not None:
-                self._inbound_dedup.pop(dedup_key, None)
+                self._release_dedup_key(dedup_key, dedup_token)
             if self.ctx is not None:
                 self.ctx.logger.exception(
                     "MeshCoreAdapter %s: error in background publish",
