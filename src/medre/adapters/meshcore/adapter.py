@@ -64,6 +64,7 @@ from medre.core.rendering.renderer import RenderingResult
 from medre.core.supervision.diagnostic_contract import sanitize_diagnostic_mapping
 
 from medre.adapters.meshcore.codec import MeshCoreCodec
+from medre.adapters.meshcore.destination import resolve_channel_index
 from medre.adapters.meshcore.errors import MeshCoreSendError
 from medre.adapters.meshcore.event_shape import MESHCORE_NATIVE_SCHEMA_VERSION
 from medre.adapters.meshcore.identity import derive_message_identity
@@ -494,6 +495,30 @@ class MeshCoreAdapter(AdapterContract):
         if not isinstance(text, str):
             raise AdapterPermanentError("MeshCore rendered text must be a string")
 
+        channel_index = payload.get("channel_index")
+
+        resolved_channel_index = (
+            channel_index
+            if isinstance(channel_index, int) and not isinstance(channel_index, bool)
+            else None
+        )
+
+        # Core owns the grant; the provider must still bind it to this adapter
+        # instance and the destination selected by its renderer before using it.
+        provenance = result.attempt_provenance
+        if provenance is not None:
+            if provenance.target_adapter != self.adapter_id:
+                raise AdapterPermanentError(
+                    "Core-bound MeshCore adapter differs from durable target"
+                )
+            expected_channel = resolve_channel_index(
+                provenance.target_channel, self._config.default_channel
+            )
+            if resolved_channel_index != expected_channel:
+                raise AdapterPermanentError(
+                    "Core-bound MeshCore channel differs from durable target"
+                )
+
         # Fake mode explicitly models a successful synthetic transport hand-off.
         if self._config.connection_type == "fake":
             if result.before_native_send is not None:
@@ -514,29 +539,7 @@ class MeshCoreAdapter(AdapterContract):
         if self._session is None:
             raise AdapterPermanentError("Session not initialised")
 
-        channel_index = payload.get("channel_index")
         contact_id = str(payload.get("contact_id", ""))
-
-        resolved_channel_index = (
-            channel_index
-            if isinstance(channel_index, int) and not isinstance(channel_index, bool)
-            else None
-        )
-
-        # A core grant is scoped to one durable target. A malformed prebuilt
-        # payload must not redirect an authorized channel send to a different
-        # channel or a DM when bypassing the normal renderer.
-        if (
-            result.attempt_provenance is not None
-            and result.before_native_send is not None
-        ):
-            expected_channel = result.attempt_provenance.target_channel
-            if expected_channel is not None and expected_channel.isdecimal():
-                if resolved_channel_index != int(expected_channel):
-                    raise AdapterPermanentError(
-                        "Core-bound MeshCore channel differs from durable target"
-                    )
-
         try:
             if result.before_native_send is None:
                 native_id = await self._session.send_text(

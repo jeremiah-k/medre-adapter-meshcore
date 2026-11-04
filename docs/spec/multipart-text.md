@@ -25,10 +25,15 @@ individual packet results under the exact durable outbox claim. The adapter
 MUST forward their `before_native_send` callback to the session unchanged.
 Core-bound native results without that callback MUST be refused before SDK use,
 including results constructed outside the standard renderer.
-For a core-bound numeric channel target, the adapter MUST verify the packet's
-native channel index and target identity against the durable attempt before
-consuming the grant; mismatch MUST NOT reach the SDK. This also applies to
-prebuilt packet results that bypass standard rendering.
+For every core-bound result, in fake and native modes, the durable target adapter
+MUST equal the receiving adapter instance. The packet's native channel index
+MUST equal the destination resolved from the durable target with the renderer's
+rules: Python integer parsing, otherwise the configured default channel. This
+includes signed or whitespace-padded numeric forms and absent or symbolic
+channel targets. Mismatches MUST be refused before grant consumption, SDK use
+or a synthetic handoff. Prebuilt packets MUST obey the same checks. These native
+resolution rules MUST NOT rewrite the durable target's identity.
+
 The callback MUST run once inside the existing send lock after pacing and
 immediately before the SDK command. Each guarded invocation MUST make at most
 one native call. Direct session calls and unbound legacy results retain their

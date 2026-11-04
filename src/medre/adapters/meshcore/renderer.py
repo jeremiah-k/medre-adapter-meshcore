@@ -60,6 +60,7 @@ from medre.core.rendering.radio_text import plan_radio_text
 from medre.core.rendering.relations import degrade_relations_inline
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
 
+from medre.adapters.meshcore.destination import resolve_channel_index
 from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
 
 if TYPE_CHECKING:
@@ -203,11 +204,9 @@ class MeshCoreRenderer:
 
         text = select_message_body(event.payload)
 
-        # Parse channel index from ctx.target_channel
-        try:
-            channel_index = int(ctx.target_channel)  # type: ignore[arg-type]
-        except (ValueError, TypeError):
-            channel_index = adapter_config.default_channel
+        channel_index = resolve_channel_index(
+            ctx.target_channel, adapter_config.default_channel
+        )
 
         # Determine fallback behaviour
         is_fallback = ctx.delivery_strategy == "fallback_text"
