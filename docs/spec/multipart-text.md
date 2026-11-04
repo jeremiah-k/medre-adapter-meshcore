@@ -25,6 +25,10 @@ individual packet results under the exact durable outbox claim. The adapter
 MUST forward their `before_native_send` callback to the session unchanged.
 Core-bound native results without that callback MUST be refused before SDK use,
 including results constructed outside the standard renderer.
+For a core-bound numeric channel target, the adapter MUST verify the packet's
+native channel index and target identity against the durable attempt before
+consuming the grant; mismatch MUST NOT reach the SDK. This also applies to
+prebuilt packet results that bypass standard rendering.
 The callback MUST run once inside the existing send lock after pacing and
 immediately before the SDK command. Each guarded invocation MUST make at most
 one native call. Direct session calls and unbound legacy results retain their

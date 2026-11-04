@@ -523,6 +523,20 @@ class MeshCoreAdapter(AdapterContract):
             else None
         )
 
+        # A core grant is scoped to one durable target. A malformed prebuilt
+        # payload must not redirect an authorized channel send to a different
+        # channel or a DM when bypassing the normal renderer.
+        if (
+            result.attempt_provenance is not None
+            and result.before_native_send is not None
+        ):
+            expected_channel = result.attempt_provenance.target_channel
+            if expected_channel is not None and expected_channel.isdecimal():
+                if resolved_channel_index != int(expected_channel):
+                    raise AdapterPermanentError(
+                        "Core-bound MeshCore channel differs from durable target"
+                    )
+
         try:
             if result.before_native_send is None:
                 native_id = await self._session.send_text(

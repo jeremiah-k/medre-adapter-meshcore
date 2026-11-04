@@ -82,11 +82,11 @@ On unexpected disconnect the session attempts bounded exponential backoff:
 
 .. note::
 
-   **Duplicate-send risk.**  The session's :meth:`send_text` method retries
-   transient failures up to 3 times.  Because acknowledgements are not
-   de-duplicated, a message that was received by the remote node but whose
-   ACK was lost on the link may be sent again.  Consumers must be tolerant
-   of duplicate deliveries.
+   **Duplicate-send risk for unbound calls.**  Without a core packet grant,
+   :meth:`send_text` may retry transient failures up to 3 times. A lost ACK
+   can then cause duplicate native commands. Guarded core-bound calls use a
+   one-use handoff grant and make at most one SDK command; any post-grant
+   timeout or cancellation remains uncertain rather than being retried.
 """
 
 from __future__ import annotations
@@ -1717,9 +1717,9 @@ class MeshCoreSession:
 
         .. warning::
 
-           **Duplicate-send risk.**  Retries may cause the same message
-           to be delivered multiple times if the node received it but
-           the ACK was lost.
+           **Unbound retry risk.**  Legacy direct calls may resubmit when
+           a response is lost. A core-bound packet with ``before_native_send``
+           makes at most one native SDK command and retains uncertainty.
 
         For DM sends, the SDK ``suggested_timeout`` (milliseconds) is
         extracted from the successful result and used as the retry delay
