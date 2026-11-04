@@ -37,7 +37,8 @@ carries ``fallback_applied="strategy_fallback_text"``.
 
 Text messages use bounded single-packet rendering by default. Explicit
 ``max_text_parts > 1`` opts long ordinary messages into the shared immutable
-radio planner; core owns durable packet handoffs. Attribution, numbering and
+radio planner; all native packets use core-owned durable handoffs, including
+short and clipped single packets. Attribution, numbering and
 UTF-8 code points respect every effective per-packet budget. Plans exceeding
 the part cap fail as a whole rather than clipping an incomplete message.
 
@@ -292,6 +293,16 @@ class MeshCoreRenderer:
         else:
             truncated_text, was_truncated, original_bytes, rendered_bytes = (
                 self._truncate_utf8_bytes(text, max_text_bytes)
+            )
+
+        # Native single packets need the same durable one-use grant as multipart
+        # packets. Plan the final wire text so clipping and attribution stay exact.
+        if radio_plan is None and adapter_config.connection_type != "fake":
+            radio_plan = plan_radio_text(
+                truncated_text,
+                prefix="",
+                max_text_bytes=max_text_bytes,
+                max_parts=1,
             )
 
         content: dict[str, object] = {

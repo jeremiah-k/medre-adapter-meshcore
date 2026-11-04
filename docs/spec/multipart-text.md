@@ -1,9 +1,16 @@
-# Guarded multipart text
+# Guarded native text
 
 `max_text_parts` MUST be an integer from 1 through 128, with bool rejected. The
 value 1 retains established single-packet clipping. A larger value opts ordinary
 `message.created` text into the shared exact radio planner when needed. Short
 messages and reaction fallbacks MUST retain their established wire form.
+
+For TCP, serial and BLE configurations, every nonempty rendered packet MUST
+carry the shared immutable radio plan, including short messages, clipped text
+and relation fallbacks. A single-packet plan MUST preserve the final wire text
+without adding numbering or repeating attribution. Empty final native text,
+including a zero-byte effective budget, MUST fail before dispatch. Synthetic
+fake-mode single-packet rendering retains its established behavior.
 
 The renderer MUST select canonical text before planning, degrade any relation
 fallback before splitting, and repeat the applied relay attribution prefix on
@@ -16,9 +23,12 @@ The adapter MUST declare synchronous guarded-radio support and MUST refuse a
 complete plan delivered directly, before any native work. Core materializes
 individual packet results under the exact durable outbox claim. The adapter
 MUST forward their `before_native_send` callback to the session unchanged.
+Core-bound native results without that callback MUST be refused before SDK use,
+including results constructed outside the standard renderer.
 The callback MUST run once inside the existing send lock after pacing and
 immediately before the SDK command. Each guarded invocation MUST make at most
-one native call; ordinary unguarded sends retain their existing retry policy.
+one native call. Direct session calls and unbound legacy results retain their
+existing retry policy and are outside the durable core-delivery guarantee.
 
 Shutdown/connection state and native SDK client identity MUST be checked inside
 the send owner before the grant and rechecked after the grant returns. If the
@@ -43,3 +53,5 @@ version remains 0.1.0; production source installation MUST pair qualified core
 and provider commits. Deterministic tests exercise the actual adapter/session
 owner without SDK sockets. Installed-SDK and bounded physical qualification
 remain separate gates. Meshtastic's deferred queue is outside this contract.
+The existing core radio-plan and local-handoff schema shapes already represent
+one packet; no new fields or provider metadata schema version are required.

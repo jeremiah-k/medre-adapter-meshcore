@@ -110,7 +110,8 @@ class MeshCoreConfig:
     max_text_bytes:
         Operator upper bound for final UTF-8 text after rendering.
         Default: ``160``; firmware prefix overhead further reduces group text.  ``0`` means the final text
-        renders as an empty string.  Must be a non-negative integer;
+        renders as an empty string in fake mode and rejects native rendering.
+        Must be a non-negative integer;
         ``bool`` is rejected explicitly.
     meshcore_relay_prefix:
         Optional relay prefix template prepended to outbound text
