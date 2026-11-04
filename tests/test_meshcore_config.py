@@ -224,6 +224,76 @@ class TestMeshCoreConfigMaxTextBytes:
             config.validate()
 
 
+class TestMeshCoreConfigMaxPendingIngressCallbacks:
+    """max_pending_ingress_callbacks validation: type, range, and edge cases."""
+
+    def test_default_is_provisional_bound(self) -> None:
+        config = MeshCoreConfig(adapter_id="meshcore-1")
+        assert config.max_pending_ingress_callbacks == 100
+
+    def test_custom_value_is_valid(self) -> None:
+        config = MeshCoreConfig(
+            adapter_id="meshcore-1", max_pending_ingress_callbacks=16
+        )
+        assert config.validate().max_pending_ingress_callbacks == 16
+
+    def test_one_is_valid(self) -> None:
+        config = MeshCoreConfig(
+            adapter_id="meshcore-1", max_pending_ingress_callbacks=1
+        )
+        assert config.validate().max_pending_ingress_callbacks == 1
+
+    def test_zero_raises(self) -> None:
+        config = MeshCoreConfig(
+            adapter_id="meshcore-1", max_pending_ingress_callbacks=0
+        )
+        with pytest.raises(
+            MeshCoreConfigError,
+            match="max_pending_ingress_callbacks must be >= 1, got 0",
+        ):
+            config.validate()
+
+    def test_negative_raises(self) -> None:
+        config = MeshCoreConfig(
+            adapter_id="meshcore-1", max_pending_ingress_callbacks=-4
+        )
+        with pytest.raises(
+            MeshCoreConfigError,
+            match="max_pending_ingress_callbacks must be >= 1, got -4",
+        ):
+            config.validate()
+
+    def test_bool_raises(self) -> None:
+        config = MeshCoreConfig(
+            adapter_id="meshcore-1", max_pending_ingress_callbacks=True
+        )  # type: ignore[arg-type]
+        with pytest.raises(
+            MeshCoreConfigError,
+            match="max_pending_ingress_callbacks must be an int, got bool",
+        ):
+            config.validate()
+
+    def test_non_int_raises(self) -> None:
+        config = MeshCoreConfig(
+            adapter_id="meshcore-1", max_pending_ingress_callbacks="10"
+        )  # type: ignore[arg-type]
+        with pytest.raises(
+            MeshCoreConfigError,
+            match="max_pending_ingress_callbacks must be an int, got str",
+        ):
+            config.validate()
+
+    def test_float_raises(self) -> None:
+        config = MeshCoreConfig(
+            adapter_id="meshcore-1", max_pending_ingress_callbacks=10.0
+        )  # type: ignore[arg-type]
+        with pytest.raises(
+            MeshCoreConfigError,
+            match="max_pending_ingress_callbacks must be an int, got float",
+        ):
+            config.validate()
+
+
 class TestMeshCoreConfigIdentity:
     """Identity / pubkey field validation."""
 
