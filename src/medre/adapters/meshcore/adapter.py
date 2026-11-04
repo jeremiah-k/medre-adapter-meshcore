@@ -228,8 +228,10 @@ class MeshCoreAdapter(AdapterContract):
         # Prevents duplicate events from SDK redelivery (e.g., reconnect
         # replay) while distinct same-second payloads pass through.
         # Bounded OrderedDict — least-recently-seen entries evicted when
-        # full. Cleared on stop/start boundaries.
-        self._inbound_dedup: OrderedDict[str, None] = OrderedDict()
+        # full. Cleared on stop/start boundaries.  Values are opaque
+        # ownership tokens (see _commit_dedup_key) so a cancelled
+        # publication releases only its own provisional reservation.
+        self._inbound_dedup: OrderedDict[str, object] = OrderedDict()
 
         # Session boundary — owns SDK lifecycle.
         self._session: MeshCoreSession | None = None
@@ -600,6 +602,34 @@ class MeshCoreAdapter(AdapterContract):
             return name.strip()
         return self._config.identity
 
+    def _commit_dedup_key(self, key: str) -> object:
+        """Commit a dedup key and return its ownership token.
+
+        The cached value is an opaque token owned by the committing
+        call site, not a constant: :meth:`_release_dedup_key` removes
+        an entry only when the stored token still matches, so a
+        cancelled handler running late cannot evict a reservation that
+        a newer delivery re-committed.  Least-recently-seen entries are
+        evicted once the cache exceeds ``_DEDUP_MAX_SIZE``.
+        """
+        token: object = object()
+        self._inbound_dedup[key] = token
+        if len(self._inbound_dedup) > _DEDUP_MAX_SIZE:
+            self._inbound_dedup.popitem(last=False)
+        return token
+
+    def _release_dedup_key(self, key: str, token: object | None) -> bool:
+        """Release a provisional dedup reservation if still owned.
+
+        Returns ``True`` when the entry for *key* still belongs to
+        *token* and was removed.  A ``None`` token never matches, so
+        nothing can release an entry it does not own.
+        """
+        if token is not None and self._inbound_dedup.get(key) is token:
+            del self._inbound_dedup[key]
+            return True
+        return False
+
     def _on_message(self, packet: dict[str, Any]) -> None:
         """Process an inbound MeshCore event payload from the session.
 
@@ -661,16 +691,18 @@ class MeshCoreAdapter(AdapterContract):
 
             # Commit dedup key only after successful decode.  The key
             # guards the async publish window against concurrent
-            # duplicates.  If publish fails _on_message_async rolls it
-            # back so redelivery is not suppressed.
+            # duplicates.  If publish fails, or the publication task is
+            # cancelled before admission, _on_message_async releases the
+            # reservation so redelivery is not suppressed.
+            dedup_token: object | None = None
             if dedup_key is not None:
-                self._inbound_dedup[dedup_key] = None
-                if len(self._inbound_dedup) > _DEDUP_MAX_SIZE:
-                    self._inbound_dedup.popitem(last=False)
+                dedup_token = self._commit_dedup_key(dedup_key)
 
             # Schedule the async publish — _on_message is synchronous
             # so we create a tracked task that is cleaned up on stop().
-            task = asyncio.create_task(self._on_message_async(canonical, dedup_key))
+            task = asyncio.create_task(
+                self._on_message_async(canonical, dedup_key, dedup_token)
+            )
             task.add_done_callback(self._background_tasks.discard)
             self._background_tasks.add(task)
         except Exception:
@@ -684,6 +716,7 @@ class MeshCoreAdapter(AdapterContract):
         self,
         canonical: CanonicalEvent,
         dedup_key: str | None = None,
+        dedup_token: object | None = None,
     ) -> None:
         """Async handler for messages received via :meth:`_on_message`.
 
@@ -694,6 +727,17 @@ class MeshCoreAdapter(AdapterContract):
         window where a task was scheduled by :meth:`_on_message` but
         has not yet executed when :meth:`stop` sets ``_started = False``.
 
+        Cancellation is never swallowed.  A publication task cancelled
+        before ``publish_inbound`` returns has not been durably
+        admitted, so it releases its provisional dedup reservation and
+        re-raises; a retransmission of the same message identity is
+        then re-admitted instead of being silently suppressed.  The
+        release is ownership-checked (see :meth:`_release_dedup_key`)
+        so a late stale handler cannot evict a reservation that a
+        newer delivery re-committed.  Once ``publish_inbound`` returns,
+        the event is admitted: the key stays and must keep suppressing
+        redelivery.
+
         Parameters
         ----------
         canonical:
@@ -702,11 +746,23 @@ class MeshCoreAdapter(AdapterContract):
             The dedup key committed by :meth:`_on_message` after
             successful decode.  Rolled back on publish failure so that
             redelivery is not suppressed.
+        dedup_token:
+            Ownership token returned by :meth:`_commit_dedup_key` for
+            *dedup_key*.  The cancellation path releases the key only
+            when the cached entry still belongs to this token.
         """
+        admitted = False
         try:
             if self.ctx is not None and self._started:
                 await self.publish_inbound(canonical)
                 self._inbound_published += 1
+                admitted = True
+        except asyncio.CancelledError:
+            # Cancelled before admission: release the provisional key
+            # so redelivery is not suppressed, then propagate the cancel.
+            if dedup_key is not None and not admitted:
+                self._release_dedup_key(dedup_key, dedup_token)
+            raise
         except Exception:
             # Roll back dedup key so redelivery is not suppressed.
             if dedup_key is not None:
@@ -780,9 +836,7 @@ class MeshCoreAdapter(AdapterContract):
 
         # Commit dedup key only after successful decode + publish.
         if dedup_key is not None:
-            self._inbound_dedup[dedup_key] = None
-            if len(self._inbound_dedup) > _DEDUP_MAX_SIZE:
-                self._inbound_dedup.popitem(last=False)
+            self._commit_dedup_key(dedup_key)
 
     # -- Diagnostics --------------------------------------------------------
 
