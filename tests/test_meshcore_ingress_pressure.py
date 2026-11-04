@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+
+import pytest
 from datetime import UTC, datetime
 from typing import Any
 
@@ -674,4 +676,76 @@ async def test_scheduled_callback_rechecks_stop_before_publication(monkeypatch) 
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await adapter.stop()
+
+
+@pytest.mark.parametrize("retired_outcome", ["late_success", "late_cancel"])
+async def test_retired_publication_does_not_release_new_session_capacity(
+    retired_outcome: str,
+) -> None:
+    """A timed-out stop cannot free a slot in the next session's budget."""
+    old_entered = asyncio.Event()
+    old_cancel_seen = asyncio.Event()
+    old_release = asyncio.Event()
+    old_finished = asyncio.Event()
+
+    async def old_publisher(_event: CanonicalEvent) -> None:
+        old_entered.set()
+        try:
+            await old_release.wait()
+        except asyncio.CancelledError:
+            old_cancel_seen.set()
+            await old_release.wait()  # Deliberately ignores first cancellation.
+
+    adapter = MeshCoreAdapter(
+        MeshCoreConfig(adapter_id="mc-retired-epoch", max_pending_ingress_callbacks=1)
+    )
+    await adapter.start(
+        AdapterContext(
+            adapter_id=adapter.adapter_id,
+            publish_inbound=old_publisher,
+            logger=logging.getLogger("test.meshcore.retired.epoch"),
+            clock=lambda: datetime.now(UTC),
+            shutdown_event=asyncio.Event(),
+        )
+    )
+    new_publisher = _HeldPublisher(entry_count=1)
+    retired_task: asyncio.Task | None = None
+    try:
+        adapter._on_message(_packet(0))
+        retired_task = _pending_tasks(adapter)[0]
+        retired_task.add_done_callback(lambda _: old_finished.set())
+        await asyncio.wait_for(old_entered.wait(), 5)
+        await asyncio.wait_for(adapter.stop(timeout=0.02), 2)
+        assert old_cancel_seen.is_set()
+        assert not retired_task.done()
+        assert adapter.diagnostics()["pending_ingress_callbacks"] == 0
+
+        sink = _PressureSink()
+        await _start(adapter, new_publisher, sink)
+        adapter._on_message(_packet(1))
+        await asyncio.wait_for(new_publisher.entry_events[0].wait(), 5)
+        assert adapter.diagnostics()["pending_ingress_callbacks"] == 1
+
+        if retired_outcome == "late_success":
+            old_release.set()
+        else:
+            retired_task.cancel()  # A second cancellation propagates.
+        await asyncio.wait_for(old_finished.wait(), 5)
+        assert adapter.diagnostics()["pending_ingress_callbacks"] == 1
+        assert adapter.diagnostics()["producer_cancelled_before_admission"] == 0
+        assert adapter.diagnostics()["inbound_published"] == 0
+        adapter._on_message(_packet(2))
+        assert adapter.diagnostics()["producer_overflow"] == 1
+        assert len(_pending_tasks(adapter)) == 1
+
+        new_publisher.gate.set()
+        await _drain(adapter)
+        assert adapter.diagnostics()["inbound_published"] == 1
+        assert adapter.diagnostics()["pending_ingress_callbacks"] == 0
+    finally:
+        old_release.set()
+        new_publisher.gate.set()
+        if retired_task is not None:
+            await asyncio.gather(retired_task, return_exceptions=True)
         await adapter.stop()

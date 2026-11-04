@@ -58,6 +58,12 @@ stepped. Stop MUST release or reset every outstanding reservation after
 draining, and a timed-out drain MUST NOT strand reservations into the next
 session. A new session MUST start from full, private capacity; a release
 from a retired session MUST NOT grant capacity to the current one.
+Every reservation MUST bind its done callback to the creating session epoch;
+late completions MUST NOT modify pending slots, cancellation counts, or
+`inbound_published` diagnostics belonging to a newer session. The stop
+budget MUST be a real deadline even when a callback's publisher does not
+cooperate with cancellation. A timed-out drain MAY leave a retired task
+alive, but MUST retire its capacity epoch before a new session starts.
 
 ## Producer pressure accounting
 

@@ -29,4 +29,8 @@ sink is contained without affecting admission. Diagnostics expose
 Reservations are released by each publication task's done callback — covering
 completion, publish failure, cancellation, and tasks cancelled before their
 coroutine first stepped — and reset at session boundaries, so stop/start and
-reconnect leave no stale reservations.
+reconnect leave no stale reservations. Callbacks bind their capacity release
+to a session epoch: a late task from a timed-out stop cannot release a new
+session slot or inflate its cancellation and publication counters.
+Background-task drains use a bounded wait that does not depend on a
+publisher acknowledging cancellation.

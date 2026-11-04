@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -241,6 +242,9 @@ class MeshCoreAdapter(AdapterContract):
         # publication task's done callback and reset at session
         # boundaries, so a new session inherits no stale reservations.
         self._pending_callback_admissions: int = 0
+        # A completed task must release only the slot reserved in its own
+        # lifecycle. Late completions from a timed-out stop are ignored.
+        self._callback_admission_epoch: int = 0
         self._producer_scheduled_count: int = 0
         self._producer_overflow_count: int = 0
         self._producer_cancelled_before_admission_count: int = 0
@@ -291,6 +295,7 @@ class MeshCoreAdapter(AdapterContract):
         self._classifier_packets_dm_relayed = 0
         self._classifier_packets_malformed = 0
         self._inbound_published = 0
+        self._callback_admission_epoch += 1
         self._pending_callback_admissions = 0
         self._producer_scheduled_count = 0
         self._producer_overflow_count = 0
@@ -406,10 +411,10 @@ class MeshCoreAdapter(AdapterContract):
         # Cancel all tracked background tasks and drain them.
         await self._drain_background_tasks(timeout)
 
-        # Release any callback admission reservations the drain could not
-        # retire (a timed-out gather leaves cancelled tasks whose done
-        # callbacks have not run yet).  A new session inherits no stale
-        # reservations from this one.
+        # Retire this admission epoch even if a slow publisher ignored
+        # cancellation. Its eventual done callback cannot free a slot
+        # reserved by a subsequent start or contaminate its counters.
+        self._callback_admission_epoch += 1
         self._pending_callback_admissions = 0
 
         # Stop the session (handles SDK disconnect + cleanup).
@@ -685,15 +690,14 @@ class MeshCoreAdapter(AdapterContract):
     def _release_callback_slot(self) -> None:
         """Free one inbound callback slot reservation.
 
-        Paired 1:1 with :meth:`_reserve_callback_slot` through
-        :meth:`_on_background_task_done`.  The floor guard keeps the
-        counter non-negative even when a release races a lifecycle
-        reset.
+        Paired 1:1 with :meth:`_reserve_callback_slot` through the
+        epoch-bound done callback. The floor guard is a second defense;
+        an old reservation cannot decrement the new session's count.
         """
         if self._pending_callback_admissions > 0:
             self._pending_callback_admissions -= 1
 
-    def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
+    def _on_background_task_done(self, epoch: int, task: asyncio.Task[Any]) -> None:
         """Release a callback reservation and account cancellation.
 
         Attached to every publication task created by
@@ -706,6 +710,8 @@ class MeshCoreAdapter(AdapterContract):
         diagnostics.
         """
         self._background_tasks.discard(task)
+        if epoch != self._callback_admission_epoch:
+            return
         self._release_callback_slot()
         if task.cancelled():
             self._producer_cancelled_before_admission_count += 1
@@ -881,7 +887,6 @@ class MeshCoreAdapter(AdapterContract):
             # The bounded-admission slot and cancellation accounting are
             # handled by the shared completion callback.
             def retire_publication(done: asyncio.Task[Any]) -> None:
-                self._on_background_task_done(done)
                 if (
                     done.cancelled()
                     and not publication_started
@@ -890,6 +895,11 @@ class MeshCoreAdapter(AdapterContract):
                     self._release_dedup_key(dedup_key, dedup_token)
 
             task.add_done_callback(retire_publication)
+            task.add_done_callback(
+                functools.partial(
+                    self._on_background_task_done, self._callback_admission_epoch
+                )
+            )
             self._background_tasks.add(task)
             self._producer_scheduled_count += 1
             self._report_producer_pressure("scheduled")
@@ -940,10 +950,15 @@ class MeshCoreAdapter(AdapterContract):
             when the cached entry still belongs to this token.
         """
         admitted = False
+        epoch = self._callback_admission_epoch
         try:
             if self.ctx is not None and self._started:
                 await self.publish_inbound(canonical)
-                self._inbound_published += 1
+                # A publisher that ignores cancellation can finish after
+                # stop/restart. Its admission result belongs to the old
+                # session, not to the new session's diagnostics.
+                if epoch == self._callback_admission_epoch:
+                    self._inbound_published += 1
                 admitted = True
         except asyncio.CancelledError:
             # Cancelled before admission: release the provisional key
@@ -1122,16 +1137,22 @@ class MeshCoreAdapter(AdapterContract):
         timeout:
             Maximum seconds to wait for tasks to finish after cancellation.
         """
-        for task in list(self._background_tasks):
+        tasks = set(self._background_tasks)
+        for task in tasks:
             task.cancel()
-        if self._background_tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*self._background_tasks, return_exceptions=True),
-                    timeout=timeout,
+        if tasks:
+            # wait_for(gather(...)) waits for children to *acknowledge*
+            # cancellation and can hang beyond the configured timeout.
+            # asyncio.wait enforces the actual stop budget even if an SDK
+            # publication suppresses cancellation and keeps running.
+            _, abandoned = await asyncio.wait(tasks, timeout=max(0.0, timeout))
+            if abandoned and self.ctx is not None:
+                self.ctx.logger.warning(
+                    "MeshCoreAdapter %s: %d inbound publications did not "
+                    "stop within the drain budget",
+                    self.adapter_id,
+                    len(abandoned),
                 )
-            except asyncio.TimeoutError:
-                pass
         self._background_tasks.clear()
 
     # -- Codec access -------------------------------------------------------
