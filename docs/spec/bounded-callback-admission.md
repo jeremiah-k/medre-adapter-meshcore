@@ -18,8 +18,11 @@ The adapter MUST bound pending inbound publication tasks by
 zero, negative, boolean and non-integer values MUST be rejected by
 configuration validation. There MUST NOT be an unbounded mode. The default
 MUST be a finite value aligned with core's admission default; the shipped
-default (`100`) is provisional pending a measured-budget qualification
-round and MUST NOT be documented as a throughput guarantee.
+default (`100`) is qualified for the synthetic bounded-admission shapes
+recorded in `docs/dev/ingress-pressure.md` — burst, sustained-imbalance,
+cancellation-resistance, post-burst loop stepping and memory evidence. It
+MUST NOT be described as a throughput or hardware guarantee; real-SDK and
+physical-device qualification remains separate.
 
 The reservation MUST be a non-blocking check executed on the owner event
 loop. The callback MUST NOT wait synchronously for an asynchronous slot,
