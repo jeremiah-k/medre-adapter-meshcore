@@ -19,7 +19,10 @@ zero, negative, boolean and non-integer values MUST be rejected by
 configuration validation. There MUST NOT be an unbounded mode. The default
 MUST be a finite value aligned with core's admission default; the shipped
 default (`100`) is provisional pending a measured-budget qualification
-round and MUST NOT be documented as a throughput guarantee.
+round and MUST NOT be documented as a throughput guarantee. The
+measured-budget qualification record for the shipped default — burst,
+sustained-imbalance, cancellation-resistance, loop-lag and memory
+evidence — is maintained in `docs/dev/ingress-pressure.md`.
 
 The reservation MUST be a non-blocking check executed on the owner event
 loop. The callback MUST NOT wait synchronously for an asynchronous slot,

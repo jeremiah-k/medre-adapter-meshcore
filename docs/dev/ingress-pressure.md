@@ -2,10 +2,13 @@
 
 `tests/test_meshcore_ingress_pressure.py` drives distinct relayable channel
 callbacks with publication held by an event, including a 256-packet burst
-against the default bound and a 32-packet burst below it. These callbacks
-exercise the real classifier, native dedup identity, codec and the synchronous
-adapter callback on the asyncio owner loop, without a physical companion or
-SDK socket.
+against the default bound and a 32-packet burst below it.
+`tests/test_meshcore_sustained_admission.py` qualifies the sustained shape:
+bursts at 1x, 4x and 16x of the bound, a sustained-imbalance cycle,
+cancellation-resistant publishers under saturation, and loop-lag plus memory
+evidence. These callbacks exercise the real classifier, native dedup identity,
+codec and the synchronous adapter callback on the asyncio owner loop, without
+a physical companion or SDK socket.
 
 ## Bounded callback admission
 
@@ -93,3 +96,58 @@ The configured budget is per session. Publishers that ignore cancellation may
 survive a timed-out stop; repeated restarts can accumulate retired tasks outside
 that budget. A process-wide bound and overlapping start/stop ownership need
 separate lifecycle qualification before claiming a global resource bound.
+
+## Measured sustained qualification (2026-11-04)
+
+`tests/test_meshcore_sustained_admission.py` recorded the measured-budget
+round for the provisional default of `100`. Content-free JSON records export
+to `MEDRE_PRESSURE_REPORT_DIR`; the numbers below are from one local run and
+are reproducible per machine. They prove bounded admission above the cap,
+dedup-safe re-admission of refused identities, epoch isolation under
+saturation, and the absence of loop starvation at burst scale. They do not
+prove throughput, real-SDK behavior, hardware or RF performance, and the
+loop-lag bound asserted by the tests is a generous CI guard, not an SLA.
+
+Above-cap bursts with publication held (default bound 100):
+
+| Burst | Pending | Refused | Re-admitted | Published | Sentinel lag |
+|------:|--------:|--------:|------------:|----------:|-------------:|
+| 100   | 100     | 0       | 0           | 100       | 1.32 ms      |
+| 400   | 100     | 300     | 300         | 400       | 1.31 ms      |
+| 1600  | 100     | 1500    | 1500        | 1600      | 1.37 ms      |
+
+Every refused identity was redelivered after the release and re-admitted in
+bound-sized slices with no new overflow, and counters and producer-pressure
+reports reconciled exactly (`scheduled` equals the burst size, `overflow`
+equals the refusal count). The admitted window published in admission order
+and drained in full.
+
+Memory evidence, measured with `tracemalloc` in-process: the retained
+saturated window (pending tasks, their canonical events and publisher
+bookkeeping, after collecting transient refused-decode allocations) grew from
+about 534 KB at a 100-burst to about 538 KB at a 1600-burst — a 1.008 ratio
+against a 16x burst growth, confirming pending work is governed by the cap,
+not the burst size. End-to-end records including producer-report bookkeeping
+showed the same shape (about 556 KB versus 716 KB, ratio about 1.29). The raw
+high-water including refused-decode churn is recorded in the JSON for context
+only. `ru_maxrss` is recorded as process context and is never asserted.
+
+Sustained imbalance used a small bound (8) over 200 cycles of 12 arrivals
+each — 2,400 distinct deliveries plus 200 duplicates suppressed by dedup —
+while the publisher released 4 publications per cycle. Every cycle kept
+pending at or below the bound, `scheduled + refused` equaled distinct
+deliveries (804 + 1,596), duplicates never consumed capacity or overflow, and
+the full admitted sequence published exactly once in admission order. The
+cycle completed in about 0.22 s with no wall-clock sleeps.
+
+Saturation stop with a cancellation-resistant publisher: with 100 held
+publications, `stop` cancelled the 99 cooperative publishers within a 1 s
+drain budget, warned once about the single cancellation-suppressing
+publication, retired it from tracking, and advanced the admission epoch. The
+restarted session admitted a full 100-packet window and refused the 101st;
+when the stubborn task finally completed (or was cancelled) after the
+restart, the new session's pending count, capacity and counters were
+untouched, and its cancellation was never misreported as
+`cancelled_before_admission`. A retired-epoch seam check confirmed a late
+pre-start cancellation reports through the original session's pressure sink
+and never the restarted session's.
