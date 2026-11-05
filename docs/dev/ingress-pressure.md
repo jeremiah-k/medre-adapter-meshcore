@@ -6,7 +6,15 @@ against the default bound and a 32-packet burst below it.
 `tests/test_meshcore_sustained_admission.py` qualifies the sustained shape:
 bursts at 1x, 4x and 16x of the bound, a sustained-imbalance cycle,
 cancellation-resistant publishers under saturation, and loop-lag plus memory
-evidence. These callbacks exercise the real classifier, native dedup identity,
+evidence. `tests/test_meshcore_process_lifetime_admission.py` extends the
+record across restart cycles in one process: tracked-registry and task-census
+bounds, per-session capacity honesty while prior strands stay alive, dedup
+boundaries across sessions, and whole-run memory guards. The process-lifetime
+peak guard uses interval high-water allocations when it owns tracing; with a
+borrowed tracer it checks only sampled retained growth and records
+`peak_growth_qualified: false`, leaving transient peak growth unqualified.
+These callbacks
+exercise the real classifier, native dedup identity,
 codec and the synchronous adapter callback on the asyncio owner loop, without
 a physical companion or SDK socket.
 
@@ -97,8 +105,12 @@ The simulation path also fences counters and dedup commits across epochs.
 
 The configured budget is per session. Publishers that ignore cancellation may
 survive a timed-out stop; repeated restarts can accumulate retired tasks outside
-that budget. A process-wide bound and overlapping start/stop ownership need
-separate lifecycle qualification before claiming a global resource bound.
+that budget. `tests/test_meshcore_process_lifetime_admission.py` pins that
+accumulation at cycle scale: the tracked registry returns to empty after every
+stop, the process-wide census finds only the test's one deliberately stranded
+publisher per cycle, then returns to baseline, and whole-run memory stays
+inside the recorded bounds. The census covers adapter-created tasks only; it is
+not a bound on tasks the SDK runtime owns.
 
 ## Measured sustained qualification (2026-11-04)
 

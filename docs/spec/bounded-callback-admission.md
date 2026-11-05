@@ -88,3 +88,49 @@ supports `cancelled_before_admission`; a successful publication that requests
 cancellation while returning MUST retain its admitted identity and MUST NOT
 increment this outcome. The simulation path MUST also fence post-await counters
 and dedup commits against a retired epoch.
+
+## Process lifetime across restart cycles
+
+Repeated restart cycles in one process MUST NOT leave tracked task
+registry entries, admission reservations or dedup state from retired
+sessions. They MUST NOT create or retain pending adapter tasks beyond the
+publishers that actually ignore cancellation. After every bounded stop the
+tracked publication-task registry MUST be empty even
+while a retired cancellation-resistant publisher is still pending, and each
+restarted session MUST admit a full window irrespective of retired publishers.
+The process-wide census MUST contain no additional adapter-created pending
+tasks beyond those publishers, and MUST return to its pre-cycle baseline once
+they settle. Late completions and late running cancellations MUST NOT change any
+newer session's capacity or counters, and a late pre-start cancellation MUST
+report through its own retired session's pressure sink at cycle scale, never
+through the restarted session's.
+
+Dedup state MUST NOT cross a session boundary: stop and start clear the map,
+so a retired session's reservation MUST NOT suppress a new-session
+re-admission of the same identity. Token ownership governs the remaining
+rollback race within or across sessions: a stale ownership token MUST NOT
+evict a reservation the active session re-committed for the same key, and a
+duplicate of that identity stays suppressed after the stale handler
+settles. The boundary clear is what lets a stranded identity be
+re-admitted. A running retired handler can reach dedup rollback despite the
+epoch fence on counters; token ownership protects the replacement reservation.
+The within-session ownership case is qualified independently in
+`tests/test_meshcore_dedup_cancel_rollback.py`.
+
+Process memory MUST stay bounded across the whole cycling run. With the
+first restart cycles retained as a warmed steady-state baseline, the peak
+growth of the remaining cycles MUST stay below 256,000 bytes above that
+baseline (``RETAINED_EXTRA_BYTES_BOUND`` in the qualification test), and once
+every stranded publisher settles the retained
+footprint MUST return below twice that baseline. Peak qualification requires
+a test-owned tracing session with its peak reset after the baseline. When
+tracing is borrowed, the qualification records `sampled_current` and checks
+only retained memory sampled at cycle boundaries; it does not qualify
+transient peak growth. The caller's tracer MUST NOT be reset or stopped.
+
+Qualification scope: these shapes are proven by synthetic SDK-callback tests
+in `tests/test_meshcore_process_lifetime_admission.py` (fake mode, no
+network, no hardware) using a test double that deliberately strands exactly one publisher per
+cycle (25 pending at peak). That exact count is the test design, not a rule
+imposed on a real adapter's uncooperative callers. They are not a claim about real MeshCore SDK callback behavior,
+throughput, hardware or RF performance.
