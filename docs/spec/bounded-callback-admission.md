@@ -88,3 +88,39 @@ supports `cancelled_before_admission`; a successful publication that requests
 cancellation while returning MUST retain its admitted identity and MUST NOT
 increment this outcome. The simulation path MUST also fence post-await counters
 and dedup commits against a retired epoch.
+
+## Process lifetime across restart cycles
+
+Repeated restart cycles in one process MUST NOT accumulate abandoned
+cancellation-resistant publications, tracked task registry entries,
+admission reservations or dedup state. After every bounded stop the tracked
+publication-task registry MUST be empty even while a retired task is still
+pending, and each restarted session MUST admit a full window while every
+prior cycle's stranded publisher is still alive. The process-wide census of
+adapter-created pending publication tasks MUST grow by exactly one stranded
+publisher per cycle, and MUST return to empty once every stranded publisher
+settles. Late completions and late running cancellations MUST NOT change any
+newer session's capacity or counters, and a late pre-start cancellation MUST
+report through its own retired session's pressure sink at cycle scale, never
+through the restarted session's.
+
+Dedup state MUST NOT cross a session boundary: stop and start clear the map,
+so a retired session's reservation MUST NOT suppress a new-session
+re-admission of the same identity. Token ownership governs the remaining
+within-session race: a stale ownership token from a retired session MUST NOT
+evict a reservation the active session re-committed for the same key, and a
+duplicate of that identity stays suppressed after the stale handler
+settles. The boundary clear is what lets a stranded identity be
+re-admitted; ownership decides nothing across a cleared boundary.
+
+Process memory MUST stay bounded across the whole cycling run. With the
+first restart cycles retained as a warmed steady-state baseline, the peak
+growth of the remaining cycles MUST stay under the recorded absolute
+extra-bytes bound, and once every stranded publisher settles the retained
+footprint MUST return below twice that baseline.
+
+Qualification scope: these shapes are proven by synthetic SDK-callback tests
+in `tests/test_meshcore_process_lifetime_admission.py` (fake mode, no
+network, no hardware) using a test double for the cancellation-resistant
+publisher. They are not a claim about real MeshCore SDK callback behavior,
+throughput, hardware or RF performance.
