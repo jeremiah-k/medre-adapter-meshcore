@@ -17,10 +17,11 @@ default of ``max_pending_ingress_callbacks=100`` was reserved for:
 
 These are deterministic SDK-callback shape tests (fake mode only, no
 network, no hardware, no sleeps).  They prove bounded admission, dedup
-safe refusal re-admission, epoch isolation under load and the absence of
-loop starvation at burst scale.  They do not prove throughput, real-SDK,
-hardware or RF behavior, and the loop-lag bound is a generous CI guard,
-not an SLA.
+safe refusal re-admission and epoch isolation under load.  Synchronous
+callback burst duration is measured separately from pending-window loop
+lag; neither measurement proves the absence of loop starvation.  These
+tests do not prove throughput, real-SDK, hardware or RF behavior.
+The post-burst loop-lag bound is a generous CI guard, not an SLA.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import gc
 import json
 import logging
 import os
+import sys
 import time
 import tracemalloc
 from datetime import UTC, datetime
@@ -50,15 +52,14 @@ except ImportError:
     ProducerPressureReport = None
 from medre.core.events import CanonicalEvent
 
-# Generous CI-tolerant ceiling for the loop-lag sentinel.  The measured
-# value is recorded, not tuned; this guard only proves that a fully
-# saturated burst window cannot starve the owner loop for whole seconds.
+# Generous CI-tolerant ceiling for the post-burst pending-window sentinel.
+# Synchronous burst blocking is measured independently, not bounded here.
 SENTINEL_LAG_BOUND_SECONDS = 5.0
 
-# Generous sublinearity bound: a 1600-burst is 16x a 100-burst, so a
-# retained pending-window footprint within 4x demonstrates that the
-# pending budget is governed by the cap, not by the burst size.
-SUBLINEAR_RETAINED_RATIO_BOUND = 4.0
+# A 1600-burst is 16x a 100-burst; this limit rejects significant
+# retained per-refusal state while allowing CI allocation variance.
+SUBLINEAR_RETAINED_RATIO_BOUND = 2.0
+RETAINED_EXTRA_BYTES_BOUND = 256_000
 
 
 def _packet(index: int) -> dict:
@@ -188,7 +189,8 @@ def _write_report(name: str, payload: dict[str, Any]) -> None:
     try:
         import resource
 
-        payload["ru_maxrss_kb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        payload["ru_maxrss_kb"] = rss // 1024 if sys.platform == "darwin" else rss
     except ImportError:  # pragma: no cover - non-Unix contexts
         payload["ru_maxrss_kb"] = None
     directory = Path(root)
@@ -198,13 +200,35 @@ def _write_report(name: str, payload: dict[str, Any]) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "platform,raw,expected", [("linux", 8192, 8192), ("darwin", 8192, 8)]
+)
+def test_process_rss_record_uses_kilobytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    raw: int,
+    expected: int,
+) -> None:
+    """Content-free exported memory records use consistent units."""
+    from types import SimpleNamespace
+
+    fake_resource = SimpleNamespace(
+        RUSAGE_SELF=0, getrusage=lambda _kind: SimpleNamespace(ru_maxrss=raw)
+    )
+    monkeypatch.setitem(sys.modules, "resource", fake_resource)
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setenv("MEDRE_PRESSURE_REPORT_DIR", str(tmp_path))
+    _write_report("rss.json", {"transport": "meshcore"})
+    assert json.loads((tmp_path / "rss.json").read_text())["ru_maxrss_kb"] == expected
+
+
 async def _sentinel_lag_seconds() -> float:
     """Measure one event-loop pass behind a fully saturated burst window.
 
-    The sentinel is a plain coroutine scheduled on the owner loop; its
-    lag covers whatever the loop must step first (the whole pending
-    publication window).  This is starvation evidence for the measured
-    record, not an SLA and not a latency claim.
+    The sentinel starts only after the synchronous callback burst returns.
+    Its lag measures one pending-window loop pass, not blocking that
+    occurred while invoking the callbacks themselves.  This is not an SLA.
     """
     started = time.perf_counter()
     await asyncio.sleep(0)
@@ -216,24 +240,30 @@ async def _stage_held_burst(
     publisher: _HeldPublisher,
     burst: int,
     offset: int = 0,
-) -> tuple[int, int, float]:
+) -> tuple[int, int, float, float]:
     """Fire a distinct burst under held publication and return evidence.
 
-    Returns ``(retained_bytes, raw_peak_bytes, sentinel_lag_seconds)``.
+    Returns ``(retained_bytes, raw_peak_bytes, sentinel_lag_seconds,
+    synchronous_burst_seconds)``.
     ``retained_bytes`` is the live tracemalloc footprint of the
     saturated window after refused-decode churn has been collected: the
     pending publication tasks, their canonical events and the publisher
     bookkeeping, all bounded by the cap.  ``raw_peak_bytes`` is the
-    unretouched high-water including transient decode allocations for
-    refused packets; it is recorded as context only.  The sentinel lag
-    is measured immediately after the synchronous burst returns, so it
-    covers the loop stepping the whole pending window.
+    absolute tracer high-water (which may include earlier allocations
+    if tracing was already enabled); it is recorded as context only.
+    The sentinel starts after synchronous callbacks return, so burst
+    blocking and the pending-window loop pass are recorded separately.
     """
     gc.collect()
-    tracemalloc.start()
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    baseline = tracemalloc.get_traced_memory()[0]
     try:
+        burst_started = time.perf_counter()
         for index in range(burst):
             adapter._on_message(_packet(offset + index))
+        burst_block = time.perf_counter() - burst_started
         lag = await _sentinel_lag_seconds()
         assert lag < SENTINEL_LAG_BOUND_SECONDS, (
             "saturated burst window starved the event loop beyond the "
@@ -242,10 +272,40 @@ async def _stage_held_burst(
         entries = min(burst, adapter._config.max_pending_ingress_callbacks)
         await asyncio.wait_for(publisher.entry_events[entries - 1].wait(), 30)
         gc.collect()
-        retained, raw_peak = tracemalloc.get_traced_memory()
+        current, raw_peak = tracemalloc.get_traced_memory()
+        retained = max(0, current - baseline)
     finally:
-        tracemalloc.stop()
-    return retained, raw_peak, lag
+        if started_tracing:
+            tracemalloc.stop()
+    return retained, raw_peak, lag, burst_block
+
+
+async def test_burst_measurement_preserves_existing_tracing_session() -> None:
+    """Do not stop or reset a tracing session that belongs to the caller."""
+    caller_started = not tracemalloc.is_tracing()
+    if caller_started:
+        tracemalloc.start()
+    publisher = _HeldPublisher(entry_count=1)
+    adapter = MeshCoreAdapter(
+        MeshCoreConfig(adapter_id="mc-tracer-owner", max_pending_ingress_callbacks=1)
+    )
+    try:
+        await _start(adapter, publisher, sink=None)
+        initial_peak = tracemalloc.get_traced_memory()[1]
+        retained, raw_peak, lag, burst_block = await _stage_held_burst(
+            adapter, publisher, 4
+        )
+        assert tracemalloc.is_tracing()
+        assert tracemalloc.get_traced_memory()[1] >= initial_peak
+        assert retained >= 0 and raw_peak >= retained
+        assert lag >= 0 and burst_block >= 0
+        publisher.gate.set()
+        await _drain(adapter)
+    finally:
+        publisher.gate.set()
+        await adapter.stop()
+        if caller_started:
+            tracemalloc.stop()
 
 
 async def _start(
@@ -317,7 +377,9 @@ async def test_burst_above_capacity_reconciles_and_readmits(burst: int) -> None:
     started = time.perf_counter()
     try:
         keys = [_dedup_key(_packet(index)) for index in range(burst)]
-        retained, raw_peak, lag = await _stage_held_burst(adapter, publisher, burst)
+        retained, raw_peak, lag, burst_block = await _stage_held_burst(
+            adapter, publisher, burst
+        )
 
         # Exactly the default bound is pending; the rest were refused.
         assert len(_pending_tasks(adapter)) == cap
@@ -387,6 +449,7 @@ async def test_burst_above_capacity_reconciles_and_readmits(burst: int) -> None:
                 "retained_bytes": retained,
                 "raw_peak_bytes": raw_peak,
                 "sentinel_lag_ms": round(lag * 1000, 3),
+                "synchronous_burst_block_ms": round(burst_block * 1000, 3),
                 "overflow_policy": "bounded_callback_capacity",
             },
         )
@@ -583,15 +646,7 @@ async def test_saturated_stubborn_publisher_retires_and_restart_refills(
 
     original_sink = _PressureSink()
     adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id="mc-sat-stubborn"))
-    ctx = AdapterContext(
-        adapter_id=adapter.adapter_id,
-        publish_inbound=publish,
-        logger=logging.getLogger("test.mc-sat-stubborn"),
-        clock=lambda: datetime.now(UTC),
-        shutdown_event=asyncio.Event(),
-        report_producer_pressure=original_sink,
-    )
-    await adapter.start(ctx)
+    await _start(adapter, publish, original_sink)
     epoch_before_stop = adapter._callback_admission_epoch
     try:
         with caplog.at_level(logging.WARNING, logger="test.mc-sat-stubborn"):
@@ -763,11 +818,11 @@ async def test_retired_pre_start_cancellation_reports_to_original_sink() -> None
     retired_epoch = adapter._callback_admission_epoch
     retired_context = adapter.ctx
     assert retired_context is not None
+    new_publisher = _HeldPublisher(entry_count=1)
     try:
         await adapter.stop()
 
         # New session: full capacity and a fresh pressure sink.
-        new_publisher = _HeldPublisher(entry_count=1)
         new_sink = _PressureSink()
         await _start(adapter, new_publisher, new_sink)
         adapter._on_message(_packet(0))
@@ -822,20 +877,34 @@ async def test_retained_pending_window_grows_sublinearly_with_burst() -> None:
     isolates the pending window itself; report bookkeeping is covered
     by the parametrized burst records.
     """
+    # Warm the adapter/codec and task machinery before recording a baseline.
+    warm_publisher = _HeldPublisher(entry_count=100)
+    warm_adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id="mc-peak-warmup"))
+    await _start(warm_adapter, warm_publisher, sink=None)
+    try:
+        await _stage_held_burst(warm_adapter, warm_publisher, 100, -100_000)
+        warm_publisher.gate.set()
+        await _drain(warm_adapter)
+    finally:
+        warm_publisher.gate.set()
+        await warm_adapter.stop()
+
     retained_peaks: dict[int, int] = {}
     raw_peaks: dict[int, int] = {}
     lags: dict[int, float] = {}
+    burst_blocks: dict[int, float] = {}
     for burst, offset in ((100, 0), (1600, 100_000)):
         publisher = _HeldPublisher(entry_count=100)
         adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id=f"mc-peak-{burst}"))
         await _start(adapter, publisher, sink=None)
         try:
-            retained, raw_peak, lag = await _stage_held_burst(
+            retained, raw_peak, lag, burst_block = await _stage_held_burst(
                 adapter, publisher, burst, offset
             )
             retained_peaks[burst] = retained
             raw_peaks[burst] = raw_peak
             lags[burst] = lag
+            burst_blocks[burst] = burst_block
             assert retained > 0
             assert len(_pending_tasks(adapter)) == 100
             publisher.gate.set()
@@ -850,6 +919,10 @@ async def test_retained_pending_window_grows_sublinearly_with_burst() -> None:
         "retained saturated footprint must be governed by the cap, not "
         f"the burst size (100B={small}B, 1600B={large}B)"
     )
+    assert large - small < RETAINED_EXTRA_BYTES_BOUND, (
+        "refused packets must not accumulate significant retained state "
+        f"(100B={small}B, 1600B={large}B)"
+    )
     assert lags[1600] < SENTINEL_LAG_BOUND_SECONDS
     _write_report(
         "meshcore-memory-sublinearity.json",
@@ -862,11 +935,15 @@ async def test_retained_pending_window_grows_sublinearly_with_burst() -> None:
             "retained_large_bytes": large,
             "retained_ratio": round(large / small, 3) if small else None,
             "retained_ratio_bound": SUBLINEAR_RETAINED_RATIO_BOUND,
+            "retained_extra_bytes_bound": RETAINED_EXTRA_BYTES_BOUND,
+            "retained_extra_bytes": large - small,
             "burst_growth_ratio": 16,
             "raw_peak_small_bytes": raw_peaks[100],
             "raw_peak_large_bytes": raw_peaks[1600],
             "sentinel_lag_small_ms": round(lags[100] * 1000, 3),
             "sentinel_lag_large_ms": round(lags[1600] * 1000, 3),
+            "synchronous_burst_block_small_ms": round(burst_blocks[100] * 1000, 3),
+            "synchronous_burst_block_large_ms": round(burst_blocks[1600] * 1000, 3),
             "overflow_policy": "bounded_callback_capacity",
         },
     )

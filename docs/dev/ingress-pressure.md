@@ -19,8 +19,10 @@ for an async slot and no semaphore is held across an await, so the loop cannot
 block or deadlock.
 
 `MeshCoreConfig.max_pending_ingress_callbacks` bounds the publication tasks
-pending per adapter. The default `100` is provisional pending a measured-budget
-round; validation rejects non-positive values, so the bound is always finite.
+pending per adapter. The default `100` has completed synthetic sustained-budget
+qualification for the shapes recorded below; it is not a throughput or hardware
+guarantee.
+Validation rejects non-positive values, so the bound is always finite.
 
 Ordering rule: the slot is reserved before the dedup key is committed. A packet
 refused for capacity is therefore never recorded in dedup — no task is
@@ -84,8 +86,9 @@ then retained exactly one asyncio task per distinct packet: 32 and 256
 outstanding tasks, respectively, with all events publishing after release and
 the task set draining. Those numbers document linear pre-admission task growth
 and are not evidence of loss or of a sustainable capacity threshold; they are
-kept here as the baseline the bounded policy superseded. The bound's default
-remains provisional until a measured-budget round selects a durable value.
+kept here as the baseline the bounded policy superseded. The default `100` is
+qualified for the synthetic bounded-admission shapes below; real-SDK and
+hardware throughput remain unqualified.
 
 Running cancellation is not evidence that admission never began and is not
 reported as `cancelled_before_admission`. A publication that successfully
@@ -100,13 +103,15 @@ separate lifecycle qualification before claiming a global resource bound.
 ## Measured sustained qualification (2026-11-04)
 
 `tests/test_meshcore_sustained_admission.py` recorded the measured-budget
-round for the provisional default of `100`. Content-free JSON records export
-to `MEDRE_PRESSURE_REPORT_DIR`; the numbers below are from one local run and
+round for the default of `100`, qualifying the synthetic shapes described below.
+Content-free JSON records export to `MEDRE_PRESSURE_REPORT_DIR`; the numbers
+below are from one local run and
 are reproducible per machine. They prove bounded admission above the cap,
 dedup-safe re-admission of refused identities, epoch isolation under
-saturation, and the absence of loop starvation at burst scale. They do not
-prove throughput, real-SDK behavior, hardware or RF performance, and the
-loop-lag bound asserted by the tests is a generous CI guard, not an SLA.
+saturation, and post-burst pending-window loop stepping. Synchronous burst
+callback blocking is recorded separately; the tests do not prove its absence.
+They do not prove throughput, real-SDK behavior, hardware or RF performance;
+the post-burst sentinel bound is a generous CI guard, not an SLA.
 
 Above-cap bursts with publication held (default bound 100):
 
@@ -122,15 +127,16 @@ reports reconciled exactly (`scheduled` equals the burst size, `overflow`
 equals the refusal count). The admitted window published in admission order
 and drained in full.
 
-Memory evidence, measured with `tracemalloc` in-process: the retained
-saturated window (pending tasks, their canonical events and publisher
-bookkeeping, after collecting transient refused-decode allocations) grew from
-about 534 KB at a 100-burst to about 538 KB at a 1600-burst — a 1.008 ratio
-against a 16x burst growth, confirming pending work is governed by the cap,
-not the burst size. End-to-end records including producer-report bookkeeping
-showed the same shape (about 556 KB versus 716 KB, ratio about 1.29). The raw
-high-water including refused-decode churn is recorded in the JSON for context
-only. `ru_maxrss` is recorded as process context and is never asserted.
+The initial 2026-11-04 `tracemalloc` record showed retained saturated-window
+footprints near 534 KB and 538 KB for 100 and 1600 callbacks (about 1.008x),
+with end-to-end footprints near 556 KB and 716 KB (about 1.29x). The revised
+test warms up the adapter, measures retained bytes relative to each pre-burst
+baseline, and requires both less than 2x growth and less than 256 KB extra
+retained memory at 16x arrivals. It records synchronous callback burst time
+separately from the post-burst sentinel. JSON records from each run supersede
+the historical numbers when evaluating a new checkout. Absolute tracing
+high-water and process RSS are context only, never memory-budget guarantees.
+An already-running `tracemalloc` session is neither reset nor stopped.
 
 Sustained imbalance used a small bound (8) over 200 cycles of 12 arrivals
 each — 2,400 distinct deliveries plus 200 duplicates suppressed by dedup —
