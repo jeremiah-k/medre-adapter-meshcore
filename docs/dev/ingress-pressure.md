@@ -15,6 +15,10 @@ per distinct packet: 32 and 256 outstanding tasks, respectively. All events
 published after release and the task set drained. Shutdown of one blocked
 publisher cancels the retained task, observes its exit and refuses subsequent
 callbacks. Releasing the sink cannot complete a publication after stop. A
+publication task cancelled while the adapter remains started releases its
+provisional dedup reservation, so a retransmission of the same identity is
+re-admitted; the release is ownership-checked, and a cancellation after a
+successful publish keeps the admitted key. A
 separate queued-but-unstarted case bypasses drain cancellation to exercise the
 coroutine's independent lifecycle check. Optional JSON
 reports contain counters and elapsed local time, not message bodies; latency
