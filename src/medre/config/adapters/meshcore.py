@@ -27,6 +27,10 @@ Validation rules
 - ``message_delay_seconds`` must be a non-negative finite number
   (≥ 0, finite), ``default_channel`` ≥ 0.
 - ``max_text_bytes`` ≥ 0, must be ``int`` (``bool`` rejected explicitly).
+- ``max_pending_ingress_callbacks`` must be a positive integer (``bool``
+  and non-positive values rejected explicitly).  Default ``100`` is a
+  provisional producer-side bound on inbound publication tasks pending
+  the measured-budget round.
 - ``meshcore_relay_prefix`` must be a string (``bool`` rejected explicitly).
   Default ``""`` means no prefix is prepended.  When non-empty, the
   string is a template for :func:`~medre.core.rendering.attribution.format_relay_prefix`.
@@ -121,6 +125,15 @@ class MeshCoreConfig:
         along with attribution extracted from the source event.
         The rendered prefix counts toward ``max_text_bytes``.
         Must be a string; ``bool`` is rejected explicitly.
+    max_pending_ingress_callbacks:
+        Producer-side bound on inbound publication tasks scheduled from
+        the synchronous SDK callback.  When the bound is reached the
+        callback refuses further distinct packets before any dedup key
+        is committed, reports producer pressure with the
+        ``"callback_capacity"`` reason, and leaves redelivery of a
+        refused packet to the radio.  Default ``100`` is provisional
+        pending a measured-budget round.  Must be a positive integer;
+        ``bool`` and non-positive values are rejected explicitly.
     """
 
     adapter_id: str
@@ -140,6 +153,7 @@ class MeshCoreConfig:
     max_text_bytes: int = GROUP_TEXT_BYTES
     meshcore_relay_prefix: str = ""
     max_text_parts: int = 1
+    max_pending_ingress_callbacks: int = 100
 
     def validate(self) -> Self:
         """Validate the configuration and return *self* for chaining.
@@ -196,6 +210,16 @@ class MeshCoreConfig:
         if self.max_text_bytes < 0:
             raise MeshCoreConfigError(
                 f"max_text_bytes must be >= 0, got {self.max_text_bytes}"
+            )
+        if type(self.max_pending_ingress_callbacks) is not int:
+            raise MeshCoreConfigError(
+                "max_pending_ingress_callbacks must be an int, got "
+                f"{type(self.max_pending_ingress_callbacks).__name__}"
+            )
+        if self.max_pending_ingress_callbacks < 1:
+            raise MeshCoreConfigError(
+                "max_pending_ingress_callbacks must be >= 1, got "
+                f"{self.max_pending_ingress_callbacks}"
             )
 
         # meshcore_relay_prefix: must be str, bool rejected
