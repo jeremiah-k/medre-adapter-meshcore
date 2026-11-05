@@ -9,11 +9,13 @@ before it commits the dedup key, so the loop never blocks on an async slot and
 no semaphore is held across an await.
 
 Because the reservation precedes the dedup commit, a capacity refusal never
-poisons dedup: a refused packet schedules no task, caches no identity, and logs
-one content-free warning, so its next delivery is re-admitted once capacity
-frees. Accepted packets report `scheduled` through the optional
+poisons dedup: a refused packet schedules no task and caches no identity, so
+its next delivery is re-admitted once capacity frees. Content-free overflow
+warnings are rate-limited to the first refusal and at most one per five seconds,
+with a cumulative count; every refusal still increments diagnostics and reports
+producer pressure. Accepted packets report `scheduled` through the optional
 `report_producer_pressure` seam; refusals report `overflow` with the
-`callback_capacity` reason; publication tasks cancelled before admission report
+`callback_capacity` reason; publication tasks cancelled before their first step report
 `cancelled_before_admission`. Each report carries `count=1` and the adapter's
 own id and never carries message content, sender identity, or key material.
 Reports are pre-admission accounting only: they never claim durable admission
@@ -34,3 +36,7 @@ to a session epoch: a late task from a timed-out stop cannot release a new
 session slot or inflate its cancellation and publication counters.
 Background-task drains use a bounded wait that does not depend on a
 publisher acknowledging cancellation.
+
+Running cancellation is phase-ambiguous and does not supply a pre-admission
+cancellation fact. Simulation completions obey the same epoch fence. Rejected
+task creation closes its coroutine and releases the slot and provisional key.

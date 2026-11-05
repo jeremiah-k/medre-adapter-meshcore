@@ -41,11 +41,13 @@ create a publication task. The refusal MUST be explicit, loss-honest
 accounting: the adapter MUST increment a `producer_overflow` diagnostics
 counter, report an `overflow` producer-pressure fact with reason
 `callback_capacity` through the optional sink
-(`AdapterContext.report_producer_pressure`) when present, and log one
-line containing no message text, no sender identity and no key material.
-The refusal MUST
-NOT imply admission, authorize retry or resend, or route the packet
-toward any recovery authority. Producer staging is explicitly not
+(`AdapterContext.report_producer_pressure`) when present. The adapter MUST
+warn on the first refusal of a session and SHOULD rate-limit subsequent
+warnings to at most one per five seconds; a warning MUST carry the cumulative
+refusal count and MUST NOT contain message text, sender identity or key
+material. Every refusal MUST still be counted and reported independently of
+warning suppression. Refusal MUST NOT imply admission, authorize retry or
+resend, or route the packet toward any recovery authority. Producer staging is explicitly not
 lossless: overflow loss may be irreversible for a cursor-less radio
 source.
 
@@ -60,7 +62,9 @@ session. A new session MUST start from full, private capacity; a release
 from a retired session MUST NOT grant capacity to the current one.
 Every reservation MUST bind its done callback to the creating session epoch;
 late completions MUST NOT modify pending slots, cancellation counts, or
-`inbound_published` diagnostics belonging to a newer session. The stop
+`inbound_published` diagnostics belonging to a newer session. A late
+pre-start cancellation MUST report to the original session's pressure sink when
+available; it MUST NOT be attributed to the restarted session. The stop
 budget MUST be a real deadline even when a callback's publisher does not
 cooperate with cancellation. A timed-out drain MAY leave a retired task
 alive, but MUST retire its capacity epoch before a new session starts.
@@ -74,3 +78,10 @@ be content-free pre-admission facts through the optional sink; they never
 claim durable admission, native acceptance or replay authority, and their
 loss when the sink is absent or the store fails is operational-accounting
 loss, never message durability.
+
+Cancellation of an already-started publication MUST NOT be reported as proof
+that admission never began. Only cancellation before the publication starts
+supports `cancelled_before_admission`; a successful publication that requests
+cancellation while returning MUST retain its admitted identity and MUST NOT
+increment this outcome. The simulation path MUST also fence post-await counters
+and dedup commits against a retired epoch.

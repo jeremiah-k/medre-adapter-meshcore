@@ -5,7 +5,7 @@ packet before committing the dedup key and scheduling the publication
 task.  When ``max_pending_ingress_callbacks`` tasks are already pending,
 a distinct packet is refused without admission: no task, no dedup key,
 one ``"overflow"`` producer-pressure report with the
-``"callback_capacity"`` reason, and one content-free warning.  A refused
+``"callback_capacity"`` reason, and rate-limited content-free warnings. A refused
 identity stays retryable — its next delivery is re-admitted once
 capacity frees.  Accepted packets report ``"scheduled"``; tasks
 cancelled before admission report ``"cancelled_before_admission"``.
@@ -29,7 +29,13 @@ from typing import Any
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.identity import derive_message_identity
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterContext, ProducerPressureReport
+from medre.core.contracts.adapter import AdapterContext
+
+try:
+    from medre.core.contracts.adapter import ProducerPressureReport
+except ImportError:
+    # Older compatible core releases lack producer-pressure reporting.
+    ProducerPressureReport = None
 from medre.core.events import CanonicalEvent
 
 
@@ -105,9 +111,11 @@ async def _start(
         "clock": lambda: datetime.now(UTC),
         "shutdown_event": asyncio.Event(),
     }
-    if sink is not None:
-        context["report_producer_pressure"] = sink
     ctx = AdapterContext(**context)
+    if sink is not None:
+        # Older compatible AdapterContext versions lack this constructor
+        # field; the adapter must tolerate the optional seam being absent.
+        ctx.report_producer_pressure = sink
     await adapter.start(ctx)
     return ctx
 
@@ -345,7 +353,7 @@ async def test_duplicate_bursts_dedup_within_bounded_capacity() -> None:
 
 
 async def test_stop_under_load_cancels_pending_and_accounts_cancellation() -> None:
-    """stop() cancels held callbacks; each reports cancelled_before_admission."""
+    """Running publications cancel without claiming that admission never began."""
     publisher = _HeldPublisher(entry_count=8)
     sink = _PressureSink()
     adapter = MeshCoreAdapter(
@@ -362,8 +370,8 @@ async def test_stop_under_load_cancels_pending_and_accounts_cancellation() -> No
         assert not _pending_tasks(adapter)
         assert publisher.published == []
         assert adapter.diagnostics()["pending_ingress_callbacks"] == 0
-        assert adapter.diagnostics()["producer_cancelled_before_admission"] == 8
-        assert sink.outcome_count("cancelled_before_admission") == 8
+        assert adapter.diagnostics()["producer_cancelled_before_admission"] == 0
+        assert sink.outcome_count("cancelled_before_admission") == 0
         assert sink.outcome_count("overflow") == 0
         assert not adapter._inbound_dedup
 
@@ -541,23 +549,29 @@ async def test_raising_pressure_sink_is_contained() -> None:
 
 
 # ===================================================================
-# The refusal log line is content-free and one per refusal.
+# Warnings are content-free and rate-limited; refusal evidence is exact.
 # ===================================================================
 
 
-async def test_refusal_logs_single_content_free_line(caplog) -> None:
-    """One warning per refusal; never message content."""
+async def test_refusal_warning_is_rate_limited_but_counts_remain_exact(caplog) -> None:
+    """A burst emits one warning, while each refusal is counted and reported."""
     publisher = _HeldPublisher(entry_count=1)
     adapter = MeshCoreAdapter(
         MeshCoreConfig(adapter_id="mc-boundary-log", max_pending_ingress_callbacks=1)
     )
-    await _start(adapter, publisher, sink=None)
+    sink = _PressureSink()
+    await _start(adapter, publisher, sink)
     try:
         with caplog.at_level(logging.WARNING, logger="test.mc-boundary-log"):
             adapter._on_message(_packet(0))
             await asyncio.wait_for(publisher.entry_events[0].wait(), 5)
-            adapter._on_message(_packet(1))
-            adapter._on_message(_packet(2))
+            for index in range(1, 65):
+                adapter._on_message(_packet(index))
+
+            assert adapter.diagnostics()["producer_overflow"] == 64
+            assert sink.outcome_count("overflow") == 64
+            adapter._last_overflow_warning_at -= 6.0
+            adapter._on_message(_packet(65))
 
         refusals = [
             record
@@ -566,6 +580,10 @@ async def test_refusal_logs_single_content_free_line(caplog) -> None:
             and "packet refused without admission" in record.getMessage()
         ]
         assert len(refusals) == 2
+        assert "total_refused=1" in refusals[0].getMessage()
+        assert "total_refused=65" in refusals[1].getMessage()
+        assert adapter.diagnostics()["producer_overflow"] == 65
+        assert sink.outcome_count("overflow") == 65
         for record in refusals:
             message = record.getMessage()
             assert "pressure 0" not in message
@@ -700,6 +718,7 @@ async def test_retired_publication_does_not_release_new_session_capacity(
     adapter = MeshCoreAdapter(
         MeshCoreConfig(adapter_id="mc-retired-epoch", max_pending_ingress_callbacks=1)
     )
+    retired_sink = _PressureSink()
     await adapter.start(
         AdapterContext(
             adapter_id=adapter.adapter_id,
@@ -707,6 +726,7 @@ async def test_retired_publication_does_not_release_new_session_capacity(
             logger=logging.getLogger("test.meshcore.retired.epoch"),
             clock=lambda: datetime.now(UTC),
             shutdown_event=asyncio.Event(),
+            report_producer_pressure=retired_sink,
         )
     )
     new_publisher = _HeldPublisher(entry_count=1)
@@ -735,6 +755,9 @@ async def test_retired_publication_does_not_release_new_session_capacity(
         assert adapter.diagnostics()["pending_ingress_callbacks"] == 1
         assert adapter.diagnostics()["producer_cancelled_before_admission"] == 0
         assert adapter.diagnostics()["inbound_published"] == 0
+        assert retired_sink.outcome_count("scheduled") == 1
+        assert retired_sink.outcome_count("cancelled_before_admission") == 0
+        assert sink.outcome_count("cancelled_before_admission") == 0
         adapter._on_message(_packet(2))
         assert adapter.diagnostics()["producer_overflow"] == 1
         assert len(_pending_tasks(adapter)) == 1
@@ -748,4 +771,98 @@ async def test_retired_publication_does_not_release_new_session_capacity(
         new_publisher.gate.set()
         if retired_task is not None:
             await asyncio.gather(retired_task, return_exceptions=True)
+        await adapter.stop()
+
+
+async def test_successful_self_cancellation_is_not_reported_as_unadmitted():
+    """A completed publication cannot become a producer cancellation loss."""
+    adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id="mc-completed-cancel"))
+    sink = _PressureSink()
+
+    async def publish(_event):
+        asyncio.current_task().cancel()
+
+    await _start(adapter, publish, sink)
+    try:
+        adapter._on_message(_packet(0))
+        task = _pending_tasks(adapter)[0]
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert adapter.diagnostics()["inbound_published"] == 1
+        assert adapter.diagnostics()["pending_ingress_callbacks"] == 0
+        assert sink.outcome_count("cancelled_before_admission") == 0
+        assert adapter.diagnostics()["producer_cancelled_before_admission"] == 0
+    finally:
+        await adapter.stop()
+
+
+async def test_failed_publisher_releases_slot_and_allows_another_packet():
+    """An ordinary publication error retires its slot as well as its dedup key."""
+    adapter = MeshCoreAdapter(
+        MeshCoreConfig(
+            adapter_id="mc-publish-failure",
+            max_pending_ingress_callbacks=1,
+        )
+    )
+    seen = []
+
+    async def publish(event):
+        seen.append(event.event_id)
+        if len(seen) == 1:
+            raise RuntimeError("publish failed")
+
+    await _start(adapter, publish)
+    try:
+        adapter._on_message(_packet(0))
+        await _drain(adapter)
+        assert adapter.diagnostics()["pending_ingress_callbacks"] == 0
+        adapter._on_message(_packet(1))
+        await _drain(adapter)
+        assert len(seen) == 2
+        assert adapter.diagnostics()["inbound_published"] == 1
+        assert adapter.diagnostics()["producer_overflow"] == 0
+    finally:
+        await adapter.stop()
+
+
+async def test_retired_simulation_does_not_commit_new_session_state():
+    """A simulation's late completion cannot pollute replacement diagnostics."""
+    adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id="mc-simulation-epoch"))
+    old = _HeldPublisher(entry_count=1)
+    await _start(adapter, old)
+    running = asyncio.create_task(adapter.simulate_inbound(_packet(0)))
+    try:
+        await asyncio.wait_for(old.entry_events[0].wait(), 5)
+        await adapter.stop()
+        fresh = _HeldPublisher(entry_count=1)
+        await _start(adapter, fresh)
+        old.gate.set()
+        await running
+        assert adapter.diagnostics()["inbound_published"] == 0
+        assert not adapter._inbound_dedup
+    finally:
+        old.gate.set()
+        await asyncio.gather(running, return_exceptions=True)
+        await adapter.stop()
+
+
+async def test_rejected_task_creation_closes_coroutine_and_returns_capacity(
+    monkeypatch,
+):
+    """A failed scheduler retains neither a coroutine nor a reservation."""
+    adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id="mc-scheduling-failure"))
+    await _start(adapter, _HeldPublisher(entry_count=1))
+    rejected = []
+
+    def reject(coroutine):
+        rejected.append(coroutine)
+        raise RuntimeError("scheduler closed")
+
+    try:
+        monkeypatch.setattr(asyncio, "create_task", reject)
+        adapter._on_message(_packet(0))
+        assert len(rejected) == 1 and rejected[0].cr_frame is None
+        assert adapter.diagnostics()["pending_ingress_callbacks"] == 0
+        assert not adapter._inbound_dedup
+    finally:
         await adapter.stop()

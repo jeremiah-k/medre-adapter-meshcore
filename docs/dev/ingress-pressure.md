@@ -28,22 +28,27 @@ redelivery of a refused packet while capacity is still full is refused again.
 
 ## Loss-honest disposition
 
-Every distinct packet reaching the callback is accounted exactly once: it is
-scheduled toward admission, refused with explicit overflow accounting, or
-cancelled before admission by lifecycle stop. Refusal and cancellation never
+Each distinct relayable packet is either scheduled toward admission or
+refused with explicit overflow accounting. A scheduled publication cancelled
+before its publication begins additionally reports cancellation; these are different stages,
+not mutually exclusive outcomes. Refusal and cancellation never
 claim durable admission, never grant a receipt, and never imply a retry;
-redelivery remains the radio's decision. Refusals log one content-free warning
-line (adapter id, pending count, bound) — never message content, sender
-identity, or key material.
+redelivery remains the radio's decision. Warnings are rate-limited: the first
+refusal of a session and at most one per five seconds afterward, including the
+cumulative refusal count, pending count and bound. Counters and producer-pressure
+reports still include every refusal. Logs never include message content, sender
+identity or key material.
 
 Reservations are released by each publication task's done callback — covering
 completion, publish failure, cancellation, and tasks cancelled before their
 coroutine first stepped — and reset at session boundaries, so stop/start and
 reconnect leave no stale reservations. Shutdown under load cancels pending
-tasks; every cancelled task is reported and counted as cancelled before
-admission. The queued-but-unstarted fence is unchanged: a callback that has
-not yet run cannot publish after stop, and releasing the sink cannot complete
-a publication after stop.
+tasks. Pre-start cancellations are counted; a late pre-start cancellation from a
+retired session still reports to the original context, without modifying
+new-session counters. The queued-but-unstarted fence is unchanged: callbacks
+that never started cannot publish after stop. A publisher already running and
+ignoring cancellation can finish after a timed-out drain; this does not confer
+new admission or send authority.
 
 A publication task cancelled while the adapter remains started also releases
 its provisional dedup reservation, so a retransmission of the same identity is
@@ -78,3 +83,13 @@ the task set draining. Those numbers document linear pre-admission task growth
 and are not evidence of loss or of a sustainable capacity threshold; they are
 kept here as the baseline the bounded policy superseded. The bound's default
 remains provisional until a measured-budget round selects a durable value.
+
+Running cancellation is not evidence that admission never began and is not
+reported as `cancelled_before_admission`. A publication that successfully
+returns while requesting task cancellation retains its admitted identity.
+The simulation path also fences counters and dedup commits across epochs.
+
+The configured budget is per session. Publishers that ignore cancellation may
+survive a timed-out stop; repeated restarts can accumulate retired tasks outside
+that budget. A process-wide bound and overlapping start/stop ownership need
+separate lifecycle qualification before claiming a global resource bound.

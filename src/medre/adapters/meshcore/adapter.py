@@ -51,8 +51,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import functools
 from collections import OrderedDict
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -247,6 +247,7 @@ class MeshCoreAdapter(AdapterContract):
         self._callback_admission_epoch: int = 0
         self._producer_scheduled_count: int = 0
         self._producer_overflow_count: int = 0
+        self._last_overflow_warning_at: float = float("-inf")
         self._producer_cancelled_before_admission_count: int = 0
 
         # Inbound dedup: keyed by the MEDRE-derived MeshCore message
@@ -299,6 +300,7 @@ class MeshCoreAdapter(AdapterContract):
         self._pending_callback_admissions = 0
         self._producer_scheduled_count = 0
         self._producer_overflow_count = 0
+        self._last_overflow_warning_at = float("-inf")
         self._producer_cancelled_before_admission_count = 0
         self._inbound_dedup.clear()
 
@@ -697,25 +699,35 @@ class MeshCoreAdapter(AdapterContract):
         if self._pending_callback_admissions > 0:
             self._pending_callback_admissions -= 1
 
-    def _on_background_task_done(self, epoch: int, task: asyncio.Task[Any]) -> None:
-        """Release a callback reservation and account cancellation.
+    def _on_background_task_done(
+        self,
+        epoch: int,
+        context: AdapterContext,
+        task: asyncio.Task[Any],
+        *,
+        publication_started: bool = False,
+    ) -> None:
+        """Release this session's slot and report cancellations to its context.
 
         Attached to every publication task created by
         :meth:`_on_message`.  Done callbacks run even for tasks
         cancelled before their coroutine first stepped, so the
         reservation is released on completion, error, cancellation and
-        stop alike.  A cancelled task is reported as
-        ``cancelled_before_admission`` producer pressure — staged work
-        dropped before any admission attempt — and counted in
-        diagnostics.
+        stop alike. Only an unstarted cancelled task is reported as
+        ``cancelled_before_admission``; a running publisher's cancellation
+        cannot establish whether durable admission occurred. Late completions never change current
+        capacity or counters, but late cancellations still report through
+        the original context rather than the restarted session's sink.
         """
         self._background_tasks.discard(task)
-        if epoch != self._callback_admission_epoch:
-            return
-        self._release_callback_slot()
-        if task.cancelled():
-            self._producer_cancelled_before_admission_count += 1
-            self._report_producer_pressure("cancelled_before_admission")
+        if epoch == self._callback_admission_epoch:
+            self._release_callback_slot()
+            if task.cancelled() and not publication_started:
+                self._producer_cancelled_before_admission_count += 1
+        if task.cancelled() and not publication_started:
+            self._report_producer_pressure(
+                "cancelled_before_admission", context=context
+            )
 
     def _report_producer_pressure(
         self,
@@ -723,6 +735,7 @@ class MeshCoreAdapter(AdapterContract):
         *,
         count: int = 1,
         reason: str | None = None,
+        context: AdapterContext | None = None,
     ) -> None:
         """Report producer pressure through the optional core seam.
 
@@ -735,8 +748,10 @@ class MeshCoreAdapter(AdapterContract):
         best-effort: reporting is skipped when the runtime context
         predates the seam or the report type is unavailable, and a sink
         failure is contained (type name only — never message content).
+        The explicit context keeps retired cancellations on their original
+        session's pressure sink, even after stop/restart.
         """
-        ctx = self.ctx
+        ctx = context if context is not None else self.ctx
         sink = getattr(ctx, "report_producer_pressure", None)
         if sink is None or ProducerPressureReport is None:
             return
@@ -758,21 +773,26 @@ class MeshCoreAdapter(AdapterContract):
         """Account the producer-side refusal of one distinct packet.
 
         No task is scheduled and no dedup key is committed, so a
-        refused packet's identity stays retryable by the radio: its
-        next delivery is re-admitted once capacity frees.  The log line
-        is content-free — it carries counters and the bound, never
-        message content, sender identity, or key material.
+        refused packet's identity stays retryable by the radio. Every
+        refusal is counted and reported; warnings are rate-limited to
+        protect the busy owner loop. They include the cumulative refused
+        count, never message content, sender identity, or key material.
         """
         self._producer_overflow_count += 1
         self._report_producer_pressure("overflow", reason="callback_capacity")
         if self.ctx is not None:
-            self.ctx.logger.warning(
-                "MeshCoreAdapter %s: ingress callback capacity full; "
-                "packet refused without admission (pending=%d, limit=%d)",
-                self.adapter_id,
-                self._pending_callback_admissions,
-                self._config.max_pending_ingress_callbacks,
-            )
+            now = monotonic()
+            if now - self._last_overflow_warning_at >= 5.0:
+                self._last_overflow_warning_at = now
+                self.ctx.logger.warning(
+                    "MeshCoreAdapter %s: ingress callback capacity full; "
+                    "packet refused without admission "
+                    "(pending=%d, limit=%d, total_refused=%d)",
+                    self.adapter_id,
+                    self._pending_callback_admissions,
+                    self._config.max_pending_ingress_callbacks,
+                    self._producer_overflow_count,
+                )
 
     def _on_message(self, packet: dict[str, Any]) -> None:
         """Process an inbound MeshCore event payload from the session.
@@ -791,8 +811,8 @@ class MeshCoreAdapter(AdapterContract):
         publication tasks are already pending, the packet is refused
         without admission — no task, no dedup key — producer pressure
         reports ``"overflow"`` with the ``"callback_capacity"`` reason,
-        and one content-free warning is logged.  A refused identity
-        stays retryable: its next delivery is re-admitted once capacity
+        and a rate-limited content-free warning is logged. A refused
+        identity stays retryable: its next delivery is re-admitted once capacity
         frees.  Accepted packets report ``"scheduled"``.
 
         Parameters
@@ -864,15 +884,19 @@ class MeshCoreAdapter(AdapterContract):
             # Schedule the async publish — _on_message is synchronous
             # so we create a tracked task that's cleaned up on stop().
             publication_started = False
+            epoch = self._callback_admission_epoch
+            context = self.ctx
 
             async def publish() -> None:
                 nonlocal publication_started
                 publication_started = True
                 await self._on_message_async(canonical, dedup_key, dedup_token)
 
+            publication = publish()
             try:
-                task = asyncio.create_task(publish())
+                task = asyncio.create_task(publication)
             except Exception:
+                publication.close()
                 # Scheduling failed: free the reserved slot and the
                 # provisional key so neither suppresses redelivery.
                 self._release_callback_slot()
@@ -893,13 +917,14 @@ class MeshCoreAdapter(AdapterContract):
                     and dedup_key is not None
                 ):
                     self._release_dedup_key(dedup_key, dedup_token)
+                self._on_background_task_done(
+                    epoch,
+                    context,
+                    done,
+                    publication_started=publication_started,
+                )
 
             task.add_done_callback(retire_publication)
-            task.add_done_callback(
-                functools.partial(
-                    self._on_background_task_done, self._callback_admission_epoch
-                )
-            )
             self._background_tasks.add(task)
             self._producer_scheduled_count += 1
             self._report_producer_pressure("scheduled")
@@ -926,9 +951,9 @@ class MeshCoreAdapter(AdapterContract):
         has not yet executed when :meth:`stop` sets ``_started = False``.
 
         Cancellation is never swallowed.  A publication task cancelled
-        before ``publish_inbound`` returns has not been durably
-        admitted, so it releases its provisional dedup reservation and
-        re-raises; a retransmission of the same message identity is
+        while awaiting ``publish_inbound`` releases its provisional
+        adapter reservation and re-raises; durable core dedup remains
+        authoritative if admission committed before cancellation; a retransmission of the same message identity is
         then re-admitted instead of being silently suppressed.  The
         release is ownership-checked (see :meth:`_release_dedup_key`)
         so a late stale handler cannot evict a reservation that a
@@ -1034,7 +1059,10 @@ class MeshCoreAdapter(AdapterContract):
             contact_label=contact_label,
             local_node_name=self._local_node_name(),
         )
+        epoch = self._callback_admission_epoch
         await self.publish_inbound(canonical)
+        if epoch != self._callback_admission_epoch:
+            return
         self._inbound_published += 1
 
         # Commit dedup key only after successful decode + publish.
