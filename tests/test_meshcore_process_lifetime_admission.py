@@ -27,7 +27,8 @@ Proven per cycle and cumulatively:
   first restart cycles establish a warmed steady-state baseline with
   their strands still pending, the remaining cycles grow the census to
   every strand alive at once, the peak growth stays under the absolute
-  extra-bytes bound, and after every stranded publisher settles the
+  extra-bytes bound when this test owns tracing (borrowed tracing checks
+  only sampled retained growth), and after every stranded publisher settles the
   retained footprint returns below twice that baseline — nothing stays
   pinned across the process lifetime.
 
@@ -52,6 +53,8 @@ import tracemalloc
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 from typing import Any
 
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
@@ -69,6 +72,10 @@ try:
 except ImportError:
     # Older compatible core releases lack producer-pressure reporting.
     ProducerPressureReport = None
+
+pytestmark = pytest.mark.skipif(
+    ProducerPressureReport is None, reason="core lacks producer-pressure reporting"
+)
 
 # Restart cycles in one process.  Every cycle strands exactly one
 # cancellation-resistant publisher; the strands of the baseline cycles
@@ -246,17 +253,26 @@ def _pending_stranded(stranded: list[asyncio.Task[None]]) -> list[asyncio.Task[N
     return [task for task in stranded if not task.done()]
 
 
-def _assert_census(stranded: list[asyncio.Task[None]], expected: int) -> None:
-    """Exact process-wide census of adapter-created pending tasks.
+def _assert_census(
+    adapter: MeshCoreAdapter,
+    baseline_tasks: set[asyncio.Task[Any]],
+    stranded: list[asyncio.Task[None]],
+    expected: int,
+) -> None:
+    """Compare all new pending loop tasks with the expected stranded set.
 
-    Every stranded publisher is a real publication task the adapter
-    created; each one must still be pending in the running loop's own
-    task census while untracked by the adapter registry.
+    The adapter registry tracks active-session work; retired stubborn
+    publishers must be untracked, with no additional hidden task leak.
     """
-    pending = _pending_stranded(stranded)
+    pending = set(_pending_stranded(stranded))
     assert len(pending) == expected
-    loop_pending = asyncio.all_tasks()
-    assert all(task in loop_pending for task in pending)
+    untracked = (
+        asyncio.all_tasks()
+        - baseline_tasks
+        - {asyncio.current_task()}
+        - set(adapter._background_tasks)
+    )
+    assert untracked == pending
 
 
 def _write_report(name: str, payload: dict[str, Any]) -> None:
@@ -293,6 +309,7 @@ async def _run_restart_cycle(
     stranded_indices: list[int],
     warnings: _DrainWarningCounter,
     all_publishers: list[_CyclePublisher],
+    baseline_tasks: set[asyncio.Task[Any]],
 ) -> AdapterContext:
     """Run one restart cycle: saturate, strand, bounded stop, seam check.
 
@@ -319,7 +336,7 @@ async def _run_restart_cycle(
     sink = _CycleSink(adapter.adapter_id)
     sinks.append(sink)
 
-    _assert_census(stranded, cycle)
+    _assert_census(adapter, baseline_tasks, stranded, cycle)
     ctx = await _start(adapter, publisher, sink)
     retired_epoch = adapter._callback_admission_epoch
 
@@ -395,7 +412,7 @@ async def _run_restart_cycle(
 
     stranded.append(stubborn)
     stranded_indices.append(admitted_order[-1])
-    _assert_census(stranded, cycle + 1)
+    _assert_census(adapter, baseline_tasks, stranded, cycle + 1)
     return ctx
 
 
@@ -433,6 +450,7 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
     logger.addHandler(warnings)
     logger.setLevel(logging.WARNING)
     logger.propagate = False
+    baseline_tasks = asyncio.all_tasks()
     try:
         # Baseline cycles: full restart cycles whose strands stay pending,
         # so the post-baseline snapshot captures the process at a
@@ -447,11 +465,16 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
                 stranded_indices,
                 warnings,
                 all_publishers,
+                baseline_tasks,
             )
         gc.collect()
-        baseline, raw_peak_absolute = tracemalloc.get_traced_memory()
+        baseline, _warmup_peak = tracemalloc.get_traced_memory()
+        if owns_tracing:
+            # Only a tracer started by this test may have its peak reset.
+            tracemalloc.reset_peak()
+        sampled_peak = baseline
         assert baseline > 0
-        _assert_census(stranded, BASELINE_STRANDS)
+        _assert_census(adapter, baseline_tasks, stranded, BASELINE_STRANDS)
         assert not adapter._background_tasks
 
         # Measured cycles: each restart grows the live-strand census by
@@ -466,13 +489,17 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
                 stranded_indices,
                 warnings,
                 all_publishers,
+                baseline_tasks,
             )
+            # When tracing was enabled by the caller, sample current
+            # retained bytes without mutating the caller's peak counter.
+            sampled_peak = max(sampled_peak, tracemalloc.get_traced_memory()[0])
 
         # --------------------------------------------------------------
         # Peak accumulation: every stranded publisher of every cycle
         # still alive, untracked, and fenced from the active session.
         # --------------------------------------------------------------
-        _assert_census(stranded, CYCLES)
+        _assert_census(adapter, baseline_tasks, stranded, CYCLES)
         assert all(task not in adapter._background_tasks for task in stranded)
         assert sum(sink.counts["scheduled"] for sink in sinks) == CYCLES * CAP
         assert (
@@ -503,7 +530,7 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
         diagnostics = adapter.diagnostics()
         assert diagnostics["pending_ingress_callbacks"] == 0
         assert not adapter._inbound_dedup
-        _assert_census(stranded, CYCLES)
+        _assert_census(adapter, baseline_tasks, stranded, CYCLES)
 
         for index in [*final_admitted, *final_refused]:
             adapter._on_message(_packet(index))
@@ -524,7 +551,9 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
 
         # Late cancellation of the first stranded publisher: its stale
         # token targets the same key this session re-committed.  The
-        # ownership check must keep the newer reservation.
+        # ownership check must keep the newer reservation: the running
+        # handler reaches _release_dedup_key even in a retired epoch.
+        # The epoch fence protects counters, not dedup rollback.
         stranded_zero = stranded[0]
         stranded_zero.cancel()
         await asyncio.wait_for(
@@ -539,7 +568,7 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
         assert diagnostics["producer_overflow"] == len(final_refused)
         assert diagnostics["producer_cancelled_before_admission"] == 0
         assert sinks[0].counts["cancelled_before_admission"] == 1
-        _assert_census(stranded, CYCLES - 1)
+        _assert_census(adapter, baseline_tasks, stranded, CYCLES - 1)
 
         # The final window publishes in admission order; the late
         # cancellation reported nothing anywhere.
@@ -557,7 +586,13 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
         await adapter.stop(timeout=DRAIN_BUDGET_SECONDS)
 
         gc.collect()
-        peak_retained, raw_peak_absolute = tracemalloc.get_traced_memory()
+        current_retained, raw_peak_absolute = tracemalloc.get_traced_memory()
+        # Own tracing: high-water allocations anywhere in the measured
+        # interval, including between cycle boundaries. Borrowed tracing:
+        # observed current-memory high water only; never reset its peak.
+        peak_retained = max(sampled_peak, current_retained)
+        if owns_tracing:
+            peak_retained = max(peak_retained, raw_peak_absolute)
         peak_extra = max(0, peak_retained - baseline)
 
         # --------------------------------------------------------------
@@ -581,7 +616,7 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
 
         # The census is empty, nothing stays tracked or reserved, and
         # the late settles moved no counter and reported nothing.
-        _assert_census(stranded, 0)
+        _assert_census(adapter, baseline_tasks, stranded, 0)
         assert not adapter._background_tasks
         assert not adapter._inbound_dedup
         diagnostics = adapter.diagnostics()
@@ -601,7 +636,7 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
         stranded.clear()
         all_publishers.clear()
         gc.collect()
-        final_retained, raw_peak_absolute = tracemalloc.get_traced_memory()
+        final_retained, _endgame_peak = tracemalloc.get_traced_memory()
         final_extra = max(0, final_retained - baseline)
 
         # Dual process-lifetime bounds: the growth that 25 deliberately
@@ -610,8 +645,9 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
         # stranded publisher settles the retained footprint returns
         # below twice that baseline — nothing stays pinned across the
         # process lifetime.
+        measurement = "interval_high_water" if owns_tracing else "sampled_current"
         assert peak_extra < RETAINED_EXTRA_BYTES_BOUND, (
-            "cycling-phase accumulation must stay bounded "
+            f"cycling-phase {measurement} growth must stay bounded "
             f"(baseline={baseline}B, peak_extra={peak_extra}B)"
         )
         assert final_retained < RETAINED_RATIO_BOUND * baseline, (
@@ -643,6 +679,8 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
                 "drain_timeout_warnings": CYCLES,
                 "retained_baseline_bytes": baseline,
                 "retained_peak_bytes": peak_retained,
+                "peak_measurement": measurement,
+                "peak_growth_qualified": owns_tracing,
                 "retained_peak_extra_bytes": peak_extra,
                 "retained_final_bytes": final_retained,
                 "retained_final_extra_bytes": final_extra,
@@ -666,3 +704,17 @@ async def test_restart_cycles_leave_no_process_lifetime_accumulation() -> None:
         if owns_tracing:
             tracemalloc.stop()
         await adapter.stop(timeout=DRAIN_BUDGET_SECONDS)
+
+
+async def test_census_detects_an_untracked_extra_task() -> None:
+    """The census must fail on a leaked loop task absent from the ledger."""
+    adapter = MeshCoreAdapter(MeshCoreConfig(adapter_id="census-probe"))
+    before = asyncio.all_tasks()
+    gate = asyncio.Event()
+    extra = asyncio.create_task(gate.wait())
+    try:
+        with pytest.raises(AssertionError):
+            _assert_census(adapter, before, [], 0)
+    finally:
+        extra.cancel()
+        await asyncio.gather(extra, return_exceptions=True)

@@ -9,7 +9,11 @@ cancellation-resistant publishers under saturation, and loop-lag plus memory
 evidence. `tests/test_meshcore_process_lifetime_admission.py` extends the
 record across restart cycles in one process: tracked-registry and task-census
 bounds, per-session capacity honesty while prior strands stay alive, dedup
-boundaries across sessions, and whole-run memory guards. These callbacks
+boundaries across sessions, and whole-run memory guards. The process-lifetime
+peak guard uses interval high-water allocations when it owns tracing; with a
+borrowed tracer it checks only sampled retained growth and records
+`peak_growth_qualified: false`, leaving transient peak growth unqualified.
+These callbacks
 exercise the real classifier, native dedup identity,
 codec and the synchronous adapter callback on the asyncio owner loop, without
 a physical companion or SDK socket.
@@ -103,8 +107,8 @@ The configured budget is per session. Publishers that ignore cancellation may
 survive a timed-out stop; repeated restarts can accumulate retired tasks outside
 that budget. `tests/test_meshcore_process_lifetime_admission.py` pins that
 accumulation at cycle scale: the tracked registry returns to empty after every
-stop, the process-wide census of adapter-created tasks grows by exactly one
-stranded publisher per cycle and settles to empty, and whole-run memory stays
+stop, the process-wide census finds only the test's one deliberately stranded
+publisher per cycle, then returns to baseline, and whole-run memory stays
 inside the recorded bounds. The census covers adapter-created tasks only; it is
 not a bound on tasks the SDK runtime owns.
 
