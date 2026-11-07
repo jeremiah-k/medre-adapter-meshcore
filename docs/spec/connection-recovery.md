@@ -49,3 +49,26 @@ A diagnostic observer failure MUST NOT fail native startup, cleanup or delivery.
 Native health reports do not change packet acceptance or confirmation levels.
 The core runtime preserves startup history and publishes current health
 separately. A runtime without a report sink continues to use health probes.
+
+## Session stop and restart boundaries
+
+`MeshCoreSession.stop()` MUST clear the inbound message callback in its
+synchronous prologue — before any await — so inbound delivery ends when stop()
+begins: SDK events dispatched during the unsubscribe, fetch-stop, or disconnect
+awaits MUST NOT reach the retired callback, and a stop() cancelled mid-await
+MUST still leave the session inert. The connection-change notification MUST
+NOT be cleared with it; stop()'s final disconnected transition is still
+published, and reconnect-path stale-SDK cleanup MUST preserve the callback.
+
+A cancelled startup deliberately retains its partial session so the runtime's
+bounded startup rollback can retire it through `stop()`, and `stop()` keeps its
+session installed until the session's own stop returns. While an earlier
+start's session remains installed, `MeshCoreAdapter.start()` MUST refuse with a
+content-free `RuntimeError` before any mutation — before the lifecycle epoch
+bump, inbound-counter reset, pre-start buffer discard, or context assignment —
+because a replacement would orphan the installed session without running its
+`stop()`, which for BLE includes the bounded BlueZ stale-link release. Only
+after `stop()` retires that session may a fresh start proceed.
+
+A retired session MUST be freed by reference counting when the adapter drops
+it: the epoch-fenced inbound callback MUST NOT capture the session it fences.
