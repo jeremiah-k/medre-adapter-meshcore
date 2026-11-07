@@ -45,13 +45,24 @@ a slot before scheduling a publication task and refuses a packet
 without admission (no task, no dedup key) when the bound is reached.
 Refusals and pre-admission cancellations are reported as producer
 pressure through the optional core seam.
+
+Pre-start buffering: the pinned SDK's ``start_auto_message_fetching``
+issues one ``get_msg()`` while ``session.start()`` is still awaiting, so
+a device-buffered frame can reach :meth:`_on_message` before ``_started``
+is set.  While :meth:`start` is in flight, such frames are held in a
+bounded FIFO (``_PRESTART_BUFFER_MAX``) and flushed through the normal
+inbound path in arrival order once startup completes; a full buffer
+drops with a counter and a rate-limited content-free warning.  ``GET_NEXT_MSG``
+pops frames from the device queue, so dropping the startup-drain frame
+would lose the message.  A stopped or never-started adapter keeps the
+pre-existing silent drop and never replays buffered frames.
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -118,6 +129,15 @@ _MESHCORE_CAPS_BASE = AdapterCapabilities(
 
 # Maximum entries in the inbound dedup OrderedDict (LRU eviction).
 _DEDUP_MAX_SIZE = 1024
+
+# Maximum packets held in the pre-start buffer while start() is in
+# flight (bounded: overflow drops with a counter and a warning, never
+# unbounded memory).
+_PRESTART_BUFFER_MAX = 64
+
+# Minimum seconds between pre-start buffer overflow warnings (mirrors
+# the bounded-admission warning rate limit to protect the owner loop).
+_PRESTART_OVERFLOW_WARNING_INTERVAL = 5.0
 
 
 class _HasClassifierCounters(Protocol):
@@ -250,6 +270,23 @@ class MeshCoreAdapter(AdapterContract):
         self._last_overflow_warning_at: float = float("-inf")
         self._producer_cancelled_before_admission_count: int = 0
 
+        # Pre-start inbound buffer.  The pinned SDK's
+        # ``start_auto_message_fetching`` issues one ``get_msg()`` while
+        # ``MeshCoreSession.start()`` is still awaiting inside
+        # :meth:`start`, so a device-buffered frame can reach
+        # :meth:`_on_message` before ``_started`` is set.
+        # ``GET_NEXT_MSG`` pops the frame from the device queue, so
+        # dropping it loses the message.  While ``_starting`` is set,
+        # inbound payloads are held in this bounded FIFO and flushed
+        # through the normal path once startup completes.  A stopped or
+        # never-started adapter drops as before and never replays.
+        self._starting: bool = False
+        self._prestart_buffer: deque[dict[str, Any]] = deque()
+        self._prestart_buffered_count: int = 0
+        self._prestart_flushed_count: int = 0
+        self._prestart_overflow_dropped_count: int = 0
+        self._last_prestart_overflow_warning_at: float = float("-inf")
+
         # Inbound dedup: keyed by the MEDRE-derived MeshCore message
         # identity (see identity.py) — the same digest that becomes the
         # durable native-ref idempotency key at admission, so the
@@ -302,6 +339,10 @@ class MeshCoreAdapter(AdapterContract):
         self._producer_overflow_count = 0
         self._last_overflow_warning_at = float("-inf")
         self._producer_cancelled_before_admission_count = 0
+        self._prestart_buffered_count = 0
+        self._prestart_flushed_count = 0
+        self._prestart_overflow_dropped_count = 0
+        self._last_prestart_overflow_warning_at = float("-inf")
         self._inbound_dedup.clear()
 
     @property
@@ -332,9 +373,14 @@ class MeshCoreAdapter(AdapterContract):
             If ``meshcore`` SDK is not installed and connection_type is
             not ``"fake"``, or if strict startup cannot connect. The long-lived
             adapter starts degraded and retries when radio reachability fails.
+        RuntimeError
+            If a start is already in flight; a concurrent replacement
+            startup is rejected without touching the in-flight owner.
         """
         if self._started:
             return
+        if self._starting:
+            raise RuntimeError("MeshCore adapter startup is already in progress")
 
         # Clear cached health at lifecycle boundary so diagnostics
         # never reports a stale health string from a previous session.
@@ -342,50 +388,106 @@ class MeshCoreAdapter(AdapterContract):
         self._health_lifecycle_epoch += 1
 
         self._reset_inbound_counters()
+        # A stale pre-start buffer from an aborted lifecycle is never
+        # replayed into a new session.
+        self._discard_prestart_buffer("start entry")
 
         self.ctx = ctx
 
         health_epoch = self._health_lifecycle_epoch
-        # Create and start the session.
-        self._session = MeshCoreSession(
-            config=self._config,
-            adapter_id=self.adapter_id,
-            platform=self.platform,
-            logger=ctx.logger,
-            on_connection_change=lambda _: self._report_native_health(health_epoch),
-        )
+        # While start() is in flight, inbound callbacks are buffered (see
+        # _buffer_prestart_packet) instead of dropped: the pinned SDK's
+        # startup drain pops a device-queue frame before _started is set.
+        self._starting = True
+        # Construction is inside the failure boundary too: an SDK
+        # constructor error must close the pre-start window immediately.
+        session: MeshCoreSession | None = None
+
+        def receive(packet: dict[str, Any]) -> None:
+            # Fence by lifecycle epoch, not by capturing the session:
+            # exactly one session is installed per epoch (start() and
+            # stop() each bump the epoch before changing ``_session``),
+            # so epoch equality is the session-ownership check.  A
+            # captured session would create a cycle — the session stores
+            # this callback — pinning every retired session until a GC
+            # pass instead of freeing it by reference counting when the
+            # adapter drops it.  Frames past this fence still face every
+            # ``_on_message`` gate.
+            if health_epoch == self._health_lifecycle_epoch:
+                self._on_message(packet)
+
         try:
-            await self._session.start(
-                message_callback=self._on_message, recover_on_failure=True
+            session = MeshCoreSession(
+                config=self._config,
+                adapter_id=self.adapter_id,
+                platform=self.platform,
+                logger=ctx.logger,
+                on_connection_change=lambda _: self._report_native_health(health_epoch),
             )
+            self._session = session
+            await session.start(message_callback=receive, recover_on_failure=True)
         except asyncio.CancelledError:
             # Clear adapter-owned fields synchronously before re-raise.
             # Retain the partial owner for core's bounded startup rollback.
             # Clearing it here would make stop() unable to retire its tasks.
-            self._started = False
-            self._start_time = None
+            # No await precedes construction, so a cancellation here always
+            # has the session constructed and installed.
+            if (
+                self._session is session
+                and health_epoch == self._health_lifecycle_epoch
+            ):
+                self._discard_prestart_buffer("cancelled start")
+                self._starting = False
+                self._started = False
+                self._start_time = None
             raise
         except Exception:
-            # Best-effort cleanup: stop session, clear all state, re-raise.
-            try:
-                if self._session is not None:
-                    await self._session.stop()
-            except Exception:
-                pass
-            self._session = None
-            self._started = False
-            self.ctx = None
-            self._start_time = None
+            # A stop or replacement owns its own session retirement. An old
+            # startup failure must not stop or clear a newer session. A
+            # constructor failure has no session yet but must still close
+            # the pre-start window here; the inner re-check then keeps any
+            # retained partial session (from a cancelled start) for stop().
+            if health_epoch == self._health_lifecycle_epoch and (
+                session is None or self._session is session
+            ):
+                self._discard_prestart_buffer("failed start")
+                self._starting = False
+                try:
+                    if session is not None:
+                        await session.stop()
+                except Exception:
+                    pass
+                if (
+                    self._session is session
+                    and health_epoch == self._health_lifecycle_epoch
+                ):
+                    self._session = None
+                    self._started = False
+                    self.ctx = None
+                    self._start_time = None
             raise
+
+        # stop() may retire the session while session.start() is awaiting.
+        # A completed native start must never resurrect an already stopped
+        # adapter or flush frames into a later lifecycle.
+        if health_epoch != self._health_lifecycle_epoch or self._session is not session:
+            raise asyncio.CancelledError("MeshCore startup was stopped or superseded")
 
         self._mark_started(ctx)
         self._started = True
+        # Pre-start buffering ends here: late startup-drain callbacks now
+        # take the normal path directly.
+        self._starting = False
         self._report_native_health(health_epoch)
         ctx.logger.info(
             "MeshCoreAdapter %s started (mode=%s)",
             self.adapter_id,
             self._config.connection_type,
         )
+
+        # Flush frames buffered during the start window through the
+        # normal inbound path, in arrival order.
+        self._flush_prestart_buffer()
 
     async def stop(self, timeout: float = 5.0) -> None:
         """Disconnect from the MeshCore node.
@@ -404,7 +506,9 @@ class MeshCoreAdapter(AdapterContract):
         # Gate callbacks immediately — prevents race between drain completing
         # and session.stop() unsubscribing.
         self._started = False
+        self._starting = False
         self._start_time = None
+        self._discard_prestart_buffer("stop")
 
         # Clear cached health at lifecycle boundary.
         self._last_health = None
@@ -794,6 +898,94 @@ class MeshCoreAdapter(AdapterContract):
                     self._producer_overflow_count,
                 )
 
+    def _buffer_prestart_packet(self, packet: dict[str, Any]) -> None:
+        """Hold one inbound packet received while :meth:`start` is in flight.
+
+        The pinned SDK's ``start_auto_message_fetching`` issues one
+        ``get_msg()`` while ``MeshCoreSession.start()`` is still awaiting,
+        so the first frame the device had buffered can reach
+        :meth:`_on_message` before the adapter sets ``_started``.
+        ``GET_NEXT_MSG`` pops that frame from the device queue, so
+        dropping it loses the message unless the mesh re-delivered it.
+        While the adapter is starting, such packets are held in a
+        bounded FIFO and flushed through the normal path once startup
+        completes (see :meth:`_flush_prestart_buffer`).
+
+        A full buffer drops the packet with a cumulative counter and a
+        rate-limited, content-free warning — never unbounded memory,
+        never a silent drop.  Counters increment even when no context is
+        available for logging.
+        """
+        if len(self._prestart_buffer) >= _PRESTART_BUFFER_MAX:
+            self._prestart_overflow_dropped_count += 1
+            if self.ctx is not None:
+                now = monotonic()
+                if (
+                    now - self._last_prestart_overflow_warning_at
+                    >= _PRESTART_OVERFLOW_WARNING_INTERVAL
+                ):
+                    self._last_prestart_overflow_warning_at = now
+                    self.ctx.logger.warning(
+                        "MeshCoreAdapter %s: pre-start buffer full; packet "
+                        "dropped without buffering (cap=%d, total_dropped=%d)",
+                        self.adapter_id,
+                        _PRESTART_BUFFER_MAX,
+                        self._prestart_overflow_dropped_count,
+                    )
+            return
+        # SDK payloads use flat scalar fields; snapshot the caller's mapping
+        # before it can be reused for a later message.
+        self._prestart_buffer.append(dict(packet))
+        self._prestart_buffered_count += 1
+
+    def _flush_prestart_buffer(self) -> None:
+        """Flush pre-start buffered packets through the normal inbound path.
+
+        Called from :meth:`start` once ``_started`` is set.  Each
+        buffered packet re-enters :meth:`_on_message`, so flushed frames
+        pass every existing guard — classification, dedup, bounded
+        callback admission — exactly as if the SDK callback had
+        delivered them after startup.  Arrival order is preserved.
+        Re-entry is synchronous (no await points), so the flush completes
+        atomically before the event loop can deliver another callback;
+        live callbacks that arrive after ``_started`` is set take the
+        normal path directly.
+        """
+        if not self._prestart_buffer:
+            return
+        packets = list(self._prestart_buffer)
+        self._prestart_buffer.clear()
+        for packet in packets:
+            self._on_message(packet)
+        self._prestart_flushed_count += len(packets)
+        if self.ctx is not None:
+            self.ctx.logger.info(
+                "MeshCoreAdapter %s: flushed %d pre-start buffered packet(s)",
+                self.adapter_id,
+                len(packets),
+            )
+
+    def _discard_prestart_buffer(self, reason: str) -> int:
+        """Drop every buffered pre-start packet without processing.
+
+        Invoked on :meth:`stop` and on failed or cancelled start
+        boundaries: a stopped or aborted lifecycle never replays buffered
+        frames into a later session.  Returns the number of discarded
+        packets and warns (content-free) when any were held, so the loss
+        is observable rather than silent.
+        """
+        discarded = len(self._prestart_buffer)
+        self._prestart_buffer.clear()
+        if discarded and self.ctx is not None:
+            self.ctx.logger.warning(
+                "MeshCoreAdapter %s: discarded %d pre-start buffered "
+                "packet(s) at %s; device-queue frames are never replayed",
+                self.adapter_id,
+                discarded,
+                reason,
+            )
+        return discarded
+
     def _on_message(self, packet: dict[str, Any]) -> None:
         """Process an inbound MeshCore event payload from the session.
 
@@ -824,6 +1016,12 @@ class MeshCoreAdapter(AdapterContract):
         # This closes the race window between _drain_background_tasks
         # completing and _session.stop() unsubscribing callbacks.
         if not self._started:
+            # While start() is in flight, the pinned SDK's startup drain
+            # can deliver a frame it already popped from the device
+            # queue; buffer it for the post-start flush instead of
+            # losing it (see _buffer_prestart_packet).
+            if self._starting:
+                self._buffer_prestart_packet(packet)
             return
         if self.ctx is None:
             return
@@ -1007,6 +1205,11 @@ class MeshCoreAdapter(AdapterContract):
         Classifies, decodes, and publishes the packet through the same
         path as a real inbound packet.
 
+        While :meth:`start` is in flight (``_starting``), a simulated
+        payload is held in the bounded pre-start buffer and flushed
+        through the normal path after startup instead of being dropped.
+        Post-stop calls keep the lifecycle-stale silent drop.
+
         Parameters
         ----------
         packet:
@@ -1015,7 +1218,7 @@ class MeshCoreAdapter(AdapterContract):
         Raises
         ------
         RuntimeError
-            If the adapter has not been started yet.
+            If the adapter has never been started (no context).
         """
         if self.ctx is None:
             raise RuntimeError(
@@ -1027,6 +1230,11 @@ class MeshCoreAdapter(AdapterContract):
         # after stop() but _started is cleared — a stale ctx must not
         # be sufficient to publish lifecycle-stale inbound messages.
         if not self._started:
+            # Same pre-start buffering as the SDK callback path: while
+            # start() is in flight, a simulated payload is flushed after
+            # startup instead of being dropped.
+            if self._starting:
+                self._buffer_prestart_packet(packet)
             return
 
         classification = self._classifier.classify(packet)
@@ -1132,6 +1340,9 @@ class MeshCoreAdapter(AdapterContract):
             "producer_cancelled_before_admission": (
                 self._producer_cancelled_before_admission_count
             ),
+            "prestart_buffered": self._prestart_buffered_count,
+            "prestart_flushed": self._prestart_flushed_count,
+            "prestart_overflow_dropped": self._prestart_overflow_dropped_count,
         }
         if self._session is not None:
             base["session"] = sanitize_diagnostic_mapping(self._session.diagnostics())
