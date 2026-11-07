@@ -27,7 +27,9 @@ MUST silently drop payloads without buffering. `simulate_inbound()` MUST raise
 `RuntimeError` when no context exists; otherwise inactive calls silently drop.
 Callbacks from a retired session MUST NOT enter a replacement lifecycle's buffer
 or live admission path. A concurrent start without an intervening stop MUST be
-rejected before changing the current startup owner.
+rejected before changing the current startup owner, and a start while an
+earlier start's session remains installed MUST be refused before any mutation,
+as `connection-recovery.md` specifies.
 
 ## Overflow
 
@@ -51,6 +53,8 @@ that no live callback can interleave between buffer hand-offs.
 
 `stop()` MUST close the buffering window and discard the buffer before its
 first await; callbacks arriving after stop starts MUST NOT reopen the buffer.
+The session's own stop clears its inbound callback in the same synchronous
+prologue, as `connection-recovery.md` specifies.
 A `start()` still awaiting an SDK session that was stopped MUST NOT mark the
 adapter started or flush any prior frames when that await completes. A stopped
 adapter MUST NOT replay buffered frames into a later session. A failed or

@@ -206,9 +206,11 @@ Missing SDKs and invalid configuration still fail explicitly.
 A disconnected started session reports transient send failure before any native
 handoff. MEDRE owns delivery retries and their configured limits; connection
 recovery does not guarantee unlimited message retention or native delivery.
-Stopping the adapter cancels recovery before native teardown. Native cancellation
-still depends on the pinned SDK and driver cooperating; this is not a process
-isolation boundary.
+Stopping the adapter cancels recovery before native teardown. Session stop
+clears the inbound callback before its first await, so inbound delivery ends
+when stop begins, even if the stop is cancelled mid-teardown. Native
+cancellation still depends on the pinned SDK and driver cooperating; this is
+not a process isolation boundary.
 
 Direct one-shot `MeshCoreSession.start()` callers retain strict connection
 failure by default; the production adapter explicitly requests degraded startup
@@ -230,7 +232,10 @@ discard the buffer and never replay it into a later session; callbacks outside
 the start window (never started, post-stop) keep the pre-existing silent drop.
 The simulation helper requires a context and raises `RuntimeError` when none
 exists. Buffered mappings are snapshotted, and callbacks from retired sessions
-cannot enter a replacement lifetime. A second concurrent start is rejected.
+cannot enter a replacement lifetime. A second concurrent start is rejected, and
+so is a start while an earlier start's session is still installed, such as the
+partial session a cancelled start retains for rollback: `stop()` retires it
+first, including the bounded BlueZ stale-link release for BLE.
 Diagnostics expose `prestart_buffered`, `prestart_flushed`, and
 `prestart_overflow_dropped`, reset at each start boundary. The contract is
 specified in `docs/spec/prestart-inbound-buffer.md`.
