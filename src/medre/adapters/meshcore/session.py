@@ -478,10 +478,16 @@ class MeshCoreSession:
     async def stop(self) -> None:
         """Disconnect from MeshCore and release all resources.
 
-        Sets ``_stop_requested`` to prevent reconnect loops.
+        Sets ``_stop_requested`` to prevent reconnect loops and clears
+        the inbound message callback synchronously — before any await —
+        so inbound delivery ends when stop() begins: SDK events
+        dispatched during the unsubscribe, fetch-stop, or disconnect
+        awaits cannot reach the retired callback, and a stop() cancelled
+        mid-await still leaves the session inert.
         Idempotent — safe to call multiple times.
         """
         self._stop_requested = True
+        self._message_callback = None
         # Initial setup runs in the caller task, not the recovery task. Retire
         # it before cleanup so it cannot reconnect after stop() returns.
         initial = self._initial_start_task

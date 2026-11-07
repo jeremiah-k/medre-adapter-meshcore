@@ -16,6 +16,10 @@ These tests pin the queue-then-flush policy:
   content-free warning;
 - ``stop()`` and failed starts discard the buffer and never replay it
   into a later session;
+- a start attempted while a cancelled startup's partial session is
+  still retained is refused before any mutation; after ``stop()``
+  retires the owner a fresh start proceeds, and a constructor failure
+  on that fresh start still closes the buffering window;
 - callbacks arriving outside the start window (never started, post-stop)
   keep the pre-existing silent drop.
 
@@ -464,18 +468,19 @@ async def test_session_constructor_failure_closes_buffer_window(
     assert inbound_collector.events == []
 
 
-async def test_constructor_failure_after_cancelled_start_closes_buffer_window(
+async def test_start_after_cancelled_start_refuses_until_owner_retired(
     inbound_collector, make_adapter_context
 ) -> None:
-    """A constructor failure must not wedge the adapter after a cancelled start.
+    """A start over an unretired cancelled startup refuses; stop unlocks.
 
     A cancelled start retains its partial session on purpose (core's
     bounded startup rollback calls ``stop()`` on it).  A follow-up
-    ``start()`` whose ``MeshCoreSession`` constructor raises must still
-    close the buffering window even though the identity guard sees the
-    retained session instead of the session that was never constructed —
-    otherwise ``_starting`` stays set and every later start is refused as
-    already in progress until an intervening ``stop()``.
+    ``start()`` while that owner is still retained must refuse before
+    any mutation — constructing a replacement would orphan the retained
+    owner without ever running its ``stop()``.  After ``stop()`` retires
+    the owner, a fresh start proceeds; a constructor failure on that
+    fresh start must still clear ``_starting`` and close the buffering
+    window.
     """
     adapter = MeshCoreAdapter(_make_config())
     ctx: AdapterContext = make_adapter_context(_CONFIG_ID)
@@ -483,14 +488,24 @@ async def test_constructor_failure_after_cancelled_start_closes_buffer_window(
     assert adapter._session is owner
     assert adapter._starting is False
 
+    with pytest.raises(RuntimeError, match="session from an earlier start"):
+        await adapter.start(ctx)
+    # The refusal left the retained owner and the closed window untouched.
+    assert adapter._session is owner
+    assert adapter._starting is False
+    assert not adapter._prestart_buffer
+
+    await adapter.stop()
+    owner.stop.assert_awaited_once()
+    assert adapter._session is None
+
+    # A constructor failure on the now-fresh start still closes the window.
     with patch(
         "medre.adapters.meshcore.adapter.MeshCoreSession",
         side_effect=ConnectionError("construction failed"),
     ):
         with pytest.raises(ConnectionError, match="construction failed"):
             await adapter.start(ctx)
-
-    # The failure closed the window instead of wedging _starting on.
     assert adapter._starting is False
     adapter._on_message(_chan_packet(7))
     assert not adapter._prestart_buffer
@@ -503,31 +518,6 @@ async def test_constructor_failure_after_cancelled_start_closes_buffer_window(
     await _drain(adapter)
     assert inbound_collector.events == []
     await adapter.stop()
-
-
-async def test_stop_after_constructor_failure_retires_retained_session(
-    make_adapter_context,
-) -> None:
-    """stop() after a failed construction still retires the retained owner.
-
-    The constructor-failure cleanup must keep the cancelled start's
-    partial session in ``self._session`` so ``stop()`` can retire it.
-    """
-    adapter = MeshCoreAdapter(_make_config())
-    ctx: AdapterContext = make_adapter_context(_CONFIG_ID)
-    owner = await _cancel_start_retaining_owner(adapter, ctx)
-
-    with patch(
-        "medre.adapters.meshcore.adapter.MeshCoreSession",
-        side_effect=ConnectionError("construction failed"),
-    ):
-        with pytest.raises(ConnectionError, match="construction failed"):
-            await adapter.start(ctx)
-    assert adapter._session is owner
-
-    await adapter.stop()
-    owner.stop.assert_awaited_once()
-    assert adapter._session is None
 
 
 async def test_failed_start_discards_buffered_packets(
