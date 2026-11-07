@@ -213,3 +213,24 @@ isolation boundary.
 Direct one-shot `MeshCoreSession.start()` callers retain strict connection
 failure by default; the production adapter explicitly requests degraded startup
 with `recover_on_failure=True`.
+
+## Connect-time device-buffer drain
+
+The pinned SDK's `start_auto_message_fetching()` issues one `get_msg()` while
+`MeshCoreSession.start()` is still awaiting inside `MeshCoreAdapter.start()`,
+so a frame buffered on the device reaches the adapter callback before the
+adapter has marked itself started. Because `GET_NEXT_MSG` pops the frame from
+the device queue, dropping it would lose the message unless the mesh
+re-delivered it. While `start()` is in flight, inbound payloads are held in a
+bounded FIFO (64 items) and flushed through the normal inbound path —
+classification, dedup, and bounded callback admission — in arrival order once
+startup completes. A full buffer drops with a cumulative counter and a
+rate-limited, content-free warning. `stop()` and failed or cancelled starts
+discard the buffer and never replay it into a later session; callbacks outside
+the start window (never started, post-stop) keep the pre-existing silent drop.
+The simulation helper requires a context and raises `RuntimeError` when none
+exists. Buffered mappings are snapshotted, and callbacks from retired sessions
+cannot enter a replacement lifetime. A second concurrent start is rejected.
+Diagnostics expose `prestart_buffered`, `prestart_flushed`, and
+`prestart_overflow_dropped`, reset at each start boundary. The contract is
+specified in `docs/spec/prestart-inbound-buffer.md`.
