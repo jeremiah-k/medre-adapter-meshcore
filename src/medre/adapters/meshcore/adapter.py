@@ -376,11 +376,28 @@ class MeshCoreAdapter(AdapterContract):
         RuntimeError
             If a start is already in flight; a concurrent replacement
             startup is rejected without touching the in-flight owner.
+            If an earlier start's session is still installed — the
+            partial session a cancelled startup retains for rollback, or
+            one an in-progress or failed :meth:`stop` has not yet
+            retired; call :meth:`stop` to retire it before starting again.
         """
         if self._started:
             return
         if self._starting:
             raise RuntimeError("MeshCore adapter startup is already in progress")
+        if self._session is not None:
+            # A cancelled startup deliberately retains its partial owner
+            # for core's bounded startup rollback to stop(), and stop()
+            # keeps its session installed until session.stop() returns.
+            # Constructing a replacement here would overwrite
+            # ``self._session`` and orphan that owner without ever running
+            # its stop() — for BLE skipping the BlueZ held-link release.
+            # Refuse before any mutation so the installed state stays
+            # exactly as its owner left it.
+            raise RuntimeError(
+                "MeshCore adapter still holds a session from an earlier start; "
+                "call stop() before starting again"
+            )
 
         # Clear cached health at lifecycle boundary so diagnostics
         # never reports a stale health string from a previous session.
@@ -443,10 +460,14 @@ class MeshCoreAdapter(AdapterContract):
             raise
         except Exception:
             # A stop or replacement owns its own session retirement. An old
-            # startup failure must not stop or clear a newer session. A
-            # constructor failure has no session yet but must still close
-            # the pre-start window here; the inner re-check then keeps any
-            # retained partial session (from a cancelled start) for stop().
+            # startup failure must not stop or clear a newer session. The
+            # unretired-startup refusal above means a start body only runs
+            # with no session installed: this failure owns either nothing
+            # yet (constructor failure, ``session is None``) or exactly the
+            # session it installed. The identity re-check still keeps a
+            # session a concurrent stop already retired from being stopped
+            # twice here, and a constructor failure still closes the
+            # pre-start window.
             if health_epoch == self._health_lifecycle_epoch and (
                 session is None or self._session is session
             ):
