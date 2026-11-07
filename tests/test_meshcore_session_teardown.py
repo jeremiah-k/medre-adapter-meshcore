@@ -211,6 +211,66 @@ async def test_stop_cancelled_mid_await_still_fences_delivery() -> None:
     assert received == []
 
 
+@pytest.mark.parametrize(
+    "pending_task_field", ["_initial_start_task", "_reconnect_task"]
+)
+async def test_stop_fences_sdk_event_before_cancelled_task_finishes(
+    pending_task_field: str,
+) -> None:
+    """No inbound delivery while stop awaits cancelled startup/recovery tasks.
+
+    The cancelled child intentionally delays exit, leaving stop() parked
+    at its *first* or *second* await. A synchronous message callback makes
+    any accidental invocation immediately observable, independent of event
+    loop scheduling. The callback must be cleared before either await.
+    """
+    mock_mc, _mock_inst = build_mock_meshcore_module()
+    session = MeshCoreSession(
+        _make_config(connection_type="tcp", host="localhost"),
+        f"teardown-await-{pending_task_field}",
+    )
+    received: list[dict] = []
+    child_started = asyncio.Event()
+    cancellation_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    def callback(packet: dict) -> None:
+        received.append(packet)
+
+    async def parked_on_cancel() -> None:
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_entered.set()
+            await release.wait()
+            raise
+
+    with (
+        patch("medre.adapters.meshcore.session.HAS_MESHCORE", True),
+        patch.dict(sys.modules, {"meshcore": mock_mc}),
+    ):
+        await session.start(callback)
+        child = asyncio.create_task(parked_on_cancel())
+        await asyncio.wait_for(child_started.wait(), 5)
+        setattr(session, pending_task_field, child)
+        stop_task = asyncio.create_task(session.stop())
+        try:
+            await asyncio.wait_for(cancellation_entered.wait(), 5)
+            assert not stop_task.done()
+            await session._on_sdk_event(_sdk_dm_event("during cancellation await"))
+            assert received == []
+            assert session._message_callback is None
+        finally:
+            release.set()
+            await asyncio.wait_for(stop_task, 5)
+
+    assert child.done()
+    assert session._message_callback is None
+    await session._on_sdk_event(_sdk_dm_event("after cancellation await"))
+    assert received == []
+
+
 # ===================================================================
 # Adapter: start() refuses while a cancelled startup's owner is retained
 # ===================================================================
