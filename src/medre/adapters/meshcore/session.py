@@ -1718,12 +1718,12 @@ class MeshCoreSession:
         """Send via the paced owner; guarded packets permit one native call.
 
         ``before_native_send`` commits the core packet boundary inside this
-        lock. Its exceptions propagate before SDK use. Ordinary, unguarded
-        calls retain the legacy bounded retry policy described below.
+        lock. Its exceptions propagate before SDK use. Unguarded calls use
+        the bounded retry policy described below.
 
         .. warning::
 
-           **Unbound retry risk.**  Legacy direct calls may resubmit when
+           **Unbound retry risk.**  Unguarded direct calls may resubmit when
            a response is lost. A core-bound packet with ``before_native_send``
            makes at most one native SDK command and retains uncertainty.
 
