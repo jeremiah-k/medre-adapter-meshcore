@@ -20,6 +20,8 @@ Evidence tier: ``fake_pipeline`` — no real radio or SDK connection.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -27,12 +29,16 @@ import pytest
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.attribution import project_meshcore_attribution
 from medre.adapters.meshcore.codec import MeshCoreCodec
+from medre.adapters.meshcore.renderer import MeshCoreRenderer
 from medre.adapters.meshcore.session import MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
+from medre.core.events import CanonicalEvent, EventMetadata, NativeMetadata
 from medre.core.rendering.attribution import (
     RelayAttribution,
     format_relay_prefix,
 )
+from medre.core.rendering.renderer import RenderingContext, RenderingResult
+from medre_meshcore_tests.helpers.native_metadata import meshcore_native_data
 
 # ===================================================================
 # Helpers
@@ -397,6 +403,124 @@ def test_renderer_combined_sender_and_sender_id() -> None:
     attr = RelayAttribution(source_platform="meshcore", **projected)
     result = format_relay_prefix("{sender} ({sender_id}): ", attr)
     assert result.rendered_prefix == "Node1 (aabbcc): "
+
+
+# ===================================================================
+# Renderer prefix truncation (declared constrained-display affordance)
+#
+# The renderer declares sender / sender_short / origin_label truncatable
+# so custom relay_prefix templates accept {nameN} suffixes (first N
+# Unicode code points, N >= 1).  The default template is "" — no
+# automatic prefix — so the declaration only widens custom templates.
+# ===================================================================
+
+
+def _truncation_event(contact_label: str | None) -> CanonicalEvent:
+    """Build a canonical message carrying MeshCore contact metadata."""
+    return CanonicalEvent(
+        event_id="truncation-event",
+        event_kind="message.created",
+        schema_version=1,
+        timestamp=datetime.now(UTC),
+        source_adapter="source",
+        source_transport_id="peer",
+        source_channel_id="0",
+        parent_event_id=None,
+        lineage=(),
+        relations=(),
+        payload={"text": "body"},
+        metadata=EventMetadata(
+            native=NativeMetadata(
+                data=meshcore_native_data(
+                    pubkey_prefix="a1b2c3",
+                    channel=0,
+                    contact_label=contact_label,
+                )
+            )
+        ),
+    )
+
+
+async def _render_truncation(
+    config: MeshCoreConfig,
+    event: CanonicalEvent,
+    *,
+    source_attribution: dict[str, Any] | None = None,
+) -> RenderingResult:
+    return await MeshCoreRenderer(
+        configs={"mc": config}, source_attribution=source_attribution or {}
+    ).render(
+        event,
+        RenderingContext(
+            target_adapter="mc",
+            target_channel="0",
+            target_platform="meshcore",
+            delivery_strategy="direct",
+        ),
+    )
+
+
+async def test_relay_prefix_truncation_renders_first_n_code_points() -> None:
+    """{sender5} resolves to the first five code points of the sender label."""
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender5}[MC] ")
+    result = await _render_truncation(config, _truncation_event("TadChesapeake"))
+    assert result.payload["text"] == "TadCh[MC] body"
+    assert result.metadata["relay_prefix_variables_used"] == ("sender5",)
+    assert result.metadata["relay_prefix_formatting_error"] is None
+
+
+async def test_relay_prefix_truncation_counts_code_points_not_bytes() -> None:
+    """The suffix counts Unicode code points, never UTF-8 bytes."""
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender2}: ")
+    result = await _render_truncation(config, _truncation_event("\U0001f47eIngrid"))
+    assert result.payload["text"] == "\U0001f47eI: body"
+
+
+async def test_relay_prefix_truncation_zero_suffix_stays_literal() -> None:
+    """{sender0} is unknown (N >= 1) and passes through unchanged."""
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender0}[MC] ")
+    result = await _render_truncation(config, _truncation_event("TadChesapeake"))
+    assert result.payload["text"].startswith("{sender0}[MC] ")
+    assert result.metadata["relay_prefix_unknown_variables"] == ("sender0",)
+    assert result.metadata["relay_prefix_formatting_error"] is not None
+
+
+async def test_relay_prefix_undeclared_truncation_stem_stays_literal() -> None:
+    """A numeric suffix on an undeclared stem passes through as a literal.
+
+    ``sender_id`` is the fixed-width pubkey prefix — it is not declared
+    truncatable for this constrained-display transport.
+    """
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender_id5}[MC] ")
+    result = await _render_truncation(config, _truncation_event("TadChesapeake"))
+    assert result.payload["text"].startswith("{sender_id5}[MC] ")
+    assert result.metadata["relay_prefix_unknown_variables"] == ("sender_id5",)
+
+
+async def test_relay_prefix_sender_short_truncation() -> None:
+    """{sender_short3} bounds the projected short label."""
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender_short3}> ")
+    result = await _render_truncation(config, _truncation_event("Base Station Alpha"))
+    assert result.payload["text"] == "Bas> body"
+
+
+async def test_relay_prefix_origin_label_truncation() -> None:
+    """{origin_label5} bounds the adapter-registered origin label."""
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{origin_label5}> ")
+    result = await _render_truncation(
+        config,
+        _truncation_event(None),
+        source_attribution={"source": SimpleNamespace(origin_label="East Ridge")},
+    )
+    assert result.payload["text"] == "East > body"
+
+
+async def test_relay_prefix_empty_template_disables_prefix() -> None:
+    """The "" default renders no prefix and no prefix diagnostic metadata."""
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="")
+    result = await _render_truncation(config, _truncation_event("TadChesapeake"))
+    assert result.payload["text"] == "body"
+    assert "relay_prefix_template" not in result.metadata
 
 
 # ===================================================================

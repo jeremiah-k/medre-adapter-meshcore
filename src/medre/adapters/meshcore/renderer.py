@@ -63,6 +63,25 @@ from medre.core.rendering.renderer import RenderingContext, RenderingResult
 from medre.adapters.meshcore.destination import resolve_channel_index
 from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
 
+_TRUNCATABLE_PREFIX_LABELS: tuple[str, ...] = (
+    "sender",
+    "sender_short",
+    "origin_label",
+)
+"""Relay-prefix label variables that accept a ``{nameN}`` truncation suffix.
+
+MeshCore's companion-app display is width-constrained, so custom prefix
+templates may bound these free-text labels to the first N Unicode code
+points (N >= 1): ``sender`` and ``sender_short`` project the wire contact
+labels and ``origin_label`` resolves from the rendering context or the
+adapter's ``origin_label`` config.  The default prefix is empty — this
+transport defines no automatic prefix template — so the declaration only
+widens what custom templates can express.  Undeclared stems (for example
+the fixed-width ``sender_id`` pubkey prefix) treat numeric suffixes as
+unknown placeholders.  Formatter rules are specified by the shared
+formatter (MEDRE ``docs/spec/routing-delivery.md`` §17.5.5).
+"""
+
 if TYPE_CHECKING:
     from medre.config.adapters.meshcore import MeshCoreConfig
 
@@ -255,7 +274,9 @@ class MeshCoreRenderer:
                 source_origin_label=source_origin_label,
                 projected_fields=projected,
             )
-            prefix_result = format_relay_prefix(prefix_template, attr)
+            prefix_result = format_relay_prefix(
+                prefix_template, attr, truncatable=_TRUNCATABLE_PREFIX_LABELS
+            )
             rendered_prefix = prefix_result.rendered_prefix
             prefix_formatting_error = prefix_result.formatting_error
             prefix_vars_used = prefix_result.variables_used
