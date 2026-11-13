@@ -218,7 +218,7 @@ class MeshCoreRenderer:
         wire_prefix = ""
 
         # -- Optional relay prefix (prepended before truncation) ---------
-        prefix_template = adapter_config.meshcore_relay_prefix
+        prefix_template = adapter_config.relay_prefix
         rendered_prefix = ""
         prefix_formatting_error: str | None = None
         prefix_vars_used: tuple[str, ...] = ()

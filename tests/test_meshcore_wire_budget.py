@@ -67,7 +67,7 @@ async def test_meshcore_renderer_uses_shared_text_authority(payload, expected):
     from medre.core.events import CanonicalEvent, EventMetadata
     from medre.core.rendering.renderer import RenderingContext
 
-    config = MeshCoreConfig(adapter_id="mc", meshcore_relay_prefix="")
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="")
     event = CanonicalEvent(
         event_id="text-source",
         event_kind="message.created",
@@ -124,7 +124,7 @@ async def test_malformed_canonical_text_never_becomes_radio_content(payload):
         metadata=EventMetadata(),
     )
     renderer = MeshCoreRenderer(
-        configs={"mc": MeshCoreConfig(adapter_id="mc", meshcore_relay_prefix="")}
+        configs={"mc": MeshCoreConfig(adapter_id="mc", relay_prefix="")}
     )
     with pytest.raises(ValueError, match="must be text"):
         await renderer.render(event, RenderingContext("direct", "mc", "0", "meshcore"))

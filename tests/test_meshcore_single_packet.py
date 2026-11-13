@@ -21,7 +21,7 @@ async def test_native_single_plan_preserves_clipped_wire_text(connection, body):
         adapter_id="mc",
         connection_type=connection,
         max_text_bytes=40,
-        meshcore_relay_prefix="[North] ",
+        relay_prefix="[North] ",
     )
     context = RenderingContext(
         target_adapter="mc",

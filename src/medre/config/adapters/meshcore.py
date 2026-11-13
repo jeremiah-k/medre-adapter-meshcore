@@ -31,7 +31,7 @@ Validation rules
   and non-positive values rejected explicitly).  Default ``100`` is a
   provisional producer-side bound on inbound publication tasks pending
   the measured-budget round.
-- ``meshcore_relay_prefix`` must be a string (``bool`` rejected explicitly).
+- ``relay_prefix`` must be a string (``bool`` rejected explicitly).
   Default ``""`` means no prefix is prepended.  When non-empty, the
   string is a template for :func:`~medre.core.rendering.attribution.format_relay_prefix`.
 """
@@ -117,7 +117,7 @@ class MeshCoreConfig:
         renders as an empty string in fake mode and rejects native rendering.
         Must be a non-negative integer;
         ``bool`` is rejected explicitly.
-    meshcore_relay_prefix:
+    relay_prefix:
         Optional relay prefix template prepended to outbound text
         before byte-budget truncation.  Default: ``""`` (no prefix).
         When non-empty, the value is passed to
@@ -151,7 +151,7 @@ class MeshCoreConfig:
     pubkey: str | None = None
     node_config: dict[str, object] = field(default_factory=dict)
     max_text_bytes: int = GROUP_TEXT_BYTES
-    meshcore_relay_prefix: str = ""
+    relay_prefix: str = ""
     max_text_parts: int = 1
     max_pending_ingress_callbacks: int = 100
 
@@ -222,13 +222,13 @@ class MeshCoreConfig:
                 f"{self.max_pending_ingress_callbacks}"
             )
 
-        # meshcore_relay_prefix: must be str, bool rejected
-        if isinstance(self.meshcore_relay_prefix, bool):
-            raise MeshCoreConfigError("meshcore_relay_prefix must be a str, got bool")
-        if not isinstance(self.meshcore_relay_prefix, str):
+        # relay_prefix: must be str, bool rejected
+        if isinstance(self.relay_prefix, bool):
+            raise MeshCoreConfigError("relay_prefix must be a str, got bool")
+        if not isinstance(self.relay_prefix, str):
             raise MeshCoreConfigError(
-                f"meshcore_relay_prefix must be a str, "
-                f"got {type(self.meshcore_relay_prefix).__name__}"
+                f"relay_prefix must be a str, "
+                f"got {type(self.relay_prefix).__name__}"
             )
 
         # --- origin_label ---
