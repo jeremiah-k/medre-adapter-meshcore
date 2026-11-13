@@ -894,3 +894,34 @@ def test_meshcore_origin_label_none_raises() -> None:
         match="origin_label must be a str, got NoneType",
     ):
         config.validate()
+
+
+@pytest.mark.parametrize("prefix", ["", "[{origin_label2}] "])
+def test_unified_relay_prefix_yaml_loader(tmp_path, prefix):
+    """Core config loading passes the public MeshCore field without aliases."""
+    from medre.config.loader import load_config
+
+    path = tmp_path / "meshcore.yaml"
+    path.write_text(
+        "runtime:\n  name: meshcore-prefix-test\nadapters:\n  meshcore:\n"
+        f"    node-a:\n      connection_type: fake\n      relay_prefix: {prefix!r}\n"
+    )
+    config, _source, _paths = load_config(str(path))
+    assert config.adapters.meshcore["node-a"].config.relay_prefix == prefix
+
+
+@pytest.mark.parametrize("prefix", ["", "[{origin_label2}] "])
+def test_unified_relay_prefix_env_override(tmp_path, monkeypatch, prefix):
+    """Core env overrides retain an explicitly empty MeshCore template."""
+    from medre.config.env import apply_env_overrides
+    from medre.config.loader import load_config
+
+    path = tmp_path / "meshcore.yaml"
+    path.write_text(
+        "runtime:\n  name: meshcore-prefix-test\nadapters:\n  meshcore:\n"
+        "    node-a:\n      connection_type: fake\n"
+    )
+    config, _source, _paths = load_config(str(path))
+    monkeypatch.setenv("MEDRE_ADAPTER__NODE_A__RELAY_PREFIX", prefix)
+    config = apply_env_overrides(config)
+    assert config.adapters.meshcore["node-a"].config.relay_prefix == prefix
