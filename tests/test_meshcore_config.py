@@ -831,9 +831,7 @@ def test_relay_prefix_template_with_multiple_placeholders() -> None:
         adapter_id="meshcore-1",
         relay_prefix="<{source_platform}:{sender_short}> ",
     )
-    assert (
-        config.validate().relay_prefix == "<{source_platform}:{sender_short}> "
-    )
+    assert config.validate().relay_prefix == "<{source_platform}:{sender_short}> "
 
 
 # --- origin_label validation: str, default "", bool rejected ---
