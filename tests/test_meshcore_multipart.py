@@ -31,7 +31,7 @@ async def render(text, *, max_parts=16):
         adapter_id="mc",
         max_text_bytes=40,
         max_text_parts=max_parts,
-        meshcore_relay_prefix="[North] ",
+        relay_prefix="[North] ",
     )
     result = await MeshCoreRenderer(configs={"mc": config}).render(
         event(text),
@@ -79,7 +79,7 @@ async def test_zero_byte_budget_stays_on_bounded_single_packet_path():
         adapter_id="mc",
         max_text_bytes=0,
         max_text_parts=16,
-        meshcore_relay_prefix="[North] ",
+        relay_prefix="[North] ",
     )
     result = await MeshCoreRenderer(configs={"mc": config}).render(
         event("radio body"),
@@ -101,13 +101,13 @@ def test_part_limit_appends_after_existing_positional_fields():
 
     defaults = MeshCoreConfig(adapter_id="mc")
     names = [field.name for field in fields(defaults)]
-    assert names.index("max_text_parts") > names.index("meshcore_relay_prefix")
+    assert names.index("max_text_parts") > names.index("relay_prefix")
     args = [getattr(defaults, name) for name in names[: names.index("max_text_parts")]]
     args[names.index("max_text_bytes")] = 40
-    args[names.index("meshcore_relay_prefix")] = "[North] "
+    args[names.index("relay_prefix")] = "[North] "
     config = MeshCoreConfig(*args)
     assert config.max_text_bytes == 40
-    assert config.meshcore_relay_prefix == "[North] "
+    assert config.relay_prefix == "[North] "
     assert config.max_text_parts == 1
 
 

@@ -764,75 +764,75 @@ def test_ble_pin_bool_true_raises() -> None:
         config.validate()
 
 
-# --- meshcore_relay_prefix validation: str, default "", bool rejected ---
+# --- relay_prefix validation: str, default "", bool rejected ---
 
 
-def test_meshcore_relay_prefix_default_is_empty_string() -> None:
+def test_relay_prefix_default_is_empty_string() -> None:
     config = MeshCoreConfig(adapter_id="meshcore-1")
-    assert config.meshcore_relay_prefix == ""
+    assert config.relay_prefix == ""
 
 
-def test_meshcore_relay_prefix_default_validates() -> None:
+def test_relay_prefix_default_validates() -> None:
     config = MeshCoreConfig(adapter_id="meshcore-1")
-    assert config.validate().meshcore_relay_prefix == ""
+    assert config.validate().relay_prefix == ""
 
 
-def test_meshcore_relay_prefix_non_empty_string_is_valid() -> None:
+def test_relay_prefix_non_empty_string_is_valid() -> None:
     config = MeshCoreConfig(
         adapter_id="meshcore-1",
-        meshcore_relay_prefix="[{sender}] ",
+        relay_prefix="[{sender}] ",
     )
-    assert config.validate().meshcore_relay_prefix == "[{sender}] "
+    assert config.validate().relay_prefix == "[{sender}] "
 
 
-def test_meshcore_relay_prefix_empty_string_is_valid() -> None:
-    config = MeshCoreConfig(adapter_id="meshcore-1", meshcore_relay_prefix="")
-    assert config.validate().meshcore_relay_prefix == ""
+def test_relay_prefix_empty_string_is_valid() -> None:
+    config = MeshCoreConfig(adapter_id="meshcore-1", relay_prefix="")
+    assert config.validate().relay_prefix == ""
 
 
-def test_meshcore_relay_prefix_bool_true_raises() -> None:
-    config = MeshCoreConfig(adapter_id="meshcore-1", meshcore_relay_prefix=True)  # type: ignore[arg-type]
+def test_relay_prefix_bool_true_raises() -> None:
+    config = MeshCoreConfig(adapter_id="meshcore-1", relay_prefix=True)  # type: ignore[arg-type]
     with pytest.raises(
         MeshCoreConfigError,
-        match="meshcore_relay_prefix must be a str, got bool",
+        match="relay_prefix must be a str, got bool",
     ):
         config.validate()
 
 
-def test_meshcore_relay_prefix_bool_false_raises() -> None:
-    config = MeshCoreConfig(adapter_id="meshcore-1", meshcore_relay_prefix=False)  # type: ignore[arg-type]
+def test_relay_prefix_bool_false_raises() -> None:
+    config = MeshCoreConfig(adapter_id="meshcore-1", relay_prefix=False)  # type: ignore[arg-type]
     with pytest.raises(
         MeshCoreConfigError,
-        match="meshcore_relay_prefix must be a str, got bool",
+        match="relay_prefix must be a str, got bool",
     ):
         config.validate()
 
 
-def test_meshcore_relay_prefix_int_raises() -> None:
-    config = MeshCoreConfig(adapter_id="meshcore-1", meshcore_relay_prefix=42)  # type: ignore[arg-type]
+def test_relay_prefix_int_raises() -> None:
+    config = MeshCoreConfig(adapter_id="meshcore-1", relay_prefix=42)  # type: ignore[arg-type]
     with pytest.raises(
         MeshCoreConfigError,
-        match="meshcore_relay_prefix must be a str, got int",
+        match="relay_prefix must be a str, got int",
     ):
         config.validate()
 
 
-def test_meshcore_relay_prefix_none_raises() -> None:
-    config = MeshCoreConfig(adapter_id="meshcore-1", meshcore_relay_prefix=None)  # type: ignore[arg-type]
+def test_relay_prefix_none_raises() -> None:
+    config = MeshCoreConfig(adapter_id="meshcore-1", relay_prefix=None)  # type: ignore[arg-type]
     with pytest.raises(
         MeshCoreConfigError,
-        match="meshcore_relay_prefix must be a str, got NoneType",
+        match="relay_prefix must be a str, got NoneType",
     ):
         config.validate()
 
 
-def test_meshcore_relay_prefix_template_with_multiple_placeholders() -> None:
+def test_relay_prefix_template_with_multiple_placeholders() -> None:
     config = MeshCoreConfig(
         adapter_id="meshcore-1",
-        meshcore_relay_prefix="<{source_platform}:{sender_short}> ",
+        relay_prefix="<{source_platform}:{sender_short}> ",
     )
     assert (
-        config.validate().meshcore_relay_prefix == "<{source_platform}:{sender_short}> "
+        config.validate().relay_prefix == "<{source_platform}:{sender_short}> "
     )
 
 
