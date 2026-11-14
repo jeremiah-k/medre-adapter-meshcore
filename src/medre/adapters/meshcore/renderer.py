@@ -53,21 +53,18 @@ from medre.adapters.metadata import project_source_fields
 from medre.core.events import CanonicalEvent
 from medre.core.events.text import select_message_body
 from medre.core.rendering.attribution import (
-    build_relay_attribution,
+    TRUNCATABLE_RELAY_LABELS,
+    resolve_relay_attribution,
     format_relay_prefix,
 )
 from medre.core.rendering.radio_text import plan_radio_text
 from medre.core.rendering.relations import degrade_relations_inline
+from medre.core.rendering.text_helpers import truncate_text_bytes
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
 
 from medre.adapters.meshcore.destination import resolve_channel_index
 from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget
 
-_TRUNCATABLE_PREFIX_LABELS: tuple[str, ...] = (
-    "sender",
-    "sender_short",
-    "origin_label",
-)
 """Relay-prefix label variables that accept a ``{nameN}`` truncation suffix.
 
 MeshCore's companion-app display is width-constrained, so custom prefix
@@ -231,7 +228,7 @@ class MeshCoreRenderer:
         is_fallback = ctx.delivery_strategy == "fallback_text"
 
         if is_fallback:
-            text = self._degrade_relations_inline(event, text)
+            text = degrade_relations_inline(event, text)
 
         body = text
         wire_prefix = ""
@@ -249,11 +246,6 @@ class MeshCoreRenderer:
             # ctx.source_origin_label (route/context) > adapter registry > None.
             # Use 'is not None' to preserve explicit empty string labels.
             src_attr_cfg = self._source_attribution.get(event.source_adapter)
-            source_origin_label: str | None = ctx.source_origin_label
-            if source_origin_label is None:
-                if src_attr_cfg is not None:
-                    source_origin_label = getattr(src_attr_cfg, "origin_label", None)
-
             # Project source identity from native metadata via dispatch.
             native_data: dict[str, object] = {}
             if event.metadata and event.metadata.native:
@@ -269,27 +261,25 @@ class MeshCoreRenderer:
                 platform_hint=platform_hint,
             )
 
-            attr = build_relay_attribution(
+            attr = resolve_relay_attribution(
                 event,
-                source_origin_label=source_origin_label,
+                source_origin_label=ctx.source_origin_label,
+                configured_origin_label=getattr(src_attr_cfg, "origin_label", None),
+                source_attribution=ctx.source_attribution,
                 projected_fields=projected,
             )
             prefix_result = format_relay_prefix(
-                prefix_template, attr, truncatable=_TRUNCATABLE_PREFIX_LABELS
+                prefix_template, attr, truncatable=TRUNCATABLE_RELAY_LABELS
             )
             rendered_prefix = prefix_result.rendered_prefix
             prefix_formatting_error = prefix_result.formatting_error
             prefix_vars_used = prefix_result.variables_used
             prefix_vars_missing = prefix_result.missing_variables
             prefix_vars_unknown = prefix_result.unknown_variables
-            # On formatting_exception the rendered_prefix is the raw
-            # template — do NOT prepend it to user-facing text.
-            if not (
-                prefix_formatting_error
-                and prefix_formatting_error.startswith("formatting_exception:")
-            ):
-                wire_prefix = rendered_prefix
-                text = rendered_prefix + text
+            if prefix_formatting_error:
+                raise ValueError(f"Invalid relay_prefix: {prefix_formatting_error}")
+            wire_prefix = rendered_prefix
+            text = rendered_prefix + text
 
         # Long ordinary messages use the exact shared wire plan only when the
         # operator opts in. Reactions retain the established single-packet path.
@@ -312,7 +302,7 @@ class MeshCoreRenderer:
             rendered_bytes = sum(part.wire_bytes for part in radio_plan.parts)
         else:
             truncated_text, was_truncated, original_bytes, rendered_bytes = (
-                self._truncate_utf8_bytes(text, max_text_bytes)
+                truncate_text_bytes(text, max_text_bytes)
             )
 
         # Native single packets need the same durable one-use grant as multipart
@@ -374,65 +364,6 @@ class MeshCoreRenderer:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _degrade_relations_inline(
-        event: CanonicalEvent,
-        text: str,
-    ) -> str:
-        """Degrade relation semantics into inline text.
-
-        Delegates to the shared
-        :func:`~medre.core.rendering.relations.degrade_relations_inline`
-        helper.
-
-        Parameters
-        ----------
-        event:
-            The canonical event whose relations to degrade.
-        text:
-            The existing content text.
-
-        Returns
-        -------
-        str
-            Content text with inline relation descriptions appended.
-        """
-        return degrade_relations_inline(event, text)
-
-    @staticmethod
-    def _truncate_utf8_bytes(text: str, max_bytes: int) -> tuple[str, bool, int, int]:
-        """Truncate *text* to at most *max_bytes* UTF-8 bytes.
-
-        Parameters
-        ----------
-        text:
-            The text to potentially truncate.
-        max_bytes:
-            Maximum number of UTF-8 bytes allowed.  Must be >= 0.
-
-        Returns
-        -------
-        tuple[str, bool, int, int]
-            ``(truncated_text, was_truncated, original_byte_count,
-            rendered_byte_count)``.
-        """
-        encoded = text.encode("utf-8")
-        original_bytes = len(encoded)
-
-        if max_bytes == 0:
-            return ("", original_bytes > 0, original_bytes, 0)
-
-        if original_bytes <= max_bytes:
-            return (text, False, original_bytes, original_bytes)
-
-        # Slice to byte budget and decode with errors="ignore" to
-        # avoid splitting multi-byte UTF-8 codepoints.
-        truncated_bytes = encoded[:max_bytes]
-        truncated_text = truncated_bytes.decode("utf-8", errors="ignore")
-        rendered_bytes = len(truncated_text.encode("utf-8"))
-
-        return (truncated_text, True, original_bytes, rendered_bytes)
 
 
 def build_meshcore_renderer(
