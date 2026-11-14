@@ -58,7 +58,7 @@ from medre.core.rendering.attribution import (
     format_relay_prefix,
 )
 from medre.core.rendering.radio_text import plan_radio_text
-from medre.core.rendering.relations import degrade_relations_inline
+from medre.core.rendering.relations import compose_relation_text
 from medre.core.rendering.text_helpers import truncate_text_bytes
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
 
@@ -228,7 +228,7 @@ class MeshCoreRenderer:
         is_fallback = ctx.delivery_strategy == "fallback_text"
 
         if is_fallback:
-            text = degrade_relations_inline(event, text)
+            text = compose_relation_text(event, text)
 
         body = text
         wire_prefix = ""
