@@ -192,7 +192,7 @@ class FakeMeshCoreAdapter(AdapterContract):
             if adapter_id is None:
                 adapter_id = "fake_meshcore"
             config = MeshCoreConfig(adapter_id=adapter_id)
-        self._config = config
+        self._config = config.validate()
         self._capabilities = replace(
             _FAKE_MESHCORE_CAPABILITIES,
             max_text_bytes=group_text_budget(config.max_text_bytes),

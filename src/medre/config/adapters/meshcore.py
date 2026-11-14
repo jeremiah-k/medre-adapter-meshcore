@@ -38,6 +38,11 @@ Validation rules
 
 from __future__ import annotations
 
+from medre.core.rendering.attribution import (
+    validate_relay_prefix,
+    TRUNCATABLE_RELAY_LABELS,
+)
+
 import math
 import re
 from dataclasses import dataclass, field
@@ -306,4 +311,10 @@ class MeshCoreConfig:
                 f"Provision secrets through a secure channel, not config metadata."
             )
 
+        try:
+            validate_relay_prefix(
+                self.relay_prefix, truncatable=TRUNCATABLE_RELAY_LABELS
+            )
+        except ValueError as exc:
+            raise MeshCoreConfigError(str(exc)) from exc
         return self

@@ -28,6 +28,5 @@ custom template MAY suffix each with a count (`{sender5}` renders the
 first five Unicode code points of the value; N ≥ 1, counting code points
 never bytes). Numeric suffixes on undeclared stems — such as the
 fixed-width `sender_id` pubkey prefix — and on roomy transports, which
-declare no truncatable variables, are unknown placeholders that pass
-through as literals. The shared formatter semantics are specified in the
+declare no truncatable variables, are unsupported placeholders rejected by configuration validation. The shared formatter semantics are specified in the
 MEDRE core `docs/spec/routing-delivery.md` §17.5.5.

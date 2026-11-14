@@ -476,25 +476,16 @@ async def test_relay_prefix_truncation_counts_code_points_not_bytes() -> None:
     assert result.payload["text"] == "\U0001f47eI: body"
 
 
-async def test_relay_prefix_truncation_zero_suffix_stays_literal() -> None:
-    """{sender0} is unknown (N >= 1) and passes through unchanged."""
-    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender0}[MC] ")
-    result = await _render_truncation(config, _truncation_event("TadChesapeake"))
-    assert result.payload["text"].startswith("{sender0}[MC] ")
-    assert result.metadata["relay_prefix_unknown_variables"] == ("sender0",)
-    assert result.metadata["relay_prefix_formatting_error"] is not None
+async def test_relay_prefix_truncation_zero_suffix_rejected() -> None:
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender0}: ")
+    with pytest.raises(ValueError, match="Invalid relay_prefix"):
+        await _render_truncation(config, _truncation_event("TadChesapeake"))
 
 
-async def test_relay_prefix_undeclared_truncation_stem_stays_literal() -> None:
-    """A numeric suffix on an undeclared stem passes through as a literal.
-
-    ``sender_id`` is the fixed-width pubkey prefix — it is not declared
-    truncatable for this constrained-display transport.
-    """
-    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender_id5}[MC] ")
-    result = await _render_truncation(config, _truncation_event("TadChesapeake"))
-    assert result.payload["text"].startswith("{sender_id5}[MC] ")
-    assert result.metadata["relay_prefix_unknown_variables"] == ("sender_id5",)
+async def test_relay_prefix_undeclared_truncation_stem_rejected() -> None:
+    config = MeshCoreConfig(adapter_id="mc", relay_prefix="{sender_id5}: ")
+    with pytest.raises(ValueError, match="Invalid relay_prefix"):
+        await _render_truncation(config, _truncation_event("TadChesapeake"))
 
 
 async def test_relay_prefix_sender_short_truncation() -> None:
