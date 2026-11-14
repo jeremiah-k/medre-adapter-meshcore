@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       core_ref:
-        description: MEDRE revision (overrides the pinned qualified revision)
+        description: MEDRE revision (defaults to the shared rendering core candidate)
         type: string
 permissions:
   contents: read
@@ -29,7 +29,7 @@ jobs:
           repository: jeremiah-k/medre
           # Pinned qualified engine revision: the shared prefix formatter
           # truncatable declaration this adapter's tests exercise.
-          ref: ${{ inputs.core_ref || vars.MEDRE_CORE_REF || '6590957fac79e897a5f71f931663117bff7f7e31' }}
+          ref: ${{ inputs.core_ref || 'cc0dbf10b2159884e953db8ef56c81a10f40fd11' }}
           path: .core
           persist-credentials: false
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
