@@ -7,12 +7,33 @@ on:
   workflow_dispatch:
     inputs:
       core_ref:
-        description: MEDRE revision (overrides the pinned qualified revision)
+        description: MEDRE revision (defaults to MEDRE_CORE_REF variable or main)
         type: string
 permissions:
   contents: read
 jobs:
+  core-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.snapshot.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jeremiah-k/medre
+          ref: ${{ inputs.core_ref || vars.MEDRE_CORE_REF || 'main' }}
+          path: .core
+          persist-credentials: false
+      - name: Snapshot core revision
+        id: snapshot
+        run: |
+          core_sha=$(git -C .core rev-parse --verify 'HEAD^{commit}')
+          [[ "$core_sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$core_sha" >> "$GITHUB_OUTPUT"
+          echo "Resolved MEDRE core: $core_sha" >> "$GITHUB_STEP_SUMMARY"
+
   test:
+    needs: core-plan
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -27,9 +48,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: jeremiah-k/medre
-          # Pinned qualified engine revision: the shared prefix formatter
-          # truncatable declaration this adapter's tests exercise.
-          ref: ${{ inputs.core_ref || vars.MEDRE_CORE_REF || '6590957fac79e897a5f71f931663117bff7f7e31' }}
+          ref: ${{ needs.core-plan.outputs.sha }}
           path: .core
           persist-credentials: false
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
