@@ -55,7 +55,7 @@ from medre.core.events.text import select_message_body
 from medre.core.rendering.attribution import (
     TRUNCATABLE_RELAY_LABELS,
     resolve_relay_attribution,
-    format_relay_prefix,
+    format_checked_relay_prefix,
 )
 from medre.core.rendering.radio_text import plan_radio_text
 from medre.core.rendering.relations import compose_relation_text
@@ -268,7 +268,7 @@ class MeshCoreRenderer:
                 source_attribution=ctx.source_attribution,
                 projected_fields=projected,
             )
-            prefix_result = format_relay_prefix(
+            prefix_result = format_checked_relay_prefix(
                 prefix_template, attr, truncatable=TRUNCATABLE_RELAY_LABELS
             )
             rendered_prefix = prefix_result.rendered_prefix
