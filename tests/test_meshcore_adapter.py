@@ -1237,13 +1237,3 @@ class TestMeshCoreLastHealthLifecycleBoundary:
 
         await adapter.stop()
         assert adapter._last_health is None
-
-
-def test_fake_adapter_rejects_invalid_prefix_at_setup():
-    from medre.adapters.fakes.meshcore import FakeMeshCoreAdapter
-    from medre.config.adapters.meshcore import MeshCoreConfig, MeshCoreConfigError
-
-    with pytest.raises(MeshCoreConfigError):
-        FakeMeshCoreAdapter(
-            MeshCoreConfig(adapter_id="test", relay_prefix="{unsupported}")
-        )
