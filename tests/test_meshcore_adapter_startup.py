@@ -15,9 +15,10 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from medre.core.contracts.adapter import AdapterContext
+
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterContext
 
 # -- Helpers ---------------------------------------------------------------
 

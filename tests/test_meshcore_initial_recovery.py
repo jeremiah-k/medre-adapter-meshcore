@@ -6,13 +6,13 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from medre_meshcore_tests.helpers.async_utils import wait_until
 
 import medre.adapters.meshcore.session as session_module
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.errors import MeshCoreConnectionError, MeshCoreSendError
 from medre.adapters.meshcore.session import MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre_meshcore_tests.helpers.async_utils import wait_until
 
 
 @pytest.fixture

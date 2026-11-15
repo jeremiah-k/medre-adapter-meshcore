@@ -7,12 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
-from medre.adapters.meshcore.adapter import MeshCoreAdapter
-from medre.adapters.meshcore.errors import MeshCoreSendError
-from medre.adapters.meshcore.renderer import MeshCoreRenderer
-from medre.adapters.meshcore.session import MeshCoreSession
-from medre.config.adapters.meshcore import MeshCoreConfig, MeshCoreConfigError
 from medre.core.contracts.adapter import AdapterPermanentError
 from medre.core.contracts.delivery import AdapterHandoffResult
 from medre.core.engine.pipeline.radio_delivery import deliver_radio_plan
@@ -23,6 +17,12 @@ from medre_meshcore_tests.helpers.storage_outbox import (
     create_outbox_item_with_parent,
     make_outbox_item,
 )
+
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
+from medre.adapters.meshcore.errors import MeshCoreSendError
+from medre.adapters.meshcore.renderer import MeshCoreRenderer
+from medre.adapters.meshcore.session import MeshCoreSession
+from medre.config.adapters.meshcore import MeshCoreConfig, MeshCoreConfigError
 
 
 async def render(text, *, max_parts=16):

@@ -44,7 +44,11 @@ def test_actual_asyncio_deprecation_at_sdk_callsite():
     with warnings.catch_warnings(record=True) as recorded:
         warnings.resetwarnings()
         _apply_filters()
-        exec(source, {"__name__": "meshcore.events"})
+        exec(
+            source, {"__name__": "meshcore.events"}
+        )  # nosec B102 # Literal SDK warning probe.
         assert not recorded
         with pytest.raises(DeprecationWarning):
-            exec(source, {"__name__": "medre.adapters.meshcore"})
+            exec(
+                source, {"__name__": "medre.adapters.meshcore"}
+            )  # nosec B102 # Literal warning probe.

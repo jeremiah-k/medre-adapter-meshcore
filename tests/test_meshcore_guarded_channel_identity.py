@@ -6,14 +6,14 @@ from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-from medre.adapters.meshcore.adapter import MeshCoreAdapter
-from medre.adapters.meshcore.renderer import MeshCoreRenderer
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.contracts.adapter import AdapterPermanentError
 from medre.core.events import DeliveryAttemptProvenance
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
 from medre_meshcore_tests.helpers.radio_event import radio_event
+
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
+from medre.adapters.meshcore.renderer import MeshCoreRenderer
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 
 def _result(

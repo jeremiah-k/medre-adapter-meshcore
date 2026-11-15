@@ -15,15 +15,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from medre.core.contracts.adapter import AdapterCodec
+from medre.core.events.canonical import CanonicalEvent, NativeRef
+from medre.core.events.kinds import EventKind
+from medre.core.events.metadata import EventMetadata, NativeMetadata
+
 from medre.adapters.meshcore.errors import MeshCoreCodecError
 from medre.adapters.meshcore.event_shape import build_meshcore_native_metadata
 from medre.adapters.meshcore.identity import derive_message_identity
 from medre.adapters.meshcore.packet_classifier import MeshCorePacketClassifier
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterCodec
-from medre.core.events.canonical import CanonicalEvent, NativeRef
-from medre.core.events.kinds import EventKind
-from medre.core.events.metadata import EventMetadata, NativeMetadata
 
 
 class MeshCoreCodec(AdapterCodec):

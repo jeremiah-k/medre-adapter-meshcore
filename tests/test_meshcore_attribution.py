@@ -7,15 +7,16 @@ detection, and RelayAttribution integration.
 
 from __future__ import annotations
 
-from medre.adapters.meshcore.attribution import (
-    is_meshcore_native,
-    project_meshcore_attribution,
-)
 from medre.core.rendering.attribution import (
     RelayAttribution,
     format_relay_prefix,
 )
 from medre_meshcore_tests.helpers.native_metadata import meshcore_native_data
+
+from medre.adapters.meshcore.attribution import (
+    is_meshcore_native,
+    project_meshcore_attribution,
+)
 
 
 def _project(

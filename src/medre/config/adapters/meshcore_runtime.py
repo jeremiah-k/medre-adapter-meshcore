@@ -3,8 +3,9 @@
 from dataclasses import dataclass
 from typing import Any, Self
 
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.config.model import GenericAdapterRuntimeConfig
+
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 
 @dataclass(frozen=True)

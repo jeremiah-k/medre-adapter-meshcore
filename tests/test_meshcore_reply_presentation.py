@@ -1,13 +1,14 @@
 """Bridge-address cleanup preserves evidence without fabricating reply targets."""
 
 import pytest
-from medre.adapters.meshcore.codec import MeshCoreCodec
-from medre.adapters.meshcore.attribution import project_meshcore_attribution
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.rendering.attribution import (
     build_relay_attribution,
     format_relay_prefix,
 )
+
+from medre.adapters.meshcore.attribution import project_meshcore_attribution
+from medre.adapters.meshcore.codec import MeshCoreCodec
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 
 @pytest.mark.parametrize("address", ["@[MEDRE-MC-A] ", "@[MEDRE-MC-A]: "])

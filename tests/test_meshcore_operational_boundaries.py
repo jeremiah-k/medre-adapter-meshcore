@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from medre.adapters.meshcore.compat import HAS_MESHCORE
 
 _SESSION_BASELINE_SDK_MODULES: frozenset[str] = frozenset(
@@ -320,9 +321,10 @@ class TestMeshCoreFakeAdapterOperability:
         replay tests.  If the fake delivery path required SDK types, those
         tests would fail in clean environments.
         """
+        from medre.core.rendering.renderer import RenderingResult
+
         from medre.adapters.fakes.meshcore import FakeMeshCoreAdapter
         from medre.config.adapters.meshcore import MeshCoreConfig
-        from medre.core.rendering.renderer import RenderingResult
 
         config = MeshCoreConfig(adapter_id="test_op_deliver")
         adapter = FakeMeshCoreAdapter(config)

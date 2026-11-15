@@ -120,7 +120,7 @@ The within-session ownership case is qualified independently in
 Process memory MUST stay bounded across the whole cycling run. With the
 first restart cycles retained as a warmed steady-state baseline, the peak
 growth of the remaining cycles MUST stay below 256,000 bytes above that
-baseline (``RETAINED_EXTRA_BYTES_BOUND`` in the qualification test), and once
+baseline (`RETAINED_EXTRA_BYTES_BOUND` in the qualification test), and once
 every stranded publisher settles the retained
 footprint MUST return below twice that baseline. Peak qualification requires
 a test-owned tracing session with its peak reset after the baseline. When

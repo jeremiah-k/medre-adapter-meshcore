@@ -25,11 +25,12 @@ from datetime import UTC, datetime
 from typing import Literal
 
 import pytest
+from medre.core.contracts.adapter import AdapterContext
+from medre.core.events import CanonicalEvent
+
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.identity import derive_message_identity
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterContext
-from medre.core.events import CanonicalEvent
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -63,9 +63,10 @@ async def test_meshcore_renderer_uses_shared_text_authority(payload, expected):
     """The radio must not choose different text from the other destinations."""
     from datetime import UTC, datetime
 
-    from medre.adapters.meshcore.renderer import MeshCoreRenderer
     from medre.core.events import CanonicalEvent, EventMetadata
     from medre.core.rendering.renderer import RenderingContext
+
+    from medre.adapters.meshcore.renderer import MeshCoreRenderer
 
     config = MeshCoreConfig(adapter_id="mc", relay_prefix="")
     event = CanonicalEvent(
@@ -105,9 +106,11 @@ async def test_meshcore_renderer_uses_shared_text_authority(payload, expected):
 async def test_malformed_canonical_text_never_becomes_radio_content(payload):
     """Reject malformed source text before packet rendering or native dispatch."""
     from datetime import UTC, datetime
-    from medre.adapters.meshcore.renderer import MeshCoreRenderer
+
     from medre.core.events import CanonicalEvent, EventMetadata
     from medre.core.rendering.renderer import RenderingContext
+
+    from medre.adapters.meshcore.renderer import MeshCoreRenderer
 
     event = CanonicalEvent(
         event_id="invalid-source",

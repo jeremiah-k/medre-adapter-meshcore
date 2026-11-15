@@ -91,8 +91,9 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from medre.adapters.meshcore.compat import HAS_MESHCORE
 from medre_meshcore_tests.helpers.live_harness import assert_no_secret_leak, bounded
+
+from medre.adapters.meshcore.compat import HAS_MESHCORE
 
 # ---------------------------------------------------------------------------
 # Module-level marker — live tests are tagged "live" at the class level so
@@ -691,9 +692,10 @@ class TestMeshCoreBLEValidation:
         """
         import time
 
+        from medre.core.rendering.renderer import RenderingResult
+
         from medre.adapters.meshcore.adapter import MeshCoreAdapter
         from medre.config.adapters.meshcore import MeshCoreConfig
-        from medre.core.rendering.renderer import RenderingResult
 
         config = MeshCoreConfig(
             adapter_id="ble-send-gate",

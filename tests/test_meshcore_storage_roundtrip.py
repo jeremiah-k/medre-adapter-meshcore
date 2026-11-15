@@ -14,8 +14,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from medre.adapters.meshcore.codec import MeshCoreCodec
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.events import (
     CanonicalEvent,
     DeliveryReceipt,
@@ -25,6 +23,9 @@ from medre.core.events import (
 )
 from medre.core.events.metadata import NativeMetadata
 from medre_meshcore_tests.helpers.native_metadata import meshcore_native_data
+
+from medre.adapters.meshcore.codec import MeshCoreCodec
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 # ---------------------------------------------------------------------------
 # Helpers

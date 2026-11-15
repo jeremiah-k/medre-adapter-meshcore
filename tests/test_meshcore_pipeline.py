@@ -11,10 +11,6 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Any
 
-from medre.adapters.fakes.meshcore import FakeMeshCoreAdapter
-from medre.adapters.meshcore.identity import derive_message_identity
-from medre.adapters.meshcore.renderer import MeshCoreRenderer
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.engine.pipeline import PipelineConfig, PipelineRunner
 from medre.core.events import CanonicalEvent, EventMetadata
 from medre.core.events.bus import EventBus
@@ -24,6 +20,11 @@ from medre.core.rendering.renderer import RenderingPipeline
 from medre.core.rendering.text import TextRenderer
 from medre.core.routing import Route, Router, RouteSource, RouteTarget
 from medre.core.storage.sqlite.storage import SQLiteStorage
+
+from medre.adapters.fakes.meshcore import FakeMeshCoreAdapter
+from medre.adapters.meshcore.identity import derive_message_identity
+from medre.adapters.meshcore.renderer import MeshCoreRenderer
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 
 def _make_renderer(*adapter_ids: str) -> MeshCoreRenderer:
