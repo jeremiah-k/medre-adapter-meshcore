@@ -38,15 +38,15 @@ Validation rules
 
 from __future__ import annotations
 
-from medre.core.rendering.attribution import (
-    validate_relay_prefix,
-    TRUNCATABLE_RELAY_LABELS,
-)
-
 import math
 import re
 from dataclasses import dataclass, field
 from typing import Literal, Self
+
+from medre.core.rendering.attribution import (
+    TRUNCATABLE_RELAY_LABELS,
+    validate_relay_prefix,
+)
 
 from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES
 from medre.config.adapters.meshcore_errors import MeshCoreConfigError

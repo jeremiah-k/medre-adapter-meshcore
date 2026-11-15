@@ -92,11 +92,11 @@ On unexpected disconnect the session attempts bounded exponential backoff:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
 import importlib
 import logging
 import math
 import random
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Protocol, cast

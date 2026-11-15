@@ -53,19 +53,19 @@ import tracemalloc
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
-
-import pytest
 from typing import Any
 
-from medre.adapters.meshcore.adapter import MeshCoreAdapter
-from medre.adapters.meshcore.identity import derive_message_identity
-from medre.config.adapters.meshcore import MeshCoreConfig
+import pytest
 from medre.core.contracts.adapter import AdapterContext
 from medre.core.events import CanonicalEvent
 from medre_meshcore_tests.helpers.async_utils import (
     bounded_cancel_and_reap,
     wait_until,
 )
+
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
+from medre.adapters.meshcore.identity import derive_message_identity
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 try:
     from medre.core.contracts.adapter import ProducerPressureReport

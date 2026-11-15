@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 
 import pytest
+
 from medre.adapters.meshcore.packet_classifier import (
     ClassificationResult,
     MeshCorePacketClassifier,

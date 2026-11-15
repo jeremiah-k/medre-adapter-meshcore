@@ -27,15 +27,16 @@ from collections.abc import Callable
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from medre.adapters.meshcore.adapter import MeshCoreAdapter
-from medre.adapters.meshcore.session import MeshCoreSession
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.contracts.adapter import AdapterContext
 from medre_meshcore_tests.helpers.meshcore_session import (
     MockEvent,
     MockEventType,
     build_mock_meshcore_module,
 )
+
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
+from medre.adapters.meshcore.session import MeshCoreSession
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 _CONFIG_ID = "mc-teardown"
 _BLE_ADDRESS = "AA:BB:CC:DD:EE:FF"

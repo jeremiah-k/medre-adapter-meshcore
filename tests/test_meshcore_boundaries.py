@@ -24,6 +24,10 @@ import sys
 from datetime import datetime, timezone
 
 import pytest
+from medre.core.contracts.adapter import AdapterPermanentError, AdapterSendError
+from medre.core.events import CanonicalEvent, EventMetadata
+from medre.core.rendering.renderer import RenderingContext, RenderingResult
+
 from medre.adapters.fakes.meshcore import FakeMeshCoreAdapter
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.codec import MeshCoreCodec
@@ -31,9 +35,6 @@ from medre.adapters.meshcore.compat import HAS_MESHCORE
 from medre.adapters.meshcore.errors import MeshCoreSendError
 from medre.adapters.meshcore.renderer import MeshCoreRenderer
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterPermanentError, AdapterSendError
-from medre.core.events import CanonicalEvent, EventMetadata
-from medre.core.rendering.renderer import RenderingContext, RenderingResult
 
 
 def _read_module_source(module) -> str:

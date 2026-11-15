@@ -54,13 +54,13 @@ from medre.core.events import CanonicalEvent
 from medre.core.events.text import select_message_body
 from medre.core.rendering.attribution import (
     TRUNCATABLE_RELAY_LABELS,
-    resolve_relay_attribution,
     format_checked_relay_prefix,
+    resolve_relay_attribution,
 )
 from medre.core.rendering.radio_text import plan_radio_text
 from medre.core.rendering.relations import compose_relation_text
-from medre.core.rendering.text_helpers import truncate_text_bytes
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
+from medre.core.rendering.text_helpers import truncate_text_bytes
 
 from medre.adapters.meshcore.destination import resolve_channel_index
 from medre.adapters.meshcore.limits import GROUP_TEXT_BYTES, group_text_budget

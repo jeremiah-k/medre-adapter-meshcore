@@ -29,10 +29,11 @@ from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
+from medre.core.contracts.adapter import AdapterContext
+
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.identity import derive_message_identity
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterContext
 
 # ---------------------------------------------------------------------------
 # Helpers

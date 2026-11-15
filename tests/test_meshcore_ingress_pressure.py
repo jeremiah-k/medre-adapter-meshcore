@@ -21,15 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-
-import pytest
 from datetime import UTC, datetime
 from typing import Any
+
+import pytest
+from medre.core.contracts.adapter import AdapterContext
 
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.identity import derive_message_identity
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterContext
 
 try:
     from medre.core.contracts.adapter import ProducerPressureReport

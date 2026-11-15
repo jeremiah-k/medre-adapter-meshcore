@@ -35,9 +35,10 @@ from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from medre.core.contracts.adapter import AdapterContext
+
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterContext
 
 _CONFIG_ID = "mc-prestart"
 

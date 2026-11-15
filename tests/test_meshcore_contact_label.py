@@ -26,12 +26,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from medre.adapters.meshcore.adapter import MeshCoreAdapter
-from medre.adapters.meshcore.attribution import project_meshcore_attribution
-from medre.adapters.meshcore.codec import MeshCoreCodec
-from medre.adapters.meshcore.renderer import MeshCoreRenderer
-from medre.adapters.meshcore.session import MeshCoreSession
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.events import CanonicalEvent, EventMetadata, NativeMetadata
 from medre.core.rendering.attribution import (
     RelayAttribution,
@@ -39,6 +33,13 @@ from medre.core.rendering.attribution import (
 )
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
 from medre_meshcore_tests.helpers.native_metadata import meshcore_native_data
+
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
+from medre.adapters.meshcore.attribution import project_meshcore_attribution
+from medre.adapters.meshcore.codec import MeshCoreCodec
+from medre.adapters.meshcore.renderer import MeshCoreRenderer
+from medre.adapters.meshcore.session import MeshCoreSession
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 # ===================================================================
 # Helpers

@@ -8,13 +8,14 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from medre.core.events import CanonicalEvent
+from medre.core.events.kinds import EventKind
+from medre_meshcore_tests.helpers.async_utils import wait_until
+
 from medre.adapters.fakes.meshcore import FakeMeshCoreAdapter
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.session import MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.events import CanonicalEvent
-from medre.core.events.kinds import EventKind
-from medre_meshcore_tests.helpers.async_utils import wait_until
 
 
 def _make_config(**overrides) -> MeshCoreConfig:

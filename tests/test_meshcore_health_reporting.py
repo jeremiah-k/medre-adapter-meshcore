@@ -5,9 +5,10 @@ import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
+from medre.core.contracts.adapter import AdapterContext
+
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre.core.contracts.adapter import AdapterContext
 
 
 def context(reports):

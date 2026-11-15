@@ -20,17 +20,18 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from medre_meshcore_tests.helpers.meshcore_session import (
+    MockEvent,
+    MockEventType,
+    build_mock_meshcore_module,
+)
+
 from medre.adapters.meshcore.errors import (
     MeshCoreConnectionError,
     MeshCoreSendError,
 )
 from medre.adapters.meshcore.session import MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
-from medre_meshcore_tests.helpers.meshcore_session import (
-    MockEvent,
-    MockEventType,
-    build_mock_meshcore_module,
-)
 
 
 def _make_config(

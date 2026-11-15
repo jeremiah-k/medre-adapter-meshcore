@@ -128,10 +128,10 @@ the post-burst sentinel bound is a generous CI guard, not an SLA.
 Above-cap bursts with publication held (default bound 100):
 
 | Burst | Pending | Refused | Re-admitted | Published | Sentinel lag |
-|------:|--------:|--------:|------------:|----------:|-------------:|
-| 100   | 100     | 0       | 0           | 100       | 1.32 ms      |
-| 400   | 100     | 300     | 300         | 400       | 1.31 ms      |
-| 1600  | 100     | 1500    | 1500        | 1600      | 1.37 ms      |
+| ----: | ------: | ------: | ----------: | --------: | -----------: |
+|   100 |     100 |       0 |           0 |       100 |      1.32 ms |
+|   400 |     100 |     300 |         300 |       400 |      1.31 ms |
+|  1600 |     100 |    1500 |        1500 |      1600 |      1.37 ms |
 
 Every refused identity was redelivered after the release and re-admitted in
 bound-sized slices with no new overflow, and counters and producer-pressure

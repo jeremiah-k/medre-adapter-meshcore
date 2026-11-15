@@ -4,14 +4,14 @@ from dataclasses import replace
 
 import msgspec
 import pytest
-
-from medre.adapters.meshcore.adapter import MeshCoreAdapter
-from medre.adapters.meshcore.renderer import MeshCoreRenderer
-from medre.config.adapters.meshcore import MeshCoreConfig
 from medre.core.contracts.adapter import AdapterPermanentError
 from medre.core.events import DeliveryAttemptProvenance
 from medre.core.rendering.renderer import RenderingContext, RenderingResult
 from medre_meshcore_tests.helpers.radio_event import radio_event as event
+
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
+from medre.adapters.meshcore.renderer import MeshCoreRenderer
+from medre.config.adapters.meshcore import MeshCoreConfig
 
 
 @pytest.mark.parametrize("connection", ["tcp", "serial", "ble"])
