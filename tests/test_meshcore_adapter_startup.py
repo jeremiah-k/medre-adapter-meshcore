@@ -67,6 +67,8 @@ async def test_stopped_diagnostics_has_sdk_contact_timeout_count_zero() -> None:
     await adapter.start(_make_ctx())
     await adapter.stop()
     diag = adapter.diagnostics()
+    assert diag["started"] is False
+    assert diag["session"]["connected"] is False
     assert diag["session"]["sdk_contact_timeout_count"] == 0
 
 
