@@ -501,10 +501,13 @@ class TestMeshCoreLiveSmoke:
         await asyncio.wait_for(adapter.start(ctx), timeout=_ADAPTER_START_TIMEOUT)
         await asyncio.wait_for(adapter.stop(), timeout=_ADAPTER_STOP_TIMEOUT)
 
-        # After stop, diagnostics should report disconnected state.
+        # After stop, diagnostics should report disconnected state. The
+        # diagnostics contract always carries a `session` mapping (a
+        # disconnected stub once the session is gone), so the correct
+        # assertion is on the stub's connection state, not key absence.
         diag = adapter.diagnostics()
         assert diag["started"] is False
-        assert "session" not in diag
+        assert diag["session"]["connected"] is False
 
     # -- Stop idempotency ---------------------------------------------------
 
