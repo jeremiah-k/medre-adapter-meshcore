@@ -31,11 +31,11 @@ filterwarnings = [
   # The pinned meshcore SDK's EventDispatcher still calls
   # asyncio.iscoroutinefunction, which Python 3.14 deprecates. With
   # warnings-as-errors the dispatcher task would die on the first event
-  # and every live SDK connection would time out. The SDK has not fixed
-  # this as of 2.3.19; drop the ignore when the SDK moves to
-  # inspect.iscoroutinefunction().
+  # and every live SDK connection would time out. Scope the exception to
+  # the SDK package (the deprecation is attributed to its call site).
+  # Drop the ignore when the installed SDK moves to inspect.iscoroutinefunction().
   "error",
-  "ignore:'asyncio\\.iscoroutinefunction' is deprecated.*:DeprecationWarning",
+  "ignore:'asyncio\\.iscoroutinefunction' is deprecated.*:DeprecationWarning:meshcore(\\.|$)",
 ]
 timeout = 360
 addopts = "-m 'not live and not docker and not hardware and not local_integration and not soak and not matrix_sdk and not lxmf_sdk and not meshtastic_sdk and not meshcore_sdk'"
