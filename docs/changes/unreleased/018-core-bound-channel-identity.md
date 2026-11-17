@@ -5,7 +5,7 @@ channel against the durable target before invoking the SDK or consuming the one-
 handoff grant. Prebuilt results that would redirect a core attempt to a
 separate channel or direct message are rejected. Ordinary renderer output
 already carries the matching channel; direct unbound session calls are
-unchanged. This narrows a pre-release trust-boundary gap without creating new
+unchanged. This narrows a trust-boundary gap without creating new
 send authority, schema fields or recipient-delivery claims.
 
 The same identity fence runs before fake-mode grant consumption or synthetic
