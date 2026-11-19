@@ -137,11 +137,16 @@ async def test_collect_keeps_rows_and_public_key_in_full() -> None:
             ("public_key_prefix", "aabbccddeeff", 0, "pubkey"),
             ("radio_freq_mhz", "868.0", 1, "radio"),
         ]
-        assert render_startup_info_block("meshcore.mc-startup-info  ready", info) == (
-            "meshcore.mc-startup-info  ready\n"
-            "  Ridge Relay · pubkey aabbccddeeff\n"
-            "  radio 868.0"
-        )
+        lines = render_startup_info_block(
+            "meshcore.mc-startup-info  ready", info
+        ).splitlines()
+        assert lines[0] == "meshcore.mc-startup-info  ready"
+        # Core owns default labels; providers support both renderer versions.
+        assert lines[1] in {
+            "  Ridge Relay · pubkey aabbccddeeff",
+            "  device name Ridge Relay · pubkey aabbccddeeff",
+        }
+        assert lines[2:] == ["  radio 868.0"]
     finally:
         await adapter.stop()
 
