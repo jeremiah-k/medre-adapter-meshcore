@@ -1387,6 +1387,74 @@ class MeshCoreAdapter(AdapterContract):
             }
         return base
 
+    # -- Startup info -------------------------------------------------------
+
+    def startup_info(self) -> dict[str, object]:
+        """Report held node-identity facts for core's startup block.
+
+        Core discovers this optional callable duck-typed on the adapter
+        object (``getattr``) and calls it once at the adapter's ready
+        transition under a bounded, supervised wait.  Failure or expiry
+        only means no startup facts; it never affects readiness.  This
+        adapter does not import core symbols for the seam, so it stays
+        installable against older cores that never look for it.
+
+        Pure read: the facts are the announce/identity state the adapter
+        already holds — the session's self-info snapshot and the
+        configured identity fallback shared with
+        :meth:`_local_node_name`.  No device or radio I/O, no resource
+        acquisition, no session mutation.  Core runs synchronous hooks
+        on a worker thread; the method binds the session once and reads
+        immutable scalar values, so the worst a snapshot straddling a
+        reconnect reset can do is omit a fact, which core drops.
+
+        Row 0 is the node identity: device name and the public-key
+        prefix.  The prefix is a published mesh identifier (it appears
+        in packet headers and diagnostics), not key material.  Row 1
+        carries the radio frequency when the self-info snapshot captured
+        one.  Firmware build and battery state are not held at ready
+        and are never probed to fill the gap; contact or peer-table
+        material is never reported here — startup info is the
+        operator's own device identity, not a directory.
+
+        Returns
+        -------
+        dict[str, object]
+            An ordered ``rows`` mapping per the core startup-info
+            contract.  Rows with no held facts are omitted; an empty
+            row list reports nothing.
+        """
+        session = self._session
+        diag: dict[str, Any] = session.diagnostics() if session is not None else {}
+        identity: list[dict[str, object]] = []
+        name = self._local_node_name()
+        if name:
+            identity.append({"name": "device_name", "value": name})
+        prefix = diag.get("public_key_prefix")
+        if isinstance(prefix, str) and prefix:
+            identity.append(
+                {
+                    "name": "public_key_prefix",
+                    "value": prefix,
+                    "label": "pubkey",
+                }
+            )
+        rows: list[list[dict[str, object]]] = []
+        if identity:
+            rows.append(identity)
+        freq = diag.get("radio_freq")
+        if isinstance(freq, (int, float)) and not isinstance(freq, bool) and freq > 0:
+            rows.append(
+                [
+                    {
+                        "name": "radio_freq_mhz",
+                        "value": float(freq),
+                        "label": "radio",
+                    }
+                ]
+            )
+        return {"rows": rows}
+
     # -- Background task management -----------------------------------------
 
     async def _drain_background_tasks(self, timeout: float = 5.0) -> None:
