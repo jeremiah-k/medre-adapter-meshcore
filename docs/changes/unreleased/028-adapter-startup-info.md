@@ -11,14 +11,16 @@ or delivery.
 The provider is a pure read of announce/identity state the adapter
 already holds — no device or radio I/O, no resource acquisition, no
 session mutation. Row 0 is the node identity: the device name (session
-self-info snapshot, falling back to the configured identity via
-`_local_node_name`) and the public-key prefix from the same snapshot.
+self-info snapshot, falling back to the configured identity) and the
+public-key prefix from the same snapshot.
 The prefix is a published mesh identifier that appears in packet
 headers and diagnostics; core renders it in full under its public-key
 name rule. Row 1 carries the radio frequency when the self-info
 snapshot captured one. Core runs synchronous hooks on a worker thread;
-the hook binds the session once and reads immutable scalar values, so
-a snapshot straddling a reconnect reset can only omit a fact.
+the hook binds the session once and obtains the three held scalars
+from a single locked publication. A concurrent refresh cannot combine
+facts from different announcements. A partial announcement replaces
+missing fields with absent values.
 
 Firmware build and battery/charge state are not held at ready and are
 deliberately omitted rather than probed. Contact or peer-table state

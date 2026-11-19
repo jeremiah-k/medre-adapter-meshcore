@@ -1401,12 +1401,12 @@ class MeshCoreAdapter(AdapterContract):
 
         Pure read: the facts are the announce/identity state the adapter
         already holds — the session's self-info snapshot and the
-        configured identity fallback shared with
+        configured identity fallback, as in
         :meth:`_local_node_name`.  No device or radio I/O, no resource
         acquisition, no session mutation.  Core runs synchronous hooks
         on a worker thread; the method binds the session once and reads
-        immutable scalar values, so the worst a snapshot straddling a
-        reconnect reset can do is omit a fact, which core drops.
+        one coherent identity snapshot. A concurrent refresh cannot mix
+        facts from different announcements.
 
         Row 0 is the node identity: device name and the public-key
         prefix.  The prefix is a published mesh identifier (it appears
@@ -1425,12 +1425,17 @@ class MeshCoreAdapter(AdapterContract):
             row list reports nothing.
         """
         session = self._session
-        diag: dict[str, Any] = session.diagnostics() if session is not None else {}
+        name, prefix, freq = (
+            session.self_info_snapshot() if session is not None else (None, None, None)
+        )
         identity: list[dict[str, object]] = []
-        name = self._local_node_name()
+        name = (
+            name.strip()
+            if isinstance(name, str) and name.strip()
+            else self._config.identity
+        )
         if name:
             identity.append({"name": "device_name", "value": name})
-        prefix = diag.get("public_key_prefix")
         if isinstance(prefix, str) and prefix:
             identity.append(
                 {
@@ -1442,7 +1447,6 @@ class MeshCoreAdapter(AdapterContract):
         rows: list[list[dict[str, object]]] = []
         if identity:
             rows.append(identity)
-        freq = diag.get("radio_freq")
         if isinstance(freq, (int, float)) and not isinstance(freq, bool) and freq > 0:
             rows.append(
                 [
