@@ -96,6 +96,7 @@ import importlib
 import logging
 import math
 import random
+import threading
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -331,6 +332,8 @@ class MeshCoreSession:
 
         # Diagnostics.
         self._diag = _SessionDiagnostics()
+        # Only the held identity scalars cross the startup-info thread boundary.
+        self._self_info_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public properties
@@ -595,9 +598,7 @@ class MeshCoreSession:
         self._diag.last_contact_update_time = None
         # Reset self-info diagnostics so stale values don't persist
         # across lifecycle boundaries.
-        self._diag.device_name = None
-        self._diag.public_key_prefix = None
-        self._diag.radio_freq = None
+        self._set_self_info(None, None, None)
         self._contact_retry_delays.clear()
         self._started = False
         self._logger.info("MeshCoreSession %s stopped", self._adapter_id)
@@ -667,11 +668,30 @@ class MeshCoreSession:
     # Diagnostics
     # ------------------------------------------------------------------
 
+    def self_info_snapshot(self) -> tuple[str | None, str | None, float | None]:
+        """Read the three held identity scalars from one publication."""
+        with self._self_info_lock:
+            return (
+                self._diag.device_name,
+                self._diag.public_key_prefix,
+                self._diag.radio_freq,
+            )
+
+    def _set_self_info(
+        self, name: str | None, prefix: str | None, frequency: float | None
+    ) -> None:
+        # No SDK accesses or awaits under this lock.
+        with self._self_info_lock:
+            self._diag.device_name = name
+            self._diag.public_key_prefix = prefix
+            self._diag.radio_freq = frequency
+
     def diagnostics(self) -> dict[str, Any]:
         """Return a safe diagnostics snapshot.
 
         No secrets, private keys, or raw SDK internals are exposed.
         """
+        name, prefix, frequency = self.self_info_snapshot()
         return {
             "connected": self._diag.connected,
             "reconnecting": self._diag.reconnecting,
@@ -684,9 +704,9 @@ class MeshCoreSession:
             "last_error": self._diag.last_error,
             "transient_delivery_failures": self._diag.transient_delivery_failures,
             "permanent_delivery_failures": self._diag.permanent_delivery_failures,
-            "device_name": self._diag.device_name,
-            "public_key_prefix": self._diag.public_key_prefix,
-            "radio_freq": self._diag.radio_freq,
+            "device_name": name,
+            "public_key_prefix": prefix,
+            "radio_freq": frequency,
             "mode": self._config.connection_type,
             "sdk_suggested_timeouts_used": self._diag.sdk_suggested_timeouts_used,
             "sdk_contact_timeout_count": len(self._contact_retry_delays),
@@ -1444,34 +1464,35 @@ class MeshCoreSession:
         elif isinstance(self_info, dict):
             payload = self_info
 
-        # Reset to avoid stale values across reconnects when payload is partial.
-        self._diag.device_name = None
-        self._diag.public_key_prefix = None
-        self._diag.radio_freq = None
-
-        if payload is None:
-            return
-
-        # Device name.
-        name = payload.get("name")
-        if isinstance(name, str):
-            self._diag.device_name = name
+        # Build a complete replacement before publishing it. Partial payloads
+        # clear unavailable facts instead of merging different announcements.
+        name_value = payload.get("name") if payload is not None else None
+        name = name_value if isinstance(name_value, str) else None
 
         # Public key prefix (first 6 hex bytes / 12 hex chars).
-        pubkey = payload.get("public_key")
+        prefix: str | None = None
+        pubkey = payload.get("public_key") if payload is not None else None
         if isinstance(pubkey, str) and len(pubkey) >= 12:
-            self._diag.public_key_prefix = pubkey[:12].lower()
+            candidate = pubkey[:12].lower()
+            if all(char in "0123456789abcdef" for char in candidate):
+                prefix = candidate
         elif isinstance(pubkey, bytes) and len(pubkey) >= 6:
-            self._diag.public_key_prefix = pubkey[:6].hex()
+            prefix = pubkey[:6].hex()
 
         # Radio frequency (if present).
-        freq = payload.get("freq")
-        if freq is None:
+        frequency: float | None = None
+        freq = payload.get("freq") if payload is not None else None
+        if freq is None and payload is not None:
             freq = payload.get("radio_freq")
         if isinstance(freq, (int, float)) and not isinstance(freq, bool):
-            f = float(freq)
-            if math.isfinite(f) and f > 0.0:
-                self._diag.radio_freq = f
+            try:
+                f = float(freq)
+            except OverflowError:
+                pass
+            else:
+                if math.isfinite(f) and f > 0.0:
+                    frequency = f
+        self._set_self_info(name, prefix, frequency)
 
     async def _unsubscribe_all(self) -> None:
         """Unsubscribe all registered callbacks."""
