@@ -27,7 +27,6 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-
 from medre.core.contracts.adapter import AdapterContext
 from medre.core.startup_info import (
     collect_startup_info,
