@@ -281,7 +281,7 @@ class FakeMeshCoreAdapter(AdapterContract):
             adapter_id=self.adapter_id,
             platform=self.platform,
             role=self.role,
-            version="0.1.0",
+            version="0.2.0",
             capabilities=self._capabilities,
             health="healthy" if self._started else "unknown",
         )
