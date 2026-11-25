@@ -46,10 +46,10 @@ without admission (no task, no dedup key) when the bound is reached.
 Refusals and pre-admission cancellations are reported as producer
 pressure through the optional core seam.
 
-Pre-start buffering: the pinned SDK's ``start_auto_message_fetching``
-issues one ``get_msg()`` while ``session.start()`` is still awaiting, so
-a device-buffered frame can reach :meth:`_on_message` before ``_started``
-is set.  While :meth:`start` is in flight, such frames are held in a
+Pre-start buffering: compatibility SDKs and unsolicited events can reach
+:meth:`_on_message` before ``_started`` is set. The pinned SDK's receive pump
+starts after setup, so it does not deliberately fill this startup buffer.
+While :meth:`start` is in flight, such frames are held in a
 bounded FIFO (``_PRESTART_BUFFER_MAX``) and flushed through the normal
 inbound path in arrival order once startup completes; a full buffer
 drops with a counter and a rate-limited content-free warning.  ``GET_NEXT_MSG``
@@ -262,6 +262,8 @@ class MeshCoreAdapter(AdapterContract):
         # publication task's done callback and reset at session
         # boundaries, so a new session inherits no stale reservations.
         self._pending_callback_admissions: int = 0
+        self._receive_capacity = asyncio.Event()
+        self._receive_capacity.set()
         # A completed task must release only the slot reserved in its own
         # lifecycle. Late completions from a timed-out stop are ignored.
         self._callback_admission_epoch: int = 0
@@ -335,6 +337,8 @@ class MeshCoreAdapter(AdapterContract):
         self._inbound_published = 0
         self._callback_admission_epoch += 1
         self._pending_callback_admissions = 0
+        self._receive_capacity = asyncio.Event()
+        self._receive_capacity.set()
         self._producer_scheduled_count = 0
         self._producer_overflow_count = 0
         self._last_overflow_warning_at = float("-inf")
@@ -413,8 +417,8 @@ class MeshCoreAdapter(AdapterContract):
 
         health_epoch = self._health_lifecycle_epoch
         # While start() is in flight, inbound callbacks are buffered (see
-        # _buffer_prestart_packet) instead of dropped: the pinned SDK's
-        # startup drain pops a device-queue frame before _started is set.
+        # _buffer_prestart_packet) instead of dropped: a legacy
+        # compatibility SDK may pop a device-queue frame before _started is set.
         self._starting = True
         # Construction is inside the failure boundary too: an SDK
         # constructor error must close the pre-start window immediately.
@@ -433,6 +437,16 @@ class MeshCoreAdapter(AdapterContract):
             if health_epoch == self._health_lifecycle_epoch:
                 self._on_message(packet)
 
+        async def wait_for_receive_capacity() -> None:
+            while health_epoch == self._health_lifecycle_epoch and self._started:
+                if (
+                    self._pending_callback_admissions
+                    < self._config.max_pending_ingress_callbacks
+                ):
+                    return
+                await self._receive_capacity.wait()
+            raise asyncio.CancelledError
+
         try:
             session = MeshCoreSession(
                 config=self._config,
@@ -440,6 +454,7 @@ class MeshCoreAdapter(AdapterContract):
                 platform=self.platform,
                 logger=ctx.logger,
                 on_connection_change=lambda _: self._report_native_health(health_epoch),
+                wait_for_receive_capacity=wait_for_receive_capacity,
             )
             self._session = session
             await session.start(message_callback=receive, recover_on_failure=True)
@@ -534,6 +549,7 @@ class MeshCoreAdapter(AdapterContract):
         # Clear cached health at lifecycle boundary.
         self._last_health = None
         self._health_lifecycle_epoch += 1
+        self._receive_capacity.set()
 
         # Cancel all tracked background tasks and drain them.
         await self._drain_background_tasks(timeout)
@@ -812,6 +828,11 @@ class MeshCoreAdapter(AdapterContract):
         ):
             return False
         self._pending_callback_admissions += 1
+        if (
+            self._pending_callback_admissions
+            >= self._config.max_pending_ingress_callbacks
+        ):
+            self._receive_capacity.clear()
         return True
 
     def _release_callback_slot(self) -> None:
@@ -823,6 +844,7 @@ class MeshCoreAdapter(AdapterContract):
         """
         if self._pending_callback_admissions > 0:
             self._pending_callback_admissions -= 1
+            self._receive_capacity.set()
 
     def _on_background_task_done(
         self,
@@ -922,7 +944,7 @@ class MeshCoreAdapter(AdapterContract):
     def _buffer_prestart_packet(self, packet: dict[str, Any]) -> None:
         """Hold one inbound packet received while :meth:`start` is in flight.
 
-        The pinned SDK's ``start_auto_message_fetching`` issues one
+        A compatibility SDK's ``start_auto_message_fetching`` may issue one
         ``get_msg()`` while ``MeshCoreSession.start()`` is still awaiting,
         so the first frame the device had buffered can reach
         :meth:`_on_message` before the adapter sets ``_started``.
@@ -1037,7 +1059,7 @@ class MeshCoreAdapter(AdapterContract):
         # This closes the race window between _drain_background_tasks
         # completing and _session.stop() unsubscribing callbacks.
         if not self._started:
-            # While start() is in flight, the pinned SDK's startup drain
+            # While start() is in flight, a compatibility SDK or unsolicited event
             # can deliver a frame it already popped from the device
             # queue; buffer it for the post-start flush instead of
             # losing it (see _buffer_prestart_packet).

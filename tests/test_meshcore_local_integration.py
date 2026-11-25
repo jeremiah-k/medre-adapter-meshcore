@@ -78,6 +78,105 @@ async def test_real_sdk_startup_error_cleans_partial_client() -> None:
         assert session._meshcore is None
 
 
+async def test_real_sdk_connect_drains_messages_queued_before_connect() -> None:
+    """Every message the node buffered before the connect is delivered.
+
+    The node hands a queued message to the client only in answer to
+    ``GET_MSG`` and never emits a ``MESSAGES_WAITING`` (0x83) notification,
+    so a backlog that the SDK's auto-fetch loop does not fetch explicitly
+    starves until a *new* message arrives.
+    """
+    received: list[dict[str, Any]] = []
+    async with LocalMeshCoreNode() as node:
+        node.queue_channel_message("queued one")
+        node.queue_channel_message("queued two")
+        node.queue_channel_message("queued three")
+
+        session = _session(node)
+        await session.start(received.append)
+
+        assert await wait_until(lambda: len(received) == 3)
+        assert [item["text"] for item in received] == [
+            "queued one",
+            "queued two",
+            "queued three",
+        ]
+        assert node.queued_messages == []
+        await session.stop()
+
+
+async def test_real_sdk_connect_drains_backlog_larger_than_the_old_round_cap() -> None:
+    """A backlog deeper than the previous 64-round cap drains completely.
+
+    openHop's repeater companion queues up to 512 messages by default
+    (``offline_queue_size``), so a drain bound below that leaves the tail
+    of the backlog stranded in the node.  This queues 100 messages before
+    the connect — more than the old cap of 64 rounds — and requires every
+    one of them to be delivered exactly once, in node order, with the
+    node's queue empty afterwards.
+    """
+    received: list[dict[str, Any]] = []
+    queued = [f"queued {index}" for index in range(100)]
+    async with LocalMeshCoreNode() as node:
+        for text in queued:
+            node.queue_channel_message(text)
+
+        session = _session(node)
+        await session.start(received.append)
+
+        assert await wait_until(lambda: len(received) == len(queued), timeout=10.0)
+        texts = [item["text"] for item in received]
+        assert texts == queued
+        # Exactly once: no message is delivered twice by the drain.
+        assert len(set(texts)) == len(queued)
+        assert node.queued_messages == []
+        await session.stop()
+
+
+async def test_real_sdk_backlog_does_not_block_startup() -> None:
+    received: list[dict[str, Any]] = []
+    async with LocalMeshCoreNode() as node:
+        for index in range(100):
+            node.queue_channel_message(f"queued {index}")
+        session = _session(node)
+        await session.start(received.append)
+        # The pump has not run in the caller's startup turn.
+        assert received == []
+        assert await wait_until(lambda: len(received) == 100, timeout=10.0)
+        assert node.queued_messages == []
+        await session.stop()
+
+
+async def test_real_sdk_reconnect_drains_messages_queued_while_disconnected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backlog that piled up while the transport was down survives reconnect."""
+    received: list[dict[str, Any]] = []
+    async with LocalMeshCoreNode() as node:
+        # Keep the recovery window wide enough to queue the backlog while
+        # the client is provably disconnected, and free of jitter so the
+        # reconnect ordering stays deterministic.
+        monkeypatch.setattr(session_mod, "_RECONNECT_BASE_DELAY", 1.0)
+        monkeypatch.setattr(session_mod, "_RECONNECT_JITTER_FRACTION", 0.0)
+
+        session = _session(node)
+        await session.start(received.append)
+
+        await node.disconnect_clients()
+        node.queue_channel_message("offline one")
+        node.queue_channel_message("offline two")
+
+        assert await wait_until(lambda: node.connection_count >= 2, timeout=10.0)
+        assert await wait_until(lambda: session.connected, timeout=10.0)
+        assert await wait_until(lambda: len(received) == 2, timeout=10.0)
+        assert [item["text"] for item in received] == [
+            "offline one",
+            "offline two",
+        ]
+        assert node.queued_messages == []
+        await session.stop()
+
+
 async def test_real_sdk_disconnect_during_inbound_reconnects() -> None:
     received: list[dict[str, Any]] = []
     async with LocalMeshCoreNode() as node:

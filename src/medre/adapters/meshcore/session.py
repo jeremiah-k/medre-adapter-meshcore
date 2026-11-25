@@ -67,6 +67,14 @@ The session supports four connection types via
     forwarded only when ``ble_pin`` is configured.  Between retry
     attempts, stale BlueZ state is cleaned before re-scanning.
 
+Inbound Backlog Drain
+----------------------
+One connection-scoped receive pump owns GET_NEXT_MSG on the pinned SDK.
+It starts after connection setup returns and wakes on MESSAGES_WAITING, draining
+until NO_MORE_MSGS. The SDK still decodes and dispatches messages; MEDRE does
+not publish the command result a second time. An unanswered command is not
+proof of an empty queue, and the companion protocol cannot guarantee receipt.
+
 Reconnect Policy
 ----------------
 On unexpected disconnect the session attempts bounded exponential backoff:
@@ -137,6 +145,10 @@ _TRANSIENT_SDK_SEND_REASONS: frozenset[str] = frozenset(
 _SDK_LIFECYCLE_TIMEOUT: float = 5.0  # seconds
 _CONNECT_ATTEMPT_TIMEOUT: float = 15.0  # TCP / serial setup attempt
 _BLE_CONNECT_ATTEMPT_TIMEOUT: float = 45.0  # includes BlueZ cleanup and discovery
+
+# One bounded native request at a time. A successful backlog can be arbitrarily
+# deep; it does not extend the startup deadline or require a guessed queue cap.
+_FETCH_ROUND_TIMEOUT: float = 2.0
 
 # suggested_timeout clamping bounds (seconds).
 # The firmware returns milliseconds; we convert to seconds and clamp.
@@ -293,6 +305,7 @@ class MeshCoreSession:
         *,
         logger: logging.Logger | None = None,
         on_connection_change: Callable[[bool], None] | None = None,
+        wait_for_receive_capacity: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._config = config
         self._adapter_id = adapter_id
@@ -303,11 +316,17 @@ class MeshCoreSession:
 
         # SDK objects — only populated for real connection modes.
         self._meshcore: Any = None  # meshcore.MeshCore instance
+        # The imported SDK module of the live client.  Kept so the backlog
+        # drain can read the SDK event types without a second import.
+        self._sdk_module: Any = None
         self._subscriptions: list[Any] = []  # Subscription handles
 
         # Inbound callback set via start().
         self._message_callback: MessageCallback | None = None
         self._on_connection_change = on_connection_change
+        self._wait_for_receive_capacity = wait_for_receive_capacity
+        self._fetch_wake: asyncio.Event | None = None
+        self._fetch_task: asyncio.Task[None] | None = None
 
         # Lifecycle guards.
         self._started: bool = False
@@ -471,6 +490,7 @@ class MeshCoreSession:
         if self._stop_requested:
             return
         self._started = True
+        self._start_receive_pump()
         self._logger.info(
             "MeshCoreSession %s started (mode=%s, connected=%s)",
             self._adapter_id,
@@ -522,6 +542,8 @@ class MeshCoreSession:
             except asyncio.CancelledError:
                 pass
         self._reconnect_task = None
+
+        await self._stop_receive_pump()
 
         # Unsubscribe all callbacks.
         await self._unsubscribe_all()
@@ -826,6 +848,7 @@ class MeshCoreSession:
         ``last_error`` for diagnostics.
         """
         self._message_callback = None
+        await self._stop_receive_pump()
         self._set_connected(False)
         self._diag.reconnecting = False
         self._subscriptions.clear()
@@ -855,6 +878,8 @@ class MeshCoreSession:
         """
         if self._meshcore is None:
             return
+
+        await self._stop_receive_pump()
 
         # Unsubscribe all registered callbacks.
         for sub in list(self._subscriptions):
@@ -1194,6 +1219,9 @@ class MeshCoreSession:
 
         # Deferred import — the SDK is only touched inside this method.
         mc = cast(_MeshCoreModule, importlib.import_module("meshcore"))
+        # Retain the module so the backlog drain can read the SDK event
+        # types without importing the SDK a second time.
+        self._sdk_module = mc
 
         # Clean up any stale SDK client from a previous connection
         # (e.g. before reconnect).  On first connect _meshcore is None
@@ -1367,28 +1395,127 @@ class MeshCoreSession:
         # following await must stay observable rather than being overwritten.
         self._set_connected(True)
 
-        # Start auto message fetching to drain buffered messages from the device.
-        # Best-effort: failure is logged but does not prevent connection.
-        try:
-            if hasattr(self._meshcore, "start_auto_message_fetching"):
-                await asyncio.wait_for(
-                    self._meshcore.start_auto_message_fetching(),
-                    timeout=_SDK_LIFECYCLE_TIMEOUT,
+        # The pinned SDK exposes the notification and native fetch primitives.
+        # Do not start its auto-fetch loop as a second owner of GET_NEXT_MSG.
+        event_types = mc.EventType
+        if hasattr(event_types, "MESSAGES_WAITING") and hasattr(
+            event_types, "NO_MORE_MSGS"
+        ):
+            client = self._meshcore
+            wake = asyncio.Event()
+            wake.set()  # An already queued backlog need not send another push.
+            self._fetch_wake = wake
+
+            async def on_waiting(_event: Any) -> None:
+                if self._meshcore is client and self._fetch_wake is wake:
+                    wake.set()
+
+            self._subscriptions.append(
+                client.subscribe(event_types.MESSAGES_WAITING, on_waiting)
+            )
+        else:
+            # Compatibility for SDKs without the explicit notification API.
+            # This path uses the SDK alone; never start a competing drain.
+            try:
+                if hasattr(self._meshcore, "start_auto_message_fetching"):
+                    await asyncio.wait_for(
+                        self._meshcore.start_auto_message_fetching(),
+                        timeout=_SDK_LIFECYCLE_TIMEOUT,
+                    )
+            except Exception as exc:
+                self._logger.debug(
+                    "MeshCoreSession %s: legacy auto-fetch startup failed: %s",
+                    self._adapter_id,
+                    type(exc).__name__,
                 )
-        except TimeoutError:
-            self._logger.warning(
-                "MeshCoreSession %s: timed out starting auto_message_fetching",
-                self._adapter_id,
-            )
-        except Exception as exc:
-            self._logger.debug(
-                "MeshCoreSession %s: auto_message_fetching failed (non-fatal): %s",
-                self._adapter_id,
-                exc,
-            )
 
         if not self._diag.connected:
             raise MeshCoreConnectionError("Native transport disconnected during setup")
+
+    def _start_receive_pump(self) -> None:
+        """Schedule only after the connection setup owner has returned."""
+        if self._fetch_wake is None or self._stop_requested or not self._diag.connected:
+            return
+        if self._fetch_task is None or self._fetch_task.done():
+            self._fetch_task = asyncio.create_task(
+                self._receive_pump(self._meshcore, self._fetch_wake),
+                name=f"meshcore-receive:{self._adapter_id}",
+            )
+            self._fetch_task.add_done_callback(self._log_task_exception)
+
+    async def _stop_receive_pump(self) -> None:
+        self._fetch_wake = None
+        task, self._fetch_task = self._fetch_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _receive_pump(self, client: Any, wake: asyncio.Event) -> None:
+        """Own initial and notification-driven fetches on this SDK connection.
+
+        The event is cleared before draining so notifications that arrive during
+        a request (including NO_MORE_MSGS) cannot be lost. Each request is
+        serialized with native sends: the SDK correlates some replies by type,
+        not by command ID. A timeout retires the ambiguous connection instead
+        of issuing another destructive fetch against an unresolved response.
+        """
+        types = self._sdk_module.EventType
+        message_types = {
+            types.CONTACT_MSG_RECV,
+            types.CHANNEL_MSG_RECV,
+        }
+        if hasattr(types, "CHANNEL_DATA_RECV"):
+            message_types.add(types.CHANNEL_DATA_RECV)
+        try:
+            while (
+                self._meshcore is client
+                and self._diag.connected
+                and not self._stop_requested
+            ):
+                await wake.wait()
+                wake.clear()
+                while (
+                    self._meshcore is client
+                    and self._diag.connected
+                    and not self._stop_requested
+                ):
+                    if self._wait_for_receive_capacity is not None:
+                        await self._wait_for_receive_capacity()
+                    async with self._send_lock:
+                        if (
+                            self._meshcore is not client
+                            or not self._diag.connected
+                            or self._stop_requested
+                        ):
+                            return
+                        async with asyncio.timeout(_FETCH_ROUND_TIMEOUT + 0.5):
+                            event = await client.commands.get_msg(
+                                timeout=_FETCH_ROUND_TIMEOUT
+                            )
+                    if event.type == types.NO_MORE_MSGS:
+                        break
+                    if event.type not in message_types:
+                        raise RuntimeError(
+                            "native fetch did not return a message or empty queue"
+                        )
+                    # Publication stays in the SDK event callback; yield to
+                    # its dispatcher and to pending sends before fetching again.
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if (
+                self._meshcore is client
+                and self._diag.connected
+                and not self._stop_requested
+            ):
+                self._logger.warning(
+                    "MeshCoreSession %s: receive fetch failed (%s); retiring ambiguous connection",
+                    self._adapter_id,
+                    type(exc).__name__,
+                )
+                self._set_connected(False)
+                self._ensure_recovery_task()
 
     def _subscribe_events(self, mc: Any) -> None:
         """Subscribe to SDK event types for inbound messages + disconnects.
@@ -1679,6 +1806,7 @@ class MeshCoreSession:
                     )
                     self._diag.reconnecting = False
                     self._diag.reconnect_attempts = 0
+                    self._start_receive_pump()
                     return
                 except Exception as exc:
                     self._diag.reconnect_attempts += 1
