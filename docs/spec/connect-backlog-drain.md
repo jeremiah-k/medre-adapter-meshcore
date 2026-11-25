@@ -43,6 +43,33 @@ reply that is neither a message, nor an empty queue, nor an elapsed window
 retires the connection for ordinary recovery. Stop and client replacement
 MUST cancel the old pump before disconnecting the SDK.
 
+A parked wait is bounded. A link can die silently — the peer vanishes
+without a FIN or RST reaching us — so no fetch ever fails and no
+notification ever arrives, and the parked pump would make the session look
+connected forever. While the pump would otherwise sit parked, it MUST
+periodically confirm the node is still reachable with a probe: one cheap
+request the companion answers over the control connection itself, without
+any radio traffic. The session uses the SDK's device query; its
+`DEVICE_INFO` reply type cannot be confused with a message event, so a
+reply can never be mistaken for fetched traffic. The first probe follows
+the park after a fixed internal interval, and the probe repeats at that
+cadence while the quiet continues; the interval equals the pinned SDK's
+own default command timeout, so a slow-but-alive node still answers inside
+one probe budget and is not probed to death. Exactly one probe runs at a
+time, under the same lock as fetches and sends — the SDK correlates
+responses by event type, not request identity — and never while a fetch is
+outstanding. A probe that goes unanswered (the SDK's own elapsed-wait
+report) and a local failure to send the query are transport failures:
+they retire the connection through the same retire path as any other pump
+failure, which runs ordinary recovery. A reply the node itself sent — a
+DEVICE_INFO answer, the wire's numeric error frame, or bytes that arrived
+but failed to parse — proves the link is alive and leaves the connection
+alone. Stop, retirement, and
+reconnect cancel the probe with the pump; a probe reply that arrives after
+cancellation matches no subscription. Detection takes roughly the probe interval plus one probe budget after
+the silence begins; that is a timing bound, not a delivery or recovery
+guarantee.
+
 ## Ingress and evidence
 
 The adapter exposes a prefetch capacity gate using its existing bounded
@@ -55,13 +82,9 @@ reserved twice. The fetched message's publication consumes the reserved
 slot instead of reserving again; a drain that ends without a fetched
 message (empty queue, retirement, stop, or a fetched frame suppressed by
 dedup or decode) releases it. Unsolicited packets still reserve on
-publication and can still be refused under pressure as before. A callback
-can consume the reserved slot while the pump waits behind the native
-command lock, so the pump rechecks its reservation after taking that lock
-and, when the slot is gone, returns to the capacity wait instead of
-issuing a destructive fetch with no reservation. The pump waits while no
-slot is free, rather than deliberately popping more queued messages into
-an already-full adapter. SDK event callbacks remain the only
+publication and can still be refused under pressure as before. The pump
+waits while no slot is free, rather than deliberately popping more queued
+messages into an already-full adapter. SDK event callbacks remain the only
 publication path. The reservation covers the message a fetch popped; it is
 not a durable admission reservation for a frame that arrives after the pump
 stopped draining, and the protocol has no delivery receipt to close that

@@ -74,6 +74,9 @@ It starts after connection setup returns and wakes on MESSAGES_WAITING, draining
 until NO_MORE_MSGS. The SDK still decodes and dispatches messages; MEDRE does
 not publish the command result a second time. An unanswered command is not
 proof of an empty queue, and the companion protocol cannot guarantee receipt.
+A parked pump probes the idle link at a fixed cadence with one cheap local
+device query, so a link that died silently retires through ordinary
+recovery instead of looking connected forever.
 
 Reconnect Policy
 ----------------
@@ -168,6 +171,24 @@ _FETCH_IDLE_REISSUE_DELAY: float = 2.0
 # its wakeup instead and keeps the connection; the next MESSAGES_WAITING
 # notification (or any fresh wakeup) starts a new drain.
 _FETCH_IDLE_SILENT_ROUNDS: int = 4
+
+# A parked wait never expires on its own, so a link that died silently —
+# the peer vanished without FIN/RST — would hold the pump parked and the
+# session looking connected forever. While the pump would otherwise sit
+# parked, it waits for the wakeup at most this long before sending one
+# liveness probe, and repeats at this cadence while the quiet continues.
+# The value equals the pinned SDK's own default command timeout (15 s): a
+# slow-but-alive companion answers inside it (the lab's 4 s per-direction
+# latency fault answers in ~8 s), while each probe also gets this same
+# budget before it is judged failed, so detection completes at roughly
+# this interval plus one probe budget after the silence begins. On a
+# healthy node the query answers in milliseconds; the budget is a
+# worst-case bound.
+_PROBE_IDLE_INTERVAL: float = 15.0
+
+# The SDK reports its own elapsed command wait as an ERROR event carrying one
+# of these reasons; nothing was received from the node.
+_PROBE_UNANSWERED_REASONS = frozenset({"timeout", "no_event_received"})
 
 # suggested_timeout clamping bounds (seconds).
 # The firmware returns milliseconds; we convert to seconds and clamp.
@@ -326,7 +347,6 @@ class MeshCoreSession:
         on_connection_change: Callable[[bool], None] | None = None,
         wait_for_receive_capacity: Callable[[], Awaitable[None]] | None = None,
         release_receive_permit: Callable[[], None] | None = None,
-        receive_permit_ready: Callable[[], bool] | None = None,
     ) -> None:
         self._config = config
         self._adapter_id = adapter_id
@@ -351,10 +371,6 @@ class MeshCoreSession:
         # fetched message's publication consumes it; drains that end
         # without a fetched message release it through this callable.
         self._release_receive_permit = release_receive_permit
-        # True only while the pump's reserved admission slot is still
-        # unconsumed; the pump rechecks it under the send lock so a late
-        # callback that consumed the slot cannot trigger a fetch.
-        self._receive_permit_ready = receive_permit_ready
         self._fetch_wake: asyncio.Event | None = None
         self._fetch_task: asyncio.Task[None] | None = None
 
@@ -1501,8 +1517,12 @@ class MeshCoreSession:
         frames keep arriving the drain continues; a streak of idle rounds
         with no inbound traffic at all means the link is not answering, so
         the pump parks on its wakeup instead of popping further messages the
-        link cannot return. Only a real transport or protocol failure retires
-        the connection.
+        link cannot return. A parked wait is bounded by the idle-link
+        liveness probe: if nothing wakes the pump within
+        _PROBE_IDLE_INTERVAL, it asks the node one cheap local query; a
+        probe that times out or errors is a silent-dead link and retires the
+        connection. Only a real transport or protocol failure retires the
+        connection.
         """
         types = self._sdk_module.EventType
         message_types = {
@@ -1519,7 +1539,7 @@ class MeshCoreSession:
                 and self._diag.connected
                 and not self._stop_requested
             ):
-                await wake.wait()
+                await self._await_wake_with_probe(client, wake)
                 wake.clear()
                 while (
                     self._meshcore is client
@@ -1616,7 +1636,7 @@ class MeshCoreSession:
                 and not self._stop_requested
             ):
                 self._logger.warning(
-                    "MeshCoreSession %s: receive fetch failed (%s: %s); retiring connection",
+                    "MeshCoreSession %s: receive pump failed (%s: %s); retiring connection",
                     self._adapter_id,
                     type(exc).__name__,
                     exc,
@@ -1626,6 +1646,101 @@ class MeshCoreSession:
         finally:
             self._release_fetch_permit()
 
+    async def _await_wake_with_probe(self, client: Any, wake: asyncio.Event) -> None:
+        """Wait for the pump's wakeup, probing the idle link when it is quiet.
+
+        A parked pump used to wait for the next notification forever, so a
+        link that died silently looked connected forever. This wait expires
+        into one liveness probe every ``_PROBE_IDLE_INTERVAL`` while the
+        quiet continues; a failed probe raises so the pump's ordinary retire
+        path — the same handler a fetch failure uses — runs the existing
+        recovery loop.
+        """
+        while (
+            self._meshcore is client
+            and self._diag.connected
+            and not self._stop_requested
+        ):
+            if wake.is_set():
+                return
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=_PROBE_IDLE_INTERVAL)
+                return
+            except TimeoutError:
+                pass
+            await self._probe_idle_link(client)
+
+    async def _probe_idle_link(self, client: Any) -> None:
+        """Confirm the parked link still answers one cheap local query.
+
+        The pinned SDK's device query is answered by the companion over the
+        control connection itself — no radio traffic — and its
+        ``DEVICE_INFO`` reply type cannot be confused with a message event,
+        so a late or stray reply can never be mistaken for fetched traffic.
+        It runs under the send lock: one probe at a time, never concurrent
+        with a fetch or a send (the SDK correlates some replies by event
+        type, not request identity). The probe gets the same
+        ``_PROBE_IDLE_INTERVAL`` budget as the SDK's own default command
+        timeout; only an unanswered query (the SDK's own elapsed-wait
+        report) or a local failure to send the query is treated as a
+        silent-dead link: raise so the pump's existing retire path runs.
+        A reply the node itself sent — a ``DEVICE_INFO`` answer, the
+        wire's numeric error frame, or bytes that arrived but failed to
+        parse — proves the link is alive and leaves the connection
+        alone
+ Stop, retire, and reconnect cancel the probe with
+        the pump task, and the SDK unsubscribes the waiter on
+        cancellation, so a late reply matches no subscription.
+        """
+        device_query = getattr(client.commands, "send_device_query", None)
+        if device_query is None:
+            # Without the SDK's local query there is nothing safe to probe
+            # with; the wait repeats without a probe and cannot retire a
+            # silent link.
+            return
+        async with self._send_lock:
+            if (
+                self._meshcore is not client
+                or not self._diag.connected
+                or self._stop_requested
+            ):
+                return
+            self._logger.debug(
+                "MeshCoreSession %s: probing the idle receive link",
+                self._adapter_id,
+            )
+            try:
+                # The SDK's send() waits _PROBE_IDLE_INTERVAL internally (its
+                # default command timeout) and then reports an ERROR event.
+                # This outer guard sits strictly above that bound, mirroring
+                # the fetch round guard: it exists only to bound a hung
+                # writer, never to race the SDK's own timeout.
+                async with asyncio.timeout(_PROBE_IDLE_INTERVAL + 0.5):
+                    result = await device_query()
+            except TimeoutError as exc:
+                raise RuntimeError("idle-link liveness probe timed out") from exc
+        types = self._sdk_module.EventType
+        result_type = getattr(result, "type", None)
+        payload = getattr(result, "payload", None)
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        # The pinned SDK reports three shapes on this query's ERROR
+        # event: an elapsed wait carries a reason of "timeout" or
+        # "no_event_received"; a local failure to send or wait carries a
+        # string under "error"; a reply the node itself sent carries an
+        # int under "error_code" (the wire's error frame), and bytes
+        # that arrived but failed to parse carry a non-elapsed reason.
+        # Only an elapsed wait or a local failure to send means no reply
+        # came from the node; any other reply proves the link is alive.
+        if result_type == types.ERROR and (
+            reason in _PROBE_UNANSWERED_REASONS
+            or (
+                isinstance(payload, dict)
+                and "error" in payload
+                and type(payload["error"]) is not int
+                and type(payload.get("error_code")) is not int
+            )
+        ):
+            raise RuntimeError(f"idle-link liveness probe unanswered ({reason})")
     @staticmethod
     def _fetch_window_elapsed(event: Any, types: Any) -> bool:
         """Report whether the fetch returned because the window was idle.
