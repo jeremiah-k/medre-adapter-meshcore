@@ -150,6 +150,16 @@ _BLE_CONNECT_ATTEMPT_TIMEOUT: float = 45.0  # includes BlueZ cleanup and discove
 # deep; it does not extend the startup deadline or require a guessed queue cap.
 _FETCH_ROUND_TIMEOUT: float = 2.0
 
+# A fetch window that elapses with no event means the node had nothing ready
+# within the window: idle, not a failure. The pump keeps the connection and
+# re-issues the fetch, because publication happens in the SDK event callback
+# whenever the frame actually arrives, even if it pops after the window. The
+# re-issue rate stays bounded: at most _FETCH_IDLE_IMMEDIATE_REISSUES
+# consecutive immediate re-issues, after which each further re-issue waits
+# for a notification or _FETCH_IDLE_REISSUE_DELAY, whichever comes first.
+_FETCH_IDLE_IMMEDIATE_REISSUES: int = 2
+_FETCH_IDLE_REISSUE_DELAY: float = 2.0
+
 # suggested_timeout clamping bounds (seconds).
 # The firmware returns milliseconds; we convert to seconds and clamp.
 # Floor: never sleep less than 0.5 s even if firmware suggests very short.
@@ -306,6 +316,7 @@ class MeshCoreSession:
         logger: logging.Logger | None = None,
         on_connection_change: Callable[[bool], None] | None = None,
         wait_for_receive_capacity: Callable[[], Awaitable[None]] | None = None,
+        release_receive_permit: Callable[[], None] | None = None,
     ) -> None:
         self._config = config
         self._adapter_id = adapter_id
@@ -325,6 +336,11 @@ class MeshCoreSession:
         self._message_callback: MessageCallback | None = None
         self._on_connection_change = on_connection_change
         self._wait_for_receive_capacity = wait_for_receive_capacity
+        # Adapter-side release of the pump's inbound-capacity permit. The
+        # pump holds at most one permit from before a fetch until the
+        # fetched message's publication consumes it; drains that end
+        # without a fetched message release it through this callable.
+        self._release_receive_permit = release_receive_permit
         self._fetch_wake: asyncio.Event | None = None
         self._fetch_task: asyncio.Task[None] | None = None
 
@@ -1456,8 +1472,15 @@ class MeshCoreSession:
         The event is cleared before draining so notifications that arrive during
         a request (including NO_MORE_MSGS) cannot be lost. Each request is
         serialized with native sends: the SDK correlates some replies by type,
-        not by command ID. A timeout retires the ambiguous connection instead
-        of issuing another destructive fetch against an unresolved response.
+        not by command ID — one fetch runs at a time, and the next fetch is
+        issued only after the previous one returned.
+
+        A fetch window that elapses with no event is idle, not a failure: the
+        node had nothing ready inside the window. The connection stays and the
+        fetch is re-issued at a bounded rate; a frame that pops after the
+        window still publishes through the SDK event callback, which sees
+        every inbound frame regardless of which request it answers. Only a
+        real transport or protocol failure retires the connection.
         """
         types = self._sdk_module.EventType
         message_types = {
@@ -1466,6 +1489,7 @@ class MeshCoreSession:
         }
         if hasattr(types, "CHANNEL_DATA_RECV"):
             message_types.add(types.CHANNEL_DATA_RECV)
+        idle_rounds = 0
         try:
             while (
                 self._meshcore is client
@@ -1493,11 +1517,38 @@ class MeshCoreSession:
                                 timeout=_FETCH_ROUND_TIMEOUT
                             )
                     if event.type == types.NO_MORE_MSGS:
+                        idle_rounds = 0
+                        self._release_fetch_permit()
                         break
+                    if self._fetch_window_elapsed(event, types):
+                        idle_rounds += 1
+                        self._logger.debug(
+                            "MeshCoreSession %s: fetch window elapsed with no "
+                            "event (%d consecutive idle round(s)); re-issuing "
+                            "on the same connection",
+                            self._adapter_id,
+                            idle_rounds,
+                        )
+                        if idle_rounds > _FETCH_IDLE_IMMEDIATE_REISSUES:
+                            # Pace further re-issues: wait for a notification
+                            # or the floor delay, so a slow link neither spins
+                            # nor strands its backlog.
+                            try:
+                                await asyncio.wait_for(
+                                    wake.wait(),
+                                    timeout=_FETCH_IDLE_REISSUE_DELAY,
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                        await asyncio.sleep(0)
+                        continue
                     if event.type not in message_types:
                         raise RuntimeError(
-                            "native fetch did not return a message or empty queue"
+                            "native fetch returned "
+                            f"{self._fetch_outcome_detail(event, types)}"
+                            " instead of a message or empty queue"
                         )
+                    idle_rounds = 0
                     # Publication stays in the SDK event callback; yield to
                     # its dispatcher and to pending sends before fetching again.
                     await asyncio.sleep(0)
@@ -1510,12 +1561,63 @@ class MeshCoreSession:
                 and not self._stop_requested
             ):
                 self._logger.warning(
-                    "MeshCoreSession %s: receive fetch failed (%s); retiring ambiguous connection",
+                    "MeshCoreSession %s: receive fetch failed (%s: %s); retiring connection",
                     self._adapter_id,
                     type(exc).__name__,
+                    exc,
                 )
                 self._set_connected(False)
                 self._ensure_recovery_task()
+        finally:
+            self._release_fetch_permit()
+
+    @staticmethod
+    def _fetch_window_elapsed(event: Any, types: Any) -> bool:
+        """Report whether the fetch returned because the window was idle.
+
+        ``meshcore`` maps an elapsed command-response wait to an ``ERROR``
+        event whose payload reason is ``no_event_received`` (or ``timeout``).
+        Those describe transport uncertainty, not a remote rejection, so the
+        pump treats them as an empty window rather than a failure.
+        """
+        if event.type != types.ERROR:
+            return False
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            return False
+        return payload.get("reason") in _TRANSIENT_SDK_SEND_REASONS
+
+    @staticmethod
+    def _fetch_outcome_detail(event: Any, types: Any) -> str:
+        """Summarize a non-message fetch outcome for the retire log."""
+        if event.type == types.ERROR:
+            payload = getattr(event, "payload", None)
+            if isinstance(payload, dict):
+                reason = payload.get("reason") or payload.get("error")
+                if reason is not None:
+                    return f"ERROR({reason})"
+            return "ERROR"
+        return str(getattr(event.type, "name", event.type))
+
+    def _release_fetch_permit(self) -> None:
+        """Release this pump's unconsumed inbound-capacity permit.
+
+        The pump holds at most one permit, acquired before a fetch and
+        consumed by the fetched message's publication. Drains that end
+        without a fetched message — an empty queue, a retirement, stop —
+        release the permit here and on the pump's exit path.
+        """
+        release = self._release_receive_permit
+        if release is None:
+            return
+        try:
+            release()
+        except Exception as exc:
+            self._logger.debug(
+                "MeshCoreSession %s: fetch permit release failed: %s",
+                self._adapter_id,
+                exc,
+            )
 
     def _subscribe_events(self, mc: Any) -> None:
         """Subscribe to SDK event types for inbound messages + disconnects.

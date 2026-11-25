@@ -350,6 +350,7 @@ async def test_capacity_gate_waits_without_holding_the_send_lock() -> None:
     session._stop_requested = False
     session._send_lock = asyncio.Lock()
     session._wait_for_receive_capacity = capacity
+    session._release_receive_permit = None
     session._fetch_wake = asyncio.Event()
     session._fetch_wake.set()
     session._fetch_task = None
