@@ -262,6 +262,11 @@ class MeshCoreAdapter(AdapterContract):
         # publication task's done callback and reset at session
         # boundaries, so a new session inherits no stale reservations.
         self._pending_callback_admissions: int = 0
+        # The receive pump's own reservation: one fetched message holds one
+        # admission slot from before its fetch until its publication. The
+        # publication consumes the permit instead of re-reserving, so a
+        # message the node has already popped is never refused at admission.
+        self._pump_permit_pending: bool = False
         self._receive_capacity = asyncio.Event()
         self._receive_capacity.set()
         # A completed task must release only the slot reserved in its own
@@ -337,6 +342,7 @@ class MeshCoreAdapter(AdapterContract):
         self._inbound_published = 0
         self._callback_admission_epoch += 1
         self._pending_callback_admissions = 0
+        self._pump_permit_pending = False
         self._receive_capacity = asyncio.Event()
         self._receive_capacity.set()
         self._producer_scheduled_count = 0
@@ -438,11 +444,16 @@ class MeshCoreAdapter(AdapterContract):
                 self._on_message(packet)
 
         async def wait_for_receive_capacity() -> None:
+            # The pump reserves its admission slot here, before issuing the
+            # fetch: the node pops the message destructively, so the slot it
+            # will publish into must already exist. While a fetched message
+            # has not published yet, its permit covers the next fetch too —
+            # one fetch per permit, never two in flight.
             while health_epoch == self._health_lifecycle_epoch and self._started:
-                if (
-                    self._pending_callback_admissions
-                    < self._config.max_pending_ingress_callbacks
-                ):
+                if self._pump_permit_pending:
+                    return
+                if self._reserve_callback_slot():
+                    self._pump_permit_pending = True
                     return
                 await self._receive_capacity.wait()
             raise asyncio.CancelledError
@@ -455,6 +466,11 @@ class MeshCoreAdapter(AdapterContract):
                 logger=ctx.logger,
                 on_connection_change=lambda _: self._report_native_health(health_epoch),
                 wait_for_receive_capacity=wait_for_receive_capacity,
+                release_receive_permit=lambda: self._release_fetch_permit(health_epoch),
+                receive_permit_ready=lambda: (
+                    health_epoch == self._health_lifecycle_epoch
+                    and self._pump_permit_pending
+                ),
             )
             self._session = session
             await session.start(message_callback=receive, recover_on_failure=True)
@@ -559,6 +575,7 @@ class MeshCoreAdapter(AdapterContract):
         # reserved by a subsequent start or contaminate its counters.
         self._callback_admission_epoch += 1
         self._pending_callback_admissions = 0
+        self._pump_permit_pending = False
 
         # Stop the session (handles SDK disconnect + cleanup).
         if self._session is not None:
@@ -846,6 +863,20 @@ class MeshCoreAdapter(AdapterContract):
             self._pending_callback_admissions -= 1
             self._receive_capacity.set()
 
+    def _release_fetch_permit(self, epoch: int) -> None:
+        """Release the receive pump's unconsumed inbound-capacity permit.
+
+        Called by the pump through an epoch-bound closure when its drain
+        ends without a fetched message (empty queue, retirement, stop) and
+        on the pump's exit path. The epoch guard keeps a retired session's
+        pump from touching the live session's accounting.
+        """
+        if epoch != self._callback_admission_epoch:
+            return
+        if self._pump_permit_pending:
+            self._pump_permit_pending = False
+            self._release_callback_slot()
+
     def _on_background_task_done(
         self,
         epoch: int,
@@ -1094,6 +1125,10 @@ class MeshCoreAdapter(AdapterContract):
             )
             if dedup_key is not None and dedup_key in self._inbound_dedup:
                 self._inbound_dedup.move_to_end(dedup_key)
+                # Fetched but not published: the node already popped this
+                # duplicate, so its admission permit (if one is pending)
+                # must not stay held.
+                self._release_fetch_permit(self._callback_admission_epoch)
                 return
 
             # Decode before committing dedup key so that decode failures
@@ -1108,7 +1143,14 @@ class MeshCoreAdapter(AdapterContract):
             # Reserve a bounded callback slot BEFORE committing the
             # dedup key: a producer-refused packet must never poison
             # dedup, so a refused identity stays retryable by the radio.
-            if not self._reserve_callback_slot():
+            # A fetched message does not reserve here: its receive pump
+            # already reserved this slot before issuing the fetch, and
+            # the node cannot redeliver a popped message. The permit is
+            # consumed instead; every other (unsolicited) packet still
+            # reserves and can still be refused under pressure.
+            if self._pump_permit_pending:
+                self._pump_permit_pending = False
+            elif not self._reserve_callback_slot():
                 self._refuse_callback_admission()
                 return
 
@@ -1170,6 +1212,9 @@ class MeshCoreAdapter(AdapterContract):
             self._producer_scheduled_count += 1
             self._report_producer_pressure("scheduled")
         except Exception:
+            # Classification or decode failed before admission: a fetched
+            # message's permit (if one is pending) must not stay held.
+            self._release_fetch_permit(self._callback_admission_epoch)
             if self.ctx is not None:
                 self.ctx.logger.exception(
                     "MeshCoreAdapter %s: error processing inbound packet",

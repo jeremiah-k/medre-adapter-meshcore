@@ -127,3 +127,65 @@ async def test_ambiguous_fetch_response_retires_connection_without_retry():
     assert session._diag.connected is False
     session._ensure_recovery_task.assert_called_once()
     await session._stop_receive_pump()
+
+class _CountingLock:
+    """A send lock that counts acquisitions, to prove absence of a busy spin."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.acquisitions = 0
+
+    async def __aenter__(self) -> "_CountingLock":
+        await self._lock.acquire()
+        self.acquisitions += 1
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._lock.release()
+
+
+@pytest.mark.asyncio
+async def test_consumed_permit_is_reacquired_after_waiting_for_send_lock():
+    """A late callback consumes the reserved slot; the pump returns to the
+    capacity wait instead of popping with no reservation, without spinning
+    on the send lock while the slot is gone."""
+    permit = False
+    reserved = asyncio.Event()
+    replenish = asyncio.Event()
+    fetched = asyncio.Event()
+
+    async def capacity():
+        nonlocal permit
+        if reserved.is_set():
+            await replenish.wait()
+        permit = True
+        reserved.set()
+
+    async def get_msg(*, timeout):
+        assert permit
+        fetched.set()
+        return SimpleNamespace(type=EventType.NO_MORE_MSGS)
+
+    session = session_with_fetch(get_msg, capacity)
+    counting_lock = _CountingLock()
+    session._send_lock = counting_lock
+    session._receive_permit_ready = lambda: permit
+    try:
+        async with counting_lock:
+            session._start_receive_pump()
+            await asyncio.wait_for(reserved.wait(), 2)
+            permit = False
+        # The pump must return to the capacity gate, not issue a pop.
+        replenish.set()
+        await asyncio.wait_for(fetched.wait(), 2)
+        assert counting_lock.acquisitions == 2
+        # No busy spin: with the slot gone again the pump must sit in the
+        # capacity wait. Many deterministic loop turns would multiply a
+        # hot loop's lock acquisitions.
+        permit = False
+        session._fetch_wake.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert counting_lock.acquisitions == 2
+    finally:
+        await session._stop_receive_pump()

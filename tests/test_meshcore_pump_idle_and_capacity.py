@@ -20,11 +20,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from enum import Enum, auto
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from medre.core.contracts.adapter import AdapterContext
+
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.session import MeshCoreSession
+from medre.config.adapters.meshcore import MeshCoreConfig
 from tests.medre_meshcore_tests.helpers.async_utils import wait_until
 
 
@@ -199,3 +204,180 @@ async def test_ambiguous_fetch_response_releases_its_permit_before_retiring() ->
     release.assert_called_once()
     assert session._diag.connected is False
     await session._stop_receive_pump()
+
+
+# ===================================================================
+# D2 at the adapter boundary: the real gate reserves, publication consumes.
+# ===================================================================
+
+
+def _packet(index: int) -> dict:
+    """Make a relayable unique channel packet without SDK/hardware state."""
+    return {
+        "text": f"pump-permit {index}",
+        "pubkey_prefix": "pump-permit-source",
+        "sender_timestamp": index + 1,
+        "type": "CHAN",
+        "txt_type": 0,
+        "channel_idx": 0,
+    }
+
+
+class _HeldPublisher:
+    """Publication stays pending until the gate opens."""
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.published: list[str] = []
+
+    async def __call__(self, canonical) -> None:
+        self.entered.set()
+        await self.gate.wait()
+        self.published.append(str(canonical.payload.get("body")))
+
+
+class _PressureSink:
+    def __init__(self) -> None:
+        self.reports: list[object] = []
+
+    def __call__(self, report) -> None:
+        self.reports.append(report)
+
+    def outcome_count(self, outcome: str) -> int:
+        return sum(
+            getattr(report, "outcome", None) == outcome for report in self.reports
+        )
+
+
+async def _start_adapter(
+    publisher: _HeldPublisher, sink: _PressureSink, *, max_pending: int = 1
+):
+    context: dict = {
+        "adapter_id": "pump-permit",
+        "publish_inbound": publisher,
+        "logger": logging.getLogger("test.pump-permit"),
+        "clock": lambda: datetime.now(UTC),
+        "shutdown_event": asyncio.Event(),
+    }
+    ctx = AdapterContext(**context)
+    ctx.report_producer_pressure = sink
+    adapter = MeshCoreAdapter(
+        MeshCoreConfig(
+            adapter_id="pump-permit", max_pending_ingress_callbacks=max_pending
+        )
+    )
+    await adapter.start(ctx)
+    return adapter
+
+
+async def test_gate_reserves_the_permit_before_fetching() -> None:
+    """The capacity gate acquires the pump's admission slot, not just a peek."""
+    publisher = _HeldPublisher()
+    sink = _PressureSink()
+    adapter = await _start_adapter(publisher, sink)
+    try:
+        gate = adapter._session._wait_for_receive_capacity
+        await asyncio.wait_for(gate(), 2)
+        # The slot is reserved before any fetch is issued.
+        assert adapter._pump_permit_pending is True
+        assert adapter._pending_callback_admissions == 1
+        assert not publisher.entered.is_set()
+        # One fetch per permit: while the permit is pending the pump reuses
+        # it instead of reserving a second slot.
+        await asyncio.wait_for(gate(), 2)
+        assert adapter._pump_permit_pending is True
+        assert adapter._pending_callback_admissions == 1
+    finally:
+        publisher.gate.set()
+        await adapter.stop()
+
+
+async def test_publication_consumes_the_permit_instead_of_re_reserving() -> None:
+    """A fetched message publishes at a full pool; the permit is not re-taken."""
+    publisher = _HeldPublisher()
+    sink = _PressureSink()
+    adapter = await _start_adapter(publisher, sink)
+    try:
+        gate = adapter._session._wait_for_receive_capacity
+        await asyncio.wait_for(gate(), 2)
+        assert adapter._pump_permit_pending is True
+        assert adapter._pending_callback_admissions == 1
+
+        # The fetched frame arrives while the pool is full with the pump's
+        # own reservation. Publication consumes the permit: no re-reserve,
+        # no refusal.
+        adapter._on_message(_packet(0))
+        assert await asyncio.wait_for(publisher.entered.wait(), 2)
+        assert adapter._pump_permit_pending is False
+        assert adapter._pending_callback_admissions == 1
+        assert sink.outcome_count("overflow") == 0
+
+        # The slot now belongs to the pending publication; it frees on
+        # completion and a fresh acquisition reserves again.
+        publisher.gate.set()
+        await asyncio.wait_for(asyncio.gather(*tuple(adapter._background_tasks)), 2)
+        assert adapter._pending_callback_admissions == 0
+        await asyncio.wait_for(gate(), 2)
+        assert adapter._pump_permit_pending is True
+        assert adapter._pending_callback_admissions == 1
+    finally:
+        publisher.gate.set()
+        await adapter.stop()
+
+
+async def test_a_full_inbound_queue_blocks_the_gate_until_capacity_frees() -> None:
+    """A full pool holds the gate — and with it the fetch — until a slot frees."""
+    publisher = _HeldPublisher()
+    sink = _PressureSink()
+    adapter = await _start_adapter(publisher, sink)
+    try:
+        gate = adapter._session._wait_for_receive_capacity
+        await asyncio.wait_for(gate(), 2)
+        # A fetched publication now occupies the pool.
+        adapter._on_message(_packet(0))
+        assert await asyncio.wait_for(publisher.entered.wait(), 2)
+        # The next acquisition must wait: the pool is at its bound.
+        gate_task = asyncio.create_task(gate())
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+        assert not gate_task.done()
+        publisher.gate.set()
+        await asyncio.wait_for(asyncio.gather(*tuple(adapter._background_tasks)), 2)
+        await asyncio.wait_for(gate_task, 2)
+        assert adapter._pump_permit_pending is True
+        assert adapter._pending_callback_admissions == 1
+    finally:
+        publisher.gate.set()
+        await adapter.stop()
+
+
+async def test_duplicate_fetched_frame_releases_the_permit() -> None:
+    """A fetched frame suppressed by dedup frees its admission permit."""
+    publisher = _HeldPublisher()
+    sink = _PressureSink()
+    adapter = await _start_adapter(publisher, sink, max_pending=2)
+    try:
+        gate = adapter._session._wait_for_receive_capacity
+        # A first copy publishes normally.
+        adapter._on_message(_packet(0))
+        assert await asyncio.wait_for(publisher.entered.wait(), 2)
+        # The pump's permit for the (redelivered) frame is pending.
+        await asyncio.wait_for(gate(), 2)
+        assert adapter._pump_permit_pending is True
+        assert adapter._pending_callback_admissions == 2
+        # The duplicate is fetched, then suppressed: fetched but not
+        # published, so the permit must be released, not held.
+        adapter._on_message(_packet(0))
+        assert adapter._pump_permit_pending is False
+        assert adapter._pending_callback_admissions == 1
+        assert adapter._receive_capacity.is_set()
+        assert sink.outcome_count("overflow") == 0
+        # The freed slot is acquirable again.
+        publisher.gate.set()
+        await asyncio.wait_for(asyncio.gather(*tuple(adapter._background_tasks)), 2)
+        await asyncio.wait_for(gate(), 2)
+        assert adapter._pump_permit_pending is True
+    finally:
+        publisher.gate.set()
+        await adapter.stop()

@@ -317,6 +317,7 @@ class MeshCoreSession:
         on_connection_change: Callable[[bool], None] | None = None,
         wait_for_receive_capacity: Callable[[], Awaitable[None]] | None = None,
         release_receive_permit: Callable[[], None] | None = None,
+        receive_permit_ready: Callable[[], bool] | None = None,
     ) -> None:
         self._config = config
         self._adapter_id = adapter_id
@@ -341,6 +342,10 @@ class MeshCoreSession:
         # fetched message's publication consumes it; drains that end
         # without a fetched message release it through this callable.
         self._release_receive_permit = release_receive_permit
+        # True only while the pump's reserved admission slot is still
+        # unconsumed; the pump rechecks it under the send lock so a late
+        # callback that consumed the slot cannot trigger a fetch.
+        self._receive_permit_ready = receive_permit_ready
         self._fetch_wake: asyncio.Event | None = None
         self._fetch_task: asyncio.Task[None] | None = None
 
@@ -1512,6 +1517,14 @@ class MeshCoreSession:
                             or self._stop_requested
                         ):
                             return
+                        # A late callback can consume this round's reserved
+                        # slot while the pump waits behind a send. Recheck
+                        # without awaiting inside the lock; with the slot
+                        # gone, return to the capacity wait instead of
+                        # issuing a destructive fetch with no reservation.
+                        permit_ready = getattr(self, "_receive_permit_ready", None)
+                        if permit_ready is not None and not permit_ready():
+                            continue
                         async with asyncio.timeout(_FETCH_ROUND_TIMEOUT + 0.5):
                             event = await client.commands.get_msg(
                                 timeout=_FETCH_ROUND_TIMEOUT
