@@ -160,6 +160,15 @@ _FETCH_ROUND_TIMEOUT: float = 2.0
 _FETCH_IDLE_IMMEDIATE_REISSUES: int = 2
 _FETCH_IDLE_REISSUE_DELAY: float = 2.0
 
+# An idle round still costs the node a popped message. While frames keep
+# arriving (late responses prove the link is slow but alive) re-issuing
+# drains the backlog; when _FETCH_IDLE_SILENT_ROUNDS consecutive idle rounds
+# bring no inbound traffic at all, the stream is not answering — re-issuing
+# would pop messages into a link that cannot return them. The pump parks on
+# its wakeup instead and keeps the connection; the next MESSAGES_WAITING
+# notification (or any fresh wakeup) starts a new drain.
+_FETCH_IDLE_SILENT_ROUNDS: int = 4
+
 # suggested_timeout clamping bounds (seconds).
 # The firmware returns milliseconds; we convert to seconds and clamp.
 # Floor: never sleep less than 0.5 s even if firmware suggests very short.
@@ -354,6 +363,10 @@ class MeshCoreSession:
         self._stop_requested: bool = False
         self._reconnect_task: asyncio.Task[None] | None = None
         self._initial_start_task: asyncio.Task[Any] | None = None
+        # Bumped for every event the SDK dispatcher delivers, so the
+        # receive pump can tell an idle-but-delivering link (late responses
+        # keep arriving) from a silent one that returns nothing at all.
+        self._fetch_inbound_seen: int = 0
 
         # Send serialization: ensures pacing sleeps are not bypassed when
         # multiple send_text() calls overlap via pipeline fan-out.
@@ -1484,8 +1497,12 @@ class MeshCoreSession:
         node had nothing ready inside the window. The connection stays and the
         fetch is re-issued at a bounded rate; a frame that pops after the
         window still publishes through the SDK event callback, which sees
-        every inbound frame regardless of which request it answers. Only a
-        real transport or protocol failure retires the connection.
+        every inbound frame regardless of which request it answers. While
+        frames keep arriving the drain continues; a streak of idle rounds
+        with no inbound traffic at all means the link is not answering, so
+        the pump parks on its wakeup instead of popping further messages the
+        link cannot return. Only a real transport or protocol failure retires
+        the connection.
         """
         types = self._sdk_module.EventType
         message_types = {
@@ -1495,6 +1512,7 @@ class MeshCoreSession:
         if hasattr(types, "CHANNEL_DATA_RECV"):
             message_types.add(types.CHANNEL_DATA_RECV)
         idle_rounds = 0
+        silent_rounds = 0
         try:
             while (
                 self._meshcore is client
@@ -1510,6 +1528,7 @@ class MeshCoreSession:
                 ):
                     if self._wait_for_receive_capacity is not None:
                         await self._wait_for_receive_capacity()
+                    inbound_before = self._fetch_inbound_seen
                     async with self._send_lock:
                         if (
                             self._meshcore is not client
@@ -1531,17 +1550,39 @@ class MeshCoreSession:
                             )
                     if event.type == types.NO_MORE_MSGS:
                         idle_rounds = 0
+                        silent_rounds = 0
                         self._release_fetch_permit()
                         break
                     if self._fetch_window_elapsed(event, types):
                         idle_rounds += 1
+                        # Late responses arriving between rounds prove the
+                        # link is slow but delivering; a round that brings no
+                        # inbound traffic at all is a silent link. Re-issuing
+                        # forever on a silent link would keep popping
+                        # messages the link cannot return.
+                        if self._fetch_inbound_seen != inbound_before or wake.is_set():
+                            silent_rounds = 0
+                        else:
+                            silent_rounds += 1
                         self._logger.debug(
                             "MeshCoreSession %s: fetch window elapsed with no "
-                            "event (%d consecutive idle round(s)); re-issuing "
-                            "on the same connection",
+                            "event (%d consecutive idle round(s), %d silent); "
+                            "re-issuing on the same connection",
                             self._adapter_id,
                             idle_rounds,
+                            silent_rounds,
                         )
+                        if silent_rounds >= _FETCH_IDLE_SILENT_ROUNDS:
+                            self._release_fetch_permit()
+                            idle_rounds = 0
+                            silent_rounds = 0
+                            self._logger.debug(
+                                "MeshCoreSession %s: fetch rounds bring no "
+                                "inbound traffic; parking the receive pump "
+                                "until the next notification",
+                                self._adapter_id,
+                            )
+                            break
                         if idle_rounds > _FETCH_IDLE_IMMEDIATE_REISSUES:
                             # Pace further re-issues: wait for a notification
                             # or the floor delay, so a slow link neither spins
@@ -1562,6 +1603,7 @@ class MeshCoreSession:
                             " instead of a message or empty queue"
                         )
                     idle_rounds = 0
+                    silent_rounds = 0
                     # Publication stays in the SDK event callback; yield to
                     # its dispatcher and to pending sends before fetching again.
                     await asyncio.sleep(0)
@@ -1757,6 +1799,10 @@ class MeshCoreSession:
         forwards it to the registered message callback.  The payload
         is a plain dict — no SDK objects leak into the adapter layer.
         """
+        # The receive pump counts these deliveries to tell an idle-but-
+        # delivering link from a silent one; bump before any early exit.
+        self._fetch_inbound_seen += 1
+
         if self._message_callback is None:
             return
 

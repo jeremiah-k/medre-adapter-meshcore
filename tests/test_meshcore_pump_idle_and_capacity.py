@@ -54,6 +54,7 @@ def session_with_fetch(get_msg, capacity=None, release=None):
     session._send_lock = asyncio.Lock()
     session._wait_for_receive_capacity = capacity
     session._release_receive_permit = release
+    session._fetch_inbound_seen = 0
     session._fetch_wake = asyncio.Event()
     session._fetch_wake.set()
     session._fetch_task = None
@@ -105,8 +106,12 @@ async def test_fetch_timeout_reissues_on_the_same_connection() -> None:
         await session._stop_receive_pump()
 
 
-async def test_repeated_idle_fetches_stay_bounded_and_connected() -> None:
-    """Idle rounds re-issue, but only two run immediately; the rest pace."""
+async def test_repeated_idle_fetches_stay_bounded_and_connected(monkeypatch) -> None:
+    """Idle rounds re-issue at a bounded rate, then park; the connection stays."""
+    monkeypatch.setattr(
+        "medre.adapters.meshcore.session._FETCH_IDLE_REISSUE_DELAY", 0.05
+    )
+    monkeypatch.setattr("medre.adapters.meshcore.session._FETCH_ROUND_TIMEOUT", 0.2)
     calls = 0
 
     async def get_msg(*, timeout):
@@ -119,13 +124,46 @@ async def test_repeated_idle_fetches_stay_bounded_and_connected() -> None:
     try:
         # The initial round plus the immediate re-issues run without waiting.
         assert await wait_until(lambda: calls >= 3, timeout=2)
-        # The next round is paced: a few loop turns do not run it early.
+        # Pacing is a floor, not a stall: the pump re-issues after it, but a
+        # silent streak parks the pump after a bounded number of rounds
+        # (initial + two immediate + the paced rounds reaching the bound).
+        assert await wait_until(lambda: calls >= 4, timeout=2)
         for _ in range(5):
-            await asyncio.sleep(0.01)
-        assert calls == 3, "pacing must not let idle rounds spin"
-        # Pacing is a floor, not a stall: the pump still re-issues after it.
-        assert await wait_until(lambda: calls >= 4, timeout=4)
+            await asyncio.sleep(0.05)
+        assert calls == 4, "silent idle rounds must park, not pop forever"
         # Idleness never retires the connection.
+        assert session._diag.connected is True
+        assert not session._ensure_recovery_task.called
+        # A fresh notification starts a new drain on the same connection.
+        session._fetch_wake.set()
+        assert await wait_until(lambda: calls >= 5, timeout=2)
+        assert session._diag.connected is True
+    finally:
+        await session._stop_receive_pump()
+
+
+async def test_idle_rounds_with_inbound_traffic_keep_draining(monkeypatch) -> None:
+    """Late frames arriving between idle rounds prove the link delivers."""
+    monkeypatch.setattr(
+        "medre.adapters.meshcore.session._FETCH_IDLE_REISSUE_DELAY", 0.02
+    )
+    monkeypatch.setattr("medre.adapters.meshcore.session._FETCH_ROUND_TIMEOUT", 0.2)
+    calls = 0
+
+    async def get_msg(*, timeout):
+        nonlocal calls
+        calls += 1
+        # A late response frame arrives while this round is outstanding.
+        session._fetch_inbound_seen += 1
+        await asyncio.sleep(0)
+        return event(EventType.ERROR, {"reason": "no_event_received"})
+
+    session = session_with_fetch(get_msg)
+    session._start_receive_pump()
+    try:
+        # Inbound activity resets the silent streak every round, so the pump
+        # keeps re-issuing well past the silent park bound.
+        assert await wait_until(lambda: calls >= 12, timeout=5)
         assert session._diag.connected is True
         assert not session._ensure_recovery_task.called
     finally:

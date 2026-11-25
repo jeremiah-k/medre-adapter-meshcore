@@ -32,12 +32,16 @@ because publication happens in the SDK event callback, which sees every
 inbound frame even when its frame pops after the window. The re-issue rate
 MUST stay bounded: a bounded number of consecutive immediate re-issues,
 after which each further round waits for a notification or a fixed floor
-delay, so a slow link neither spins nor strands its backlog. Repeated idle
-rounds are logged at DEBUG, not as warnings. A reply that is neither a
-message, nor an empty queue, nor an elapsed window — a node ERROR reply, a
-malformed result, a transport-level failure — retires the connection for
-ordinary recovery. Stop and client replacement MUST cancel the old pump
-before disconnecting the SDK.
+delay, so a slow link neither spins nor strands its backlog. Each idle
+round still costs the node a popped message, so a streak of idle rounds
+that brings no inbound traffic at all — a link that is not answering —
+MUST park the pump on its wakeup instead of popping further messages the
+link cannot return; the next notification starts a new drain on the same
+connection. Repeated idle rounds are logged at DEBUG, not as warnings. A
+reply that is neither a message, nor an empty queue, nor an elapsed window
+— a node ERROR reply, a malformed result, a transport-level failure —
+retires the connection for ordinary recovery. Stop and client replacement
+MUST cancel the old pump before disconnecting the SDK.
 
 ## Ingress and evidence
 

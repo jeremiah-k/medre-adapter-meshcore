@@ -8,7 +8,9 @@ after adapter startup, serializes native fetches with sends, and respects
 callback-capacity pressure. A fetch window that elapses with no event is an
 empty window, not a failure: the connection stays and the fetch is re-issued
 at a bounded rate, while a non-message reply other than an elapsed window
-still retires the connection for ordinary recovery. The pump reserves one
+still retires the connection for ordinary recovery. Idle rounds that bring
+no inbound traffic at all park the pump instead of popping further messages
+into a link that is not answering. The pump reserves one
 bounded-admission slot before it fetches; the fetched message's publication
 consumes that slot instead of reserving again, so a message the node has
 already popped is not refused at admission, and a drain that ends without a

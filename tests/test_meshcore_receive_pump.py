@@ -28,6 +28,7 @@ def session_with_fetch(get_msg, capacity=None):
     session._send_lock = asyncio.Lock()
     session._wait_for_receive_capacity = capacity
     session._release_receive_permit = None
+    session._fetch_inbound_seen = 0
     session._fetch_wake = asyncio.Event()
     session._fetch_wake.set()
     session._fetch_task = None
