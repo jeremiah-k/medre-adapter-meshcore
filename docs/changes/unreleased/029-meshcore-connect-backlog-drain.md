@@ -30,3 +30,11 @@ already popped is not refused at admission, and a drain that ends without a
 fetched message gives the slot back. No fixed queue-depth assumption is
 needed. The SDK event decoder remains the only publication path. This is
 queue retrieval, not an exactly-once or durable delivery guarantee.
+At connect time the pinned SDK fetches nothing — its handshake only sends
+APP_START — so the pump's initial wakeup is the only connect-time fetch, and
+no SDK option is needed to keep it that way. Over BLE, a warm reconnect
+after an unclean drop can make the host Bluetooth stack deliver every
+notification twice; each duplicate resolves one fetch round against a queue
+that pops in node order, costs no extra pop, and is collapsed to one stored
+event by the adapter's ingress deduplication. Absorbing that host-stack
+artefact is queue retrieval, not an exactly-once promise.

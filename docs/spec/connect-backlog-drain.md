@@ -24,6 +24,25 @@ requests. There is no guessed backlog depth or startup drain deadline. Each
 request has its own timeout and is serialized with sends; only one fetch runs
 at a time, and the next is issued only after the previous one returned.
 
+At connect time the pinned SDK itself fetches nothing: its connect handshake
+only starts the event dispatcher, opens the transport, and sends APP_START.
+The pump's initial wakeup is therefore the only connect-time fetch, and the
+SDK auto-fetch worker is never started on SDKs that expose the explicit
+notification API. Over BLE, a warm reconnect after an unclean drop can make
+the host Bluetooth stack deliver every notification twice (observed on
+BlueZ: two identical deliveries about a millisecond apart). The dropped
+client's notify session survives in the host stack and is re-armed on the
+next connection; the pinned SDK clears such a stale registration only when
+the same connection object reconnects, which this adapter's
+fresh-client-per-connect policy never does, and no public SDK API reaches a
+dropped client's session. A duplicated frame resolves one fetch round, so
+each duplicate costs one extra fetch; every round still pops at most one
+queued message in node order, the extra rounds run against the emptied
+queue and pop nothing, and the drain still ends on the node's NO_MORE_MSGS.
+The adapter's ingress deduplication collapses each duplicated pair to one
+stored event. Absorbing this host-stack artefact is not a delivery promise:
+the destructive pop protocol cannot promise exactly-once across reconnects.
+
 A fetch window that elapses with no event is an empty window: the node had
 nothing ready within it. The SDK reports that state as an ERROR event whose
 payload reason says no event was received (or timed out). The pump MUST
