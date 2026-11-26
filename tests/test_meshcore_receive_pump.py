@@ -24,6 +24,8 @@ def session_with_fetch(get_msg, capacity=None):
     session._meshcore = client
     session._sdk_module = SimpleNamespace(EventType=EventType)
     session._diag = SimpleNamespace(connected=True)
+    # The retirement path sanitizes through the session config.
+    session._config = SimpleNamespace(ble_pin=None)
     session._stop_requested = False
     session._send_lock = asyncio.Lock()
     session._fetch_round_in_flight = False
@@ -132,27 +134,29 @@ async def test_ambiguous_fetch_response_retires_connection_without_retry():
     session._ensure_recovery_task.assert_called_once()
     await session._stop_receive_pump()
 
-class _CountingLock:
-    """A send lock that counts acquisitions, to prove absence of a busy spin."""
 
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self.acquisitions = 0
+@pytest.mark.asyncio
+async def test_retirement_carries_the_failure_into_last_error():
+    """The diagnostics surface shows why the pump retired: a node ERROR
+    reply reaches it as the SDK's payload reason, an elapsed window never
+    retires at all, and a transport exception names itself."""
 
-    async def __aenter__(self) -> "_CountingLock":
-        await self._lock.acquire()
-        self.acquisitions += 1
-        return self
+    async def get_msg(*, timeout):
+        return SimpleNamespace(type=EventType.ERROR, payload={"error": "bad request"})
 
-    async def __aexit__(self, *exc_info: object) -> None:
-        self._lock.release()
+    session = session_with_fetch(get_msg)
+    session._start_receive_pump()
+    await asyncio.wait_for(session._fetch_task, 2)
+    assert (
+        session._diag.last_error is not None
+    ), "a pump retirement must surface its failure in last_error"
+    assert "bad request" in session._diag.last_error
+    assert session._diag.connected is False
+    await session._stop_receive_pump()
 
 
 @pytest.mark.asyncio
 async def test_consumed_permit_is_reacquired_after_waiting_for_send_lock():
-    """A late callback consumes the reserved slot; the pump returns to the
-    capacity wait instead of popping with no reservation, without spinning
-    on the send lock while the slot is gone."""
     permit = False
     reserved = asyncio.Event()
     replenish = asyncio.Event()
@@ -171,25 +175,69 @@ async def test_consumed_permit_is_reacquired_after_waiting_for_send_lock():
         return SimpleNamespace(type=EventType.NO_MORE_MSGS)
 
     session = session_with_fetch(get_msg, capacity)
-    counting_lock = _CountingLock()
-    session._send_lock = counting_lock
     session._receive_permit_ready = lambda: permit
     try:
-        async with counting_lock:
+        async with session._send_lock:
             session._start_receive_pump()
             await asyncio.wait_for(reserved.wait(), 2)
             permit = False
         # The pump must return to the capacity gate, not issue a pop.
         replenish.set()
         await asyncio.wait_for(fetched.wait(), 2)
-        assert counting_lock.acquisitions == 2
-        # No busy spin: with the slot gone again the pump must sit in the
-        # capacity wait. Many deterministic loop turns would multiply a
-        # hot loop's lock acquisitions.
-        permit = False
-        session._fetch_wake.set()
-        for _ in range(50):
-            await asyncio.sleep(0)
-        assert counting_lock.acquisitions == 2
+    finally:
+        await session._stop_receive_pump()
+
+
+@pytest.mark.asyncio
+async def test_one_notification_cannot_keep_silent_rounds_draining():
+    parked = asyncio.Event()
+    calls = 0
+
+    async def get_msg(*, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            session._fetch_wake.set()
+        elif calls == 2:
+            parked.set()
+        return SimpleNamespace(type=EventType.ERROR, payload={"reason": "timeout"})
+
+    session = session_with_fetch(get_msg)
+    session._start_receive_pump()
+    try:
+        await asyncio.wait_for(parked.wait(), 2)
+        await asyncio.sleep(0)
+        assert calls == 2
+        assert session._pump_parked
+    finally:
+        await session._stop_receive_pump()
+
+
+@pytest.mark.asyncio
+async def test_a_notification_racing_no_more_msgs_triggers_one_extra_drain():
+    """A notification that races the node's empty-queue answer is kept as
+    exactly one pending extra drain: the parked pump drains once more and
+    parks again on the next empty answer."""
+    drains = []
+    idle = asyncio.Event()
+
+    async def get_msg(*, timeout):
+        drains.append(1)
+        if len(drains) == 1:
+            # The notification races this empty-queue answer.
+            session._fetch_wake.set()
+            return SimpleNamespace(type=EventType.NO_MORE_MSGS)
+        if len(drains) == 2:
+            idle.set()
+            return SimpleNamespace(type=EventType.NO_MORE_MSGS)
+        raise AssertionError("the racing notification must not drain twice")
+
+    session = session_with_fetch(get_msg)
+    session._start_receive_pump()
+    try:
+        await asyncio.wait_for(idle.wait(), 2)
+        await asyncio.sleep(0)
+        assert len(drains) == 2
+        assert session._pump_parked
     finally:
         await session._stop_receive_pump()

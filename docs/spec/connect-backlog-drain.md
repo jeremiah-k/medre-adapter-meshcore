@@ -44,23 +44,37 @@ stored event. Absorbing this host-stack artefact is not a delivery promise:
 the destructive pop protocol cannot promise exactly-once across reconnects.
 
 A fetch window that elapses with no event is an empty window: the node had
-nothing ready within it. The SDK reports that state as an ERROR event whose
-payload reason says no event was received (or timed out). The pump MUST
-treat such a round as idle — keep the connection and re-issue the fetch —
-because publication happens in the SDK event callback, which sees every
-inbound frame even when its frame pops after the window. The re-issue rate
-MUST stay bounded: a bounded number of consecutive immediate re-issues,
-after which each further round waits for a notification or a fixed floor
-delay, so a slow link neither spins nor strands its backlog. Each idle
-round still costs the node a popped message, so a streak of idle rounds
-that brings no inbound traffic at all — a link that is not answering —
-MUST park the pump on its wakeup instead of popping further messages the
-link cannot return; the next notification starts a new drain on the same
-connection. Repeated idle rounds are logged at DEBUG, not as warnings. A
-reply that is neither a message, nor an empty queue, nor an elapsed window
-— a node ERROR reply, a malformed result, a transport-level failure —
-retires the connection for ordinary recovery. Stop and client replacement
-MUST cancel the old pump before disconnecting the SDK.
+nothing ready within it, or it popped a message whose frame did not arrive
+in time. The SDK reports that state as an ERROR event whose payload reason
+says no event was received (or timed out). A frame that pops after the
+window still publishes through the SDK event callback, which sees every
+direct-message and channel-text frame the connection delivers — counted
+whether or not the frame publishes; frames the callback is not subscribed
+to, such as binary channel data or device replies, count as nothing — and
+that callback wakes the pump, so a slow-but-delivering link resumes its
+interrupted drain on the same connection, with no loss and no reconnect.
+A window
+that elapses while inbound traffic is still arriving — a late frame, or a
+notification — means the link is delivering, however slowly: the pump
+keeps the connection and re-issues the fetch, and the re-issue rate MUST
+stay bounded — a bounded number of consecutive immediate re-issues, after
+which each further round waits for a notification or a fixed floor delay —
+so a slow link neither spins nor strands its backlog. Each
+MESSAGES_WAITING notification is liveness evidence for at most one
+elapsed round: it is consumed for pacing once, and a notification that
+races the node's NO_MORE_MSGS answer triggers exactly one extra drain
+before the pump parks again. A window that
+elapses with no inbound traffic at all MUST park the pump at once: the
+node's fetch is a destructive pop, so the window may have ended because
+the node popped a message whose frame was lost, and every further fetch
+would pop another message into a link that is not returning what it pops.
+The reserved capacity permit is released, as any interrupted drain's is,
+and the silent round stays recorded, so a transport loss behind it is
+recognised as unclean. Repeated elapsed windows are logged at DEBUG, not
+as warnings. A reply that is neither a message, nor an empty queue, nor an
+elapsed window — a node ERROR reply, a malformed result, a transport-level
+failure — retires the connection for ordinary recovery. Stop and client
+replacement MUST cancel the old pump before disconnecting the SDK.
 
 A parked wait is bounded. A link can die silently — the peer vanishes
 without a FIN or RST reaching us — so no fetch ever fails and no
@@ -74,7 +88,14 @@ reply can never be mistaken for fetched traffic. The first probe follows
 the park after a fixed internal interval, and the probe repeats at that
 cadence while the quiet continues; the interval equals the pinned SDK's
 own default command timeout, so a slow-but-alive node still answers inside
-one probe budget and is not probed to death. Exactly one probe runs at a
+one probe budget and is not probed to death. An answered probe also
+re-arms an interrupted drain: while the pump stays parked because the last
+drain ended on an elapsed window rather than the node's NO_MORE_MSGS, one
+answered probe issues exactly one fetch; if that fetch's window elapses
+with no inbound traffic the pump parks again, and the next answered probe
+re-arms it again. A drain that ended with NO_MORE_MSGS is complete: an
+answered probe issues nothing for it — the notification does. Exactly one
+probe runs at a
 time, under the same lock as fetches and sends — the SDK correlates
 responses by event type, not request identity — and never while a fetch is
 outstanding. A probe that goes unanswered (the SDK's own elapsed-wait
@@ -111,12 +132,25 @@ unanswered, so nothing was popped into the dead link — fetch immediately,
 with no probe. An SDK without the
 device query cannot be gated and keeps the immediate-fetch behaviour.
 
-The gate bounds loss on a link that delivers nothing. It cannot bound loss
-on a link that answers the probe and then swallows a message frame: such a
-link consumes at most one queued message per reconnect attempt, and
-recovery stays active, so the loss continues for as long as that link
-persists. No exchange short of popping a message can tell that link from a
-healthy one.
+The gate bounds loss on a link that delivers nothing, and the elapsed-
+window rule bounds loss on a link that answers the probe and then swallows
+message frames: such a link consumes at most one queued message per probe
+interval (about fifteen seconds) for as long as it persists, and recovery
+stays active. The bound assumes the link returns no direct-message or
+channel-text frame: replies of any other kind — device answers, binary
+channel data, node errors — never count as inbound traffic, so a link
+that swallows message frames while answering anything else stays silent
+to the park rule and re-arms at most one fetch per answered probe. A
+silence the connection survives resumes an interrupted drain within one
+probe interval of the park, plus one probe budget for the answer. A
+longer silence retires the connection; the reconnect backoff then runs
+from its base doubling to its cap under bounded jitter — one to thirty
+seconds on TCP and serial, ten seconds to five minutes on BLE — each
+attempt bounded by its connect timeout, and a link that recovers resumes
+at the first successful redial, so recovery timing is dominated by that
+backoff when the silence covers the disconnect. No exchange short of
+popping a message can tell such a link from a healthy one at the moment
+the fetch is issued; that is a loss bound, not a delivery promise.
 
 ## Ingress and evidence
 

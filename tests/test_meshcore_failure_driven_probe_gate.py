@@ -83,7 +83,6 @@ def fast_gate(monkeypatch) -> None:
         "medre.adapters.meshcore.session._FETCH_IDLE_REISSUE_DELAY", 0.01
     )
     monkeypatch.setattr("medre.adapters.meshcore.session._FETCH_ROUND_TIMEOUT", 0.2)
-    monkeypatch.setattr("medre.adapters.meshcore.session._FETCH_IDLE_SILENT_ROUNDS", 2)
     monkeypatch.setattr(
         "medre.adapters.meshcore.session._PROBE_IDLE_INTERVAL", 0.05, raising=False
     )

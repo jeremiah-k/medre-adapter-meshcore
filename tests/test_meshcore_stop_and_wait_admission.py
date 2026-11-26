@@ -285,9 +285,7 @@ async def test_a_never_admissible_event_releases_the_drain():
         # not a retry of the refused one.
         await asyncio.wait_for(gate(), 2)
         adapter._on_message(_packet(1))
-        await asyncio.wait_for(
-            asyncio.gather(*tuple(adapter._background_tasks)), 2
-        )
+        await asyncio.wait_for(asyncio.gather(*tuple(adapter._background_tasks)), 2)
         assert len(attempts) == 2
         assert attempts[0] is not attempts[1]
         assert not adapter._pump_publication_outstanding
@@ -370,9 +368,7 @@ async def test_stale_publication_completion_keeps_a_newer_owners_entry():
         adapter._retire_pending_publication(key, stale_token)
         assert adapter._pending_dedup_publications[key][0] is new_token
         hold.set()
-        await asyncio.wait_for(
-            asyncio.gather(*tuple(adapter._background_tasks)), 2
-        )
+        await asyncio.wait_for(asyncio.gather(*tuple(adapter._background_tasks)), 2)
         assert adapter._pending_dedup_publications[key][0] is new_token
         assert len(adapter._pending_dedup_publications) == 1
     finally:
@@ -409,9 +405,7 @@ async def test_an_evicted_identity_still_promotes_from_the_pending_map():
         assert adapter._pump_publication_outstanding is True
         assert len(attempts) == 1
         hold.set()
-        await asyncio.wait_for(
-            asyncio.gather(*tuple(adapter._background_tasks)), 2
-        )
+        await asyncio.wait_for(asyncio.gather(*tuple(adapter._background_tasks)), 2)
         assert key not in adapter._pending_dedup_publications
         assert len(adapter._pending_dedup_publications) == 0
     finally:

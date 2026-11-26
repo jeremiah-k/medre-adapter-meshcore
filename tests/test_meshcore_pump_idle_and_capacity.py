@@ -1,9 +1,15 @@
 """Receive-pump idle fetches and the pump's inbound-capacity permit.
 
-An SDK fetch window that elapses with no event is idle, not a failure: the
-pump keeps the connection and re-issues the fetch at a bounded rate, because
-publication happens in the SDK event callback whenever the frame actually
-arrives. Only a real transport or protocol failure retires the connection.
+The node's fetch is a destructive pop, so a fetch window that elapses with
+no inbound traffic parks the pump at once: the window may have ended
+because the node popped a message whose frame was lost, and re-issuing
+would pop another message into a link that is not returning what it pops.
+A window that elapses while traffic is still arriving — a late frame, or a
+notification — means the link is slow but delivering: the pump keeps the
+connection and re-issues at a bounded rate. A frame that pops after its
+window publishes through the SDK event callback, which wakes the pump, so
+a slow link resumes its interrupted drain on the same connection. Only a
+real transport or protocol failure retires the connection.
 
 The pump holds at most one inbound-capacity permit, acquired before it
 issues a fetch; the fetched message's publication consumes the permit
@@ -12,8 +18,9 @@ refused at admission. A drain that ends without a fetched message releases
 the permit.
 
 Deterministic SDK-shape tests: no network, no hardware, no fixed sleeps —
-condition-based waiting only. The idle/permit tests fail against the
-previous retire-on-timeout, reserve-at-publication behaviour.
+condition-based waiting only. The idle/permit tests pin the empty-window
+park rule and the one-permit-per-fetched-message accounting, including the
+popped-but-not-relayed channel-data round.
 """
 
 from __future__ import annotations
@@ -50,11 +57,15 @@ def session_with_fetch(get_msg, capacity=None, release=None):
     session._meshcore = client
     session._sdk_module = SimpleNamespace(EventType=EventType)
     session._diag = SimpleNamespace(connected=True)
+    # The retirement path sanitizes through the session config.
+    session._config = SimpleNamespace(ble_pin=None)
     session._stop_requested = False
     session._send_lock = asyncio.Lock()
     session._fetch_round_in_flight = False
     session._pump_silent_rounds = 0
+    session._pump_drain_incomplete = False
     session._receive_failure_pending = False
+    session._message_callback = None
     session._wait_for_receive_capacity = capacity
     session._release_receive_permit = release
     session._fetch_inbound_seen = 0
@@ -69,33 +80,54 @@ def session_with_fetch(get_msg, capacity=None, release=None):
 
 
 # ===================================================================
-# D1: an idle fetch window keeps the connection and re-issues.
+# D1: an elapsed window with no traffic parks at once; a late frame
+# (or a notification) resumes the drain on the same connection.
 # ===================================================================
 
 
-async def test_fetch_timeout_reissues_on_the_same_connection() -> None:
-    """An elapsed fetch window re-issues the fetch without retiring."""
+async def test_late_frame_after_an_elapsed_window_wakes_the_pump(monkeypatch) -> None:
+    """A frame that pops after its window wakes the parked pump."""
+    monkeypatch.setattr(
+        "medre.adapters.meshcore.session._PROBE_IDLE_INTERVAL", 0.05, raising=False
+    )
     seen: list[Enum] = []
     drained = asyncio.Event()
-    responses = iter(
-        [
-            event(EventType.ERROR, {"reason": "no_event_received"}),
-            event(EventType.CONTACT_MSG_RECV),
-            event(EventType.NO_MORE_MSGS),
-        ]
-    )
+    late_frame_published = asyncio.Event()
 
     async def get_msg(*, timeout):
         assert timeout > 0
-        response = next(responses)
-        seen.append(response.type)
-        if response.type is EventType.NO_MORE_MSGS:
+        if not seen:
+            # The node popped a message and sent it; the frame arrives
+            # after this window closes, so the round ends empty.
+            response = event(EventType.ERROR, {"reason": "no_event_received"})
+        elif len(seen) == 1:
+            # The next destructive pop must wait until the late frame was
+            # actually published: fetching earlier would pop again into a
+            # link that has not returned anything yet.
+            assert (
+                late_frame_published.is_set()
+            ), "fetched again before the late frame arrived"
+            response = event(EventType.CONTACT_MSG_RECV)
+        else:
+            response = event(EventType.NO_MORE_MSGS)
             drained.set()
+        seen.append(response.type)
         return response
 
     session = session_with_fetch(get_msg)
     session._start_receive_pump()
     try:
+        # The elapsed window parks the pump: no further fetch follows it.
+        assert await wait_until(lambda: len(seen) == 1, timeout=2)
+        for _ in range(5):
+            await asyncio.sleep(0.02)
+        assert (
+            len(seen) == 1
+        ), "an elapsed window with no inbound traffic must park, not re-issue"
+        # The frame pops after its window and publishes through the event
+        # callback — which wakes the pump.
+        late_frame_published.set()
+        await session._on_sdk_event(event(EventType.CONTACT_MSG_RECV, {"text": "late"}))
         assert await wait_until(drained.is_set, timeout=2)
         assert seen == [
             EventType.ERROR,
@@ -109,12 +141,13 @@ async def test_fetch_timeout_reissues_on_the_same_connection() -> None:
         await session._stop_receive_pump()
 
 
-async def test_repeated_idle_fetches_stay_bounded_and_connected(monkeypatch) -> None:
-    """Idle rounds re-issue at a bounded rate, then park; the connection stays."""
+async def test_elapsed_window_without_traffic_parks_until_traffic_or_a_wake(
+    monkeypatch,
+) -> None:
+    """One empty window parks the pump: no fetch follows until traffic comes."""
     monkeypatch.setattr(
-        "medre.adapters.meshcore.session._FETCH_IDLE_REISSUE_DELAY", 0.05
+        "medre.adapters.meshcore.session._PROBE_IDLE_INTERVAL", 0.05, raising=False
     )
-    monkeypatch.setattr("medre.adapters.meshcore.session._FETCH_ROUND_TIMEOUT", 0.2)
     calls = 0
 
     async def get_msg(*, timeout):
@@ -122,24 +155,26 @@ async def test_repeated_idle_fetches_stay_bounded_and_connected(monkeypatch) -> 
         calls += 1
         return event(EventType.ERROR, {"reason": "no_event_received"})
 
+    # No device query: nothing can answer a probe, so nothing may fetch.
     session = session_with_fetch(get_msg)
     session._start_receive_pump()
     try:
-        # The initial round plus the immediate re-issues run without waiting.
-        assert await wait_until(lambda: calls >= 3, timeout=2)
-        # Pacing is a floor, not a stall: the pump re-issues after it, but a
-        # silent streak parks the pump after a bounded number of rounds
-        # (initial + two immediate + the paced rounds reaching the bound).
-        assert await wait_until(lambda: calls >= 4, timeout=2)
-        for _ in range(5):
+        assert await wait_until(lambda: calls >= 1, timeout=2)
+        for _ in range(6):
             await asyncio.sleep(0.05)
-        assert calls == 4, "silent idle rounds must park, not pop forever"
+        assert (
+            calls == 1
+        ), "an elapsed window with no inbound traffic must park the pump at once"
         # Idleness never retires the connection.
         assert session._diag.connected is True
         assert not session._ensure_recovery_task.called
-        # A fresh notification starts a new drain on the same connection.
+        # A fresh notification starts a new drain on the same connection:
+        # one more fetch, whose empty window parks the pump again.
         session._fetch_wake.set()
-        assert await wait_until(lambda: calls >= 5, timeout=2)
+        assert await wait_until(lambda: calls == 2, timeout=2)
+        for _ in range(4):
+            await asyncio.sleep(0.05)
+        assert calls == 2, "the next empty window parks again"
         assert session._diag.connected is True
     finally:
         await session._stop_receive_pump()
@@ -245,6 +280,48 @@ async def test_ambiguous_fetch_response_releases_its_permit_before_retiring() ->
     release.assert_called_once()
     assert session._diag.connected is False
     await session._stop_receive_pump()
+
+
+async def test_a_notification_during_a_drain_drives_one_extra_round_after_no_more(
+    monkeypatch,
+) -> None:
+    """A wake that lands mid-drain survives the drain's NO_MORE round as
+    exactly one extra, bounded round against the emptied queue."""
+    monkeypatch.setattr(
+        "medre.adapters.meshcore.session._PROBE_IDLE_INTERVAL", 0.05, raising=False
+    )
+    calls = 0
+
+    async def get_msg(*, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # A fetched message: the drain keeps going.
+            return event(EventType.CONTACT_MSG_RECV)
+        if calls == 2:
+            # The notification arrives while this round is outstanding;
+            # the wake survives the round's NO_MORE_MSGS answer.
+            session._fetch_wake.set()
+        return event(EventType.NO_MORE_MSGS)
+
+    session = session_with_fetch(get_msg)
+    session._start_receive_pump()
+    try:
+        assert await wait_until(lambda: calls >= 3, timeout=2)
+        for _ in range(5):
+            await asyncio.sleep(0.02)
+        assert calls == 3, (
+            "a mid-drain notification costs exactly one extra empty round, "
+            f"not an unbounded sequence (saw {calls})"
+        )
+        # The extra round ended on NO_MORE_MSGS: the pump is parked, the
+        # connection is intact, and nothing was treated as a failure.
+        assert session._pump_parked is True
+        assert session._pump_drain_incomplete is False
+        assert session._diag.connected is True
+        assert not session._ensure_recovery_task.called
+    finally:
+        await session._stop_receive_pump()
 
 
 # ===================================================================

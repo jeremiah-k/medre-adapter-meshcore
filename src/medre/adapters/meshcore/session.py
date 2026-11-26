@@ -156,24 +156,20 @@ _BLE_CONNECT_ATTEMPT_TIMEOUT: float = 45.0  # includes BlueZ cleanup and discove
 # deep; it does not extend the startup deadline or require a guessed queue cap.
 _FETCH_ROUND_TIMEOUT: float = 2.0
 
-# A fetch window that elapses with no event means the node had nothing ready
-# within the window: idle, not a failure. The pump keeps the connection and
-# re-issues the fetch, because publication happens in the SDK event callback
-# whenever the frame actually arrives, even if it pops after the window. The
-# re-issue rate stays bounded: at most _FETCH_IDLE_IMMEDIATE_REISSUES
-# consecutive immediate re-issues, after which each further re-issue waits
-# for a notification or _FETCH_IDLE_REISSUE_DELAY, whichever comes first.
+# A fetch window that elapses with no inbound traffic at all parks the pump
+# at once: the node's fetch is a destructive pop, so the window may have
+# ended because it popped a message whose frame was lost, and re-issuing
+# would pop another message into a link that is not returning what it pops.
+# A window that elapses while inbound traffic is still arriving — a late
+# frame, or a notification — means the link is slow but delivering: the
+# pump keeps the connection and re-issues, because publication happens in
+# the SDK event callback whenever the frame actually arrives, even if it
+# pops after the window. That re-issue rate stays bounded: at most
+# _FETCH_IDLE_IMMEDIATE_REISSUES consecutive immediate re-issues, after
+# which each further re-issue waits for a notification or
+# _FETCH_IDLE_REISSUE_DELAY, whichever comes first.
 _FETCH_IDLE_IMMEDIATE_REISSUES: int = 2
 _FETCH_IDLE_REISSUE_DELAY: float = 2.0
-
-# An idle round still costs the node a popped message. While frames keep
-# arriving (late responses prove the link is slow but alive) re-issuing
-# drains the backlog; when _FETCH_IDLE_SILENT_ROUNDS consecutive idle rounds
-# bring no inbound traffic at all, the stream is not answering — re-issuing
-# would pop messages into a link that cannot return them. The pump parks on
-# its wakeup instead and keeps the connection; the next MESSAGES_WAITING
-# notification (or any fresh wakeup) starts a new drain.
-_FETCH_IDLE_SILENT_ROUNDS: int = 4
 
 # A parked wait never expires on its own, so a link that died silently —
 # the peer vanished without FIN/RST — would hold the pump parked and the
@@ -350,6 +346,7 @@ class MeshCoreSession:
         on_connection_change: Callable[[bool], None] | None = None,
         wait_for_receive_capacity: Callable[[], Awaitable[None]] | None = None,
         release_receive_permit: Callable[[], None] | None = None,
+        receive_permit_ready: Callable[[], bool] | None = None,
     ) -> None:
         self._config = config
         self._adapter_id = adapter_id
@@ -374,6 +371,7 @@ class MeshCoreSession:
         # fetched message's publication consumes it; drains that end
         # without a fetched message release it through this callable.
         self._release_receive_permit = release_receive_permit
+        self._receive_permit_ready = receive_permit_ready
         self._fetch_wake: asyncio.Event | None = None
         self._fetch_task: asyncio.Task[None] | None = None
         # True while a fetch round's destructive pop is outstanding, so a
@@ -387,6 +385,20 @@ class MeshCoreSession:
         # loss on a connection with a nonzero streak is unclean even when
         # no fetch round is in flight at that moment.
         self._pump_silent_rounds: int = 0
+        # True when the last drain on this connection was interrupted by an
+        # elapsed fetch window instead of ending on the node's NO_MORE_MSGS:
+        # the node may still hold queued messages this connection never saw.
+        # An answered idle probe re-arms exactly one fetch for such a drain;
+        # a drain that ended with NO_MORE_MSGS is complete and an answered
+        # probe never fetches for it.
+        self._pump_drain_incomplete: bool = False
+        # True while the pump is parked — waiting for traffic, a
+        # notification, or an answered probe — so a frame publishing
+        # through the event callback wakes it. A frame published while a
+        # drain is running is that drain's business; waking would only
+        # leave a stale wake behind after the drain's final empty-queue
+        # round.
+        self._pump_parked: bool = False
         # A connection that follows a failure-driven retirement — a fetch or
         # probe failure, or an unclean transport loss while a fetch was in
         # flight — must earn the right to fetch: its first probe must be
@@ -1534,20 +1546,26 @@ class MeshCoreSession:
         not by command ID — one fetch runs at a time, and the next fetch is
         issued only after the previous one returned.
 
-        A fetch window that elapses with no event is idle, not a failure: the
-        node had nothing ready inside the window. The connection stays and the
-        fetch is re-issued at a bounded rate; a frame that pops after the
-        window still publishes through the SDK event callback, which sees
-        every inbound frame regardless of which request it answers. While
-        frames keep arriving the drain continues; a streak of idle rounds
-        with no inbound traffic at all means the link is not answering, so
-        the pump parks on its wakeup instead of popping further messages the
-        link cannot return. A parked wait is bounded by the idle-link
-        liveness probe: if nothing wakes the pump within
-        _PROBE_IDLE_INTERVAL, it asks the node one cheap local query; a
-        probe that times out or errors is a silent-dead link and retires the
-        connection. Only a real transport or protocol failure retires the
-        connection.
+        A fetch window that elapses with no inbound traffic parks the pump
+        at once: the node's fetch is a destructive pop, so the window may
+        have ended because the node popped a message whose frame was lost,
+        and every further fetch would pop another message into a link that
+        is not returning what it pops. The reserved capacity permit is
+        released, as any interrupted drain's is, and a frame that pops
+        after the window still publishes through the SDK event callback —
+        which wakes the pump, so a slow-but-delivering link resumes its
+        interrupted drain on the same connection. A window that elapses
+        while inbound traffic is still arriving — a late frame, or a
+        notification — means the link is delivering, however slowly: the
+        pump keeps the connection and re-issues at a bounded rate. A parked
+        wait is bounded by the idle-link liveness probe: if nothing wakes
+        the pump within _PROBE_IDLE_INTERVAL, it asks the node one cheap
+        local query; a probe that times out or errors is a silent-dead link
+        and retires the connection. An answered probe re-arms exactly one
+        fetch for a drain the elapsed window interrupted; a drain that
+        ended with the node's NO_MORE_MSGS is complete and an answered
+        probe never fetches for it. Only a real transport or protocol
+        failure retires the connection.
 
         A connection that follows a failure-driven retirement — its
         predecessor died of a fetch or probe failure, or of a transport loss
@@ -1556,16 +1574,30 @@ class MeshCoreSession:
         server-to-client direction is still broken would swallow one queued
         message per fetch. A fresh start or a reconnect after a clean
         disconnect fetches immediately.
+
+        A binary channel-data frame is popped but never relayed: the
+        adapter publishes text messages only, and the node's FIFO queue
+        must still advance past the frame or every message queued behind
+        it would be stuck. Such a round releases its reserved permit —
+        nothing will publish from the frame — logs one DEBUG line, and
+        continues the drain immediately; the pop is accounted for, so it
+        is never mistaken for lost traffic, and it neither stalls the
+        drain nor retires the connection.
         """
         types = self._sdk_module.EventType
         message_types = {
             types.CONTACT_MSG_RECV,
             types.CHANNEL_MSG_RECV,
         }
-        if hasattr(types, "CHANNEL_DATA_RECV"):
-            message_types.add(types.CHANNEL_DATA_RECV)
+        channel_data_type = getattr(types, "CHANNEL_DATA_RECV", None)
         idle_rounds = 0
-        silent_rounds = 0
+        # A notification is consumed for pacing independently of the
+        # extra drain needed when the empty-queue response races a push.
+        pending_notification = False
+        # A new connection starts with no drain history: nothing has been
+        # interrupted yet.
+        self._pump_drain_incomplete = False
+        self._pump_parked = False
         try:
             if (
                 self._meshcore is client
@@ -1591,16 +1623,18 @@ class MeshCoreSession:
                 and self._diag.connected
                 and not self._stop_requested
             ):
-                await self._await_wake_with_probe(client, wake)
+                if not await self._await_wake_with_probe(client, wake):
+                    break
                 wake.clear()
+                pending_notification = False
                 while (
                     self._meshcore is client
                     and self._diag.connected
                     and not self._stop_requested
                 ):
+                    self._pump_parked = False
                     if self._wait_for_receive_capacity is not None:
                         await self._wait_for_receive_capacity()
-                    inbound_before = self._fetch_inbound_seen
                     async with self._send_lock:
                         if (
                             self._meshcore is not client
@@ -1608,14 +1642,18 @@ class MeshCoreSession:
                             or self._stop_requested
                         ):
                             return
-                        # A late callback can consume this round's reserved
-                        # slot while the pump waits behind a send. Recheck
-                        # without awaiting inside the lock; with the slot
-                        # gone, return to the capacity wait instead of
-                        # issuing a destructive fetch with no reservation.
+                        # A late callback may consume a reserved permit while
+                        # this pump waits behind a send. Recheck without
+                        # awaiting inside the lock; wait for capacity outside.
                         permit_ready = getattr(self, "_receive_permit_ready", None)
                         if permit_ready is not None and not permit_ready():
                             continue
+                        # Keep the pending extra drain but consume each push
+                        # as liveness evidence at most once.
+                        notified = wake.is_set()
+                        pending_notification |= notified
+                        wake.clear()
+                        inbound_before = self._fetch_inbound_seen
                         self._fetch_round_in_flight = True
                         try:
                             async with asyncio.timeout(_FETCH_ROUND_TIMEOUT + 0.5):
@@ -1624,59 +1662,92 @@ class MeshCoreSession:
                                 )
                         finally:
                             self._fetch_round_in_flight = False
+                    notified = notified or wake.is_set()
+                    pending_notification |= notified
+                    wake.clear()
                     if event.type == types.NO_MORE_MSGS:
                         idle_rounds = 0
-                        silent_rounds = 0
                         self._pump_silent_rounds = 0
+                        self._pump_drain_incomplete = False
                         self._release_fetch_permit()
+                        # The drain is complete: the pump is parked until
+                        # the next notification.
+                        self._pump_parked = True
+                        if pending_notification:
+                            wake.set()
                         break
                     if self._fetch_window_elapsed(event, types):
                         idle_rounds += 1
-                        # Late responses arriving between rounds prove the
-                        # link is slow but delivering; a round that brings no
-                        # inbound traffic at all is a silent link. Re-issuing
-                        # forever on a silent link would keep popping
-                        # messages the link cannot return.
-                        if self._fetch_inbound_seen != inbound_before or wake.is_set():
-                            silent_rounds = 0
+                        if self._fetch_inbound_seen != inbound_before or notified:
+                            # Late frames and notifications arriving between
+                            # rounds prove the link is slow but delivering;
+                            # re-issuing at a bounded rate keeps draining it.
                             self._pump_silent_rounds = 0
-                        else:
-                            silent_rounds += 1
-                            # Keep the streak where a disconnect handler can
-                            # see it: rounds like these popped messages the
-                            # link never returned, however the connection
-                            # ends.
-                            self._pump_silent_rounds = silent_rounds
-                        self._logger.debug(
-                            "MeshCoreSession %s: fetch window elapsed with no "
-                            "event (%d consecutive idle round(s), %d silent); "
-                            "re-issuing on the same connection",
-                            self._adapter_id,
-                            idle_rounds,
-                            silent_rounds,
-                        )
-                        if silent_rounds >= _FETCH_IDLE_SILENT_ROUNDS:
-                            self._release_fetch_permit()
-                            idle_rounds = 0
-                            silent_rounds = 0
                             self._logger.debug(
-                                "MeshCoreSession %s: fetch rounds bring no "
-                                "inbound traffic; parking the receive pump "
-                                "until the next notification",
+                                "MeshCoreSession %s: fetch window elapsed with "
+                                "no event, but inbound traffic is arriving "
+                                "(%d consecutive idle round(s)); re-issuing "
+                                "at a bounded rate on the same connection",
                                 self._adapter_id,
+                                idle_rounds,
                             )
-                            break
-                        if idle_rounds > _FETCH_IDLE_IMMEDIATE_REISSUES:
-                            # Pace further re-issues: wait for a notification
-                            # or the floor delay, so a slow link neither spins
-                            # nor strands its backlog.
-                            try:
-                                await asyncio.wait_for(
-                                    wake.wait(),
-                                    timeout=_FETCH_IDLE_REISSUE_DELAY,
-                                )
-                            except asyncio.TimeoutError:
-                                pass
+                            if idle_rounds > _FETCH_IDLE_IMMEDIATE_REISSUES:
+                                # Pace further re-issues: wait for a
+                                # notification or the floor delay, so a slow
+                                # link neither spins nor strands its backlog.
+                                try:
+                                    await asyncio.wait_for(
+                                        wake.wait(),
+                                        timeout=_FETCH_IDLE_REISSUE_DELAY,
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+                            await asyncio.sleep(0)
+                            continue
+                        # No inbound traffic at all: the window may have
+                        # ended because the node popped a message whose
+                        # frame was lost, and every further fetch would pop
+                        # another message into a link that is not returning
+                        # what it pops. Park at once instead. Keep the
+                        # silent round where a disconnect handler can see
+                        # it: this round popped a message the link never
+                        # returned, however the connection ends. Traffic or
+                        # a notification resumes the drain; so does one
+                        # answered liveness probe, because the last drain
+                        # ended without the node's NO_MORE_MSGS.
+                        idle_rounds = 0
+                        self._pump_silent_rounds += 1
+                        self._pump_drain_incomplete = True
+                        self._release_fetch_permit()
+                        # Parked: a frame publishing through the event
+                        # callback now wakes the pump.
+                        self._pump_parked = True
+                        self._logger.debug(
+                            "MeshCoreSession %s: fetch window elapsed with "
+                            "no inbound traffic (%d unanswered round(s)); "
+                            "parking the receive pump until traffic or an "
+                            "answered probe",
+                            self._adapter_id,
+                            self._pump_silent_rounds,
+                        )
+                        break
+                    if event.type is channel_data_type:
+                        # Popped from the node's FIFO queue but never
+                        # relayed: the adapter publishes text messages
+                        # only. Release the round's permit — nothing
+                        # will publish from this frame — and continue
+                        # the drain; one DEBUG line accounts for the
+                        # pop so it cannot be mistaken for lost
+                        # traffic or a failure.
+                        idle_rounds = 0
+                        self._release_fetch_permit()
+                        self._logger.debug(
+                            "MeshCoreSession %s: fetched a binary "
+                            "channel-data frame; not relayed, the "
+                            "round's admission permit is released and "
+                            "the drain continues",
+                            self._adapter_id,
+                        )
                         await asyncio.sleep(0)
                         continue
                     if event.type not in message_types:
@@ -1686,7 +1757,6 @@ class MeshCoreSession:
                             " instead of a message or empty queue"
                         )
                     idle_rounds = 0
-                    silent_rounds = 0
                     # Publication stays in the SDK event callback; yield to
                     # its dispatcher and to pending sends before fetching again.
                     await asyncio.sleep(0)
@@ -1704,6 +1774,11 @@ class MeshCoreSession:
                     type(exc).__name__,
                     exc,
                 )
+                # The diagnostics surface carries why the pump retired:
+                # a fetch or probe failure names the SDK's ERROR payload
+                # reason in its message, a transport exception names
+                # itself.
+                self._diag.last_error = self._sanitize_ble_exc(exc)
                 # The retirement is failure-driven (a fetch or probe
                 # failed): the next connection must prove the link
                 # answers before its first fetch.
@@ -1713,15 +1788,26 @@ class MeshCoreSession:
         finally:
             self._release_fetch_permit()
 
-    async def _await_wake_with_probe(self, client: Any, wake: asyncio.Event) -> None:
+    async def _await_wake_with_probe(self, client: Any, wake: asyncio.Event) -> bool:
         """Wait for the pump's wakeup, probing the idle link when it is quiet.
 
-        A parked pump used to wait for the next notification forever, so a
-        link that died silently looked connected forever. This wait expires
-        into one liveness probe every ``_PROBE_IDLE_INTERVAL`` while the
-        quiet continues; a failed probe raises so the pump's ordinary retire
-        path — the same handler a fetch failure uses — runs the existing
-        recovery loop.
+        A parked wait never expires on its own, so a link that died
+        silently would hold the pump parked while the session looks
+        connected. This wait expires into one liveness probe every
+        ``_PROBE_IDLE_INTERVAL`` while the quiet continues; a failed probe
+        raises so the pump's ordinary retire path — the same handler a
+        fetch failure uses — runs the existing recovery loop. An answered
+        probe proves the link delivers, so it
+        re-arms exactly one fetch for a drain an elapsed window interrupted
+        (``_pump_drain_incomplete``): if the re-armed fetch's window elapses
+        with no traffic the pump parks again, and the next answered probe
+        re-arms it again. A drain that ended with the node's NO_MORE_MSGS is
+        complete; an answered probe never fetches for it — the notification
+        does.
+
+        Returns ``True`` when the pump may issue a fetch now — the wake
+        fired, or an answered probe re-armed an interrupted drain — and
+        ``False`` when the connection ended.
         """
         while (
             self._meshcore is client
@@ -1729,15 +1815,18 @@ class MeshCoreSession:
             and not self._stop_requested
         ):
             if wake.is_set():
-                return
+                return True
             try:
                 await asyncio.wait_for(wake.wait(), timeout=_PROBE_IDLE_INTERVAL)
-                return
+                return True
             except TimeoutError:
                 pass
-            await self._probe_idle_link(client)
+            answered = await self._probe_idle_link(client)
+            if answered and self._pump_drain_incomplete:
+                return True
+        return False
 
-    async def _probe_idle_link(self, client: Any) -> None:
+    async def _probe_idle_link(self, client: Any) -> bool:
         """Confirm a parked link (or an unproven reconnect) still answers.
 
         The pinned SDK's device query is answered by the companion over the
@@ -1753,26 +1842,31 @@ class MeshCoreSession:
         silent-dead link: raise so the pump's existing retire path runs.
         A reply the node itself sent — a ``DEVICE_INFO`` answer, the
         wire's numeric error frame, or bytes that arrived but failed to
-        parse — proves the link is alive and leaves the connection
-        alone — and clears the failure-driven gate, so a
-        reconnect that followed a failure may fetch.
- Stop, retire, and reconnect cancel the probe with
-        the pump task, and the SDK unsubscribes the waiter on
-        cancellation, so a late reply matches no subscription.
+        parse — proves the link is alive and leaves the connection alone
+        — and clears the failure-driven gate, so a reconnect that
+        followed a failure may fetch. Stop, retire, and reconnect cancel
+        the probe with the pump task, and the SDK unsubscribes the
+        waiter on cancellation, so a late reply matches no subscription.
+
+        Returns ``True`` when a probe ran and a reply that is neither an
+        elapsed wait nor a local send failure came back — the link is
+        proven to deliver — and ``False`` when no probe ran (the SDK has
+        no device query, or the connection ended first), so the caller
+        must not treat quiet as an answer.
         """
         device_query = getattr(client.commands, "send_device_query", None)
         if device_query is None:
             # Without the SDK's local query there is nothing safe to probe
             # with; the wait repeats without a probe and cannot retire a
             # silent link.
-            return
+            return False
         async with self._send_lock:
             if (
                 self._meshcore is not client
                 or not self._diag.connected
                 or self._stop_requested
             ):
-                return
+                return False
             self._logger.debug(
                 "MeshCoreSession %s: probing the idle receive link",
                 self._adapter_id,
@@ -1798,7 +1892,8 @@ class MeshCoreSession:
         # int under "error_code" (the wire's error frame), and bytes
         # that arrived but failed to parse carry a non-elapsed reason.
         # Only an elapsed wait or a local failure to send means no reply
-        # came from the node; any other reply proves the link is alive.
+        # came from the node; any other reply proves the link is alive
+        # and clears the failure-driven gate.
         if result_type == types.ERROR and (
             reason in _PROBE_UNANSWERED_REASONS
             or (
@@ -1810,6 +1905,13 @@ class MeshCoreSession:
         ):
             raise RuntimeError(f"idle-link liveness probe unanswered ({reason})")
         self._receive_failure_pending = False
+        self._logger.debug(
+            "MeshCoreSession %s: idle-link probe answered %s; the link is alive",
+            self._adapter_id,
+            self._fetch_outcome_detail(result, types),
+        )
+        return True
+
     @staticmethod
     def _fetch_window_elapsed(event: Any, types: Any) -> bool:
         """Report whether the fetch returned because the window was idle.
@@ -1986,6 +2088,16 @@ class MeshCoreSession:
         # The receive pump counts these deliveries to tell an idle-but-
         # delivering link from a silent one; bump before any early exit.
         self._fetch_inbound_seen += 1
+        # A frame that pops after its fetch window has elapsed still
+        # publishes here — and it proves the link delivers, so it wakes a
+        # parked pump: a slow-but-delivering link then resumes its
+        # interrupted drain on the same connection instead of waiting for
+        # a new notification. A frame published while a drain is running
+        # sets no wake: that drain fetches again anyway, and a wake set
+        # now would only survive as a stale one after the drain's final
+        # empty-queue round.
+        if self._pump_parked and self._fetch_wake is not None:
+            self._fetch_wake.set()
 
         if self._message_callback is None:
             return

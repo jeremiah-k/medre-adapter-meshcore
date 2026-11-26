@@ -1,32 +1,36 @@
 """Idle-link liveness probes for the parked receive pump.
 
 A silently dead link — a peer that vanishes without FIN/RST — never fails a
-fetch: the pump parks after its silent idle rounds and the session looks
+fetch: the pump parks after an empty fetch window and the session looks
 connected forever. While the pump would otherwise sit parked, it MUST
 periodically confirm the node is still reachable with a cheap local query
 (the SDK device query, whose DEVICE_INFO reply cannot be confused with a
 message event). A probe that goes unanswered is a transport failure:
 the connection retires through the pump's ordinary retire path, which runs
-the existing recovery loop exactly once. Only an elapsed-wait report or a
-local failure to send is a silent-dead link; a reply the node itself sent —
-a DEVICE_INFO answer, the wire's numeric error frame, or bytes that arrived
-but failed to parse — proves the link is alive and never retires.
+the existing recovery loop exactly once. A reply of any kind — including an
+error the node itself sends — proves the link is alive and never retires.
+
+An answered probe also re-arms exactly one fetch for a drain that an
+elapsed window interrupted: the node may still hold messages that drain
+never saw, so a link that recovers resumes within one probe interval, and
+a link that answers probes while swallowing message frames consumes at
+most one message per probe interval. A drain that ended with
+NO_MORE_MSGS is complete; an answered probe never fetches for it.
 
 One probe runs at a time, never concurrent with a fetch, serialized with
 sends on the session's send lock. Stop, retire and reconnect cancel the
 probe with the pump; a late probe reply matches no subscription.
 
 Deterministic SDK-shape tests: no network, no hardware, no fixed sleeps —
-condition-based waiting only. The probe tests fail against the previous
-park-forever behaviour, which never sent any probe.
+condition-based waiting only. The probe tests pin the probe cadence, the
+retirement of an unanswered link, the one-fetch re-arm of an answered
+probe, and the never-counted device reply.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-
-import pytest
 from enum import Enum, auto
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -56,6 +60,8 @@ def session_with_fetch(get_msg, device_query=None, release=None):
     session._meshcore = client
     session._sdk_module = SimpleNamespace(EventType=EventType)
     session._diag = SimpleNamespace(connected=True)
+    # The retirement path sanitizes through the session config.
+    session._config = SimpleNamespace(ble_pin=None)
     session._stop_requested = False
     session._send_lock = asyncio.Lock()
     session._fetch_round_in_flight = False
@@ -176,11 +182,9 @@ async def test_node_error_reply_to_the_probe_keeps_the_link(monkeypatch) -> None
     async def send_device_query():
         nonlocal probe_calls
         probe_calls += 1
-        # The node answers, but does not implement this query: the wire's
-        # ERROR frame carries a numeric code, which the SDK reports under
-        # "error_code" — never an elapsed-wait reason, never the string
-        # the SDK itself uses for a local send failure.
-        return event(EventType.ERROR, {"error_code": 2, "code_string": "err"})
+        # The node answers, but does not implement this query: the SDK
+        # reports the node's own error code, not an elapsed-wait reason.
+        return event(EventType.ERROR, {"error": 2})
 
     session = session_with_fetch(get_msg, send_device_query)
     session._start_receive_pump()
@@ -230,12 +234,14 @@ async def test_stop_during_a_probe_cancels_cleanly_with_no_warnings(
         await session._stop_receive_pump()
 
 
-async def test_probe_never_overlaps_a_fetch(monkeypatch) -> None:
-    """While a probe is in flight no fetch is issued, and both serialize."""
+async def test_probe_never_overlaps_a_fetch_and_rearms_exactly_one(monkeypatch) -> None:
+    """A probe is never concurrent with a fetch, and it re-arms one fetch."""
     park_quietly(monkeypatch)
     get_msg_calls = 0
+    probes_answered = 0
     probe_entered = asyncio.Event()
-    release_probe = asyncio.Event()
+    release_first_probe = asyncio.Event()
+    block_later_probes = asyncio.Event()
 
     async def get_msg(*, timeout):
         nonlocal get_msg_calls
@@ -243,11 +249,17 @@ async def test_probe_never_overlaps_a_fetch(monkeypatch) -> None:
         return event(EventType.ERROR, {"reason": "no_event_received"})
 
     async def send_device_query():
+        nonlocal probes_answered
         probe_entered.set()
         # The SDK correlates replies by event type, so a probe and a fetch
         # must never be outstanding together.
         assert session._send_lock.locked()
-        await release_probe.wait()
+        if probes_answered == 0:
+            await release_first_probe.wait()
+            probes_answered += 1
+            return event(EventType.DEVICE_INFO, {"fw ver": 13})
+        # Every later probe stays in flight, unanswered.
+        await block_later_probes.wait()
         return event(EventType.DEVICE_INFO, {"fw ver": 13})
 
     session = session_with_fetch(get_msg, send_device_query)
@@ -262,56 +274,235 @@ async def test_probe_never_overlaps_a_fetch(monkeypatch) -> None:
         assert (
             get_msg_calls == rounds_at_probe
         ), "a fetch must not be issued while a probe is in flight"
-        release_probe.set()
-        # After the answered probe the pump stays parked (no notification);
-        # the next fetch happens only after a fresh wake.
+        release_first_probe.set()
+        # The drain this probe interrupted ended on an elapsed window, so
+        # the answered probe re-arms exactly one fetch.
+        assert await wait_until(
+            lambda: get_msg_calls == rounds_at_probe + 1, timeout=2
+        ), "one answered probe must re-arm exactly one fetch after an interrupted drain"
+        # The re-armed round's window elapses too: the pump parks again, and
+        # with later probes left unanswered nothing further may fetch.
         for _ in range(5):
             await asyncio.sleep(0.02)
-        assert get_msg_calls == rounds_at_probe
+        assert (
+            get_msg_calls == rounds_at_probe + 1
+        ), "an answered probe re-arms one fetch, not a re-issue streak"
         assert session._diag.connected is True
     finally:
-        release_probe.set()
+        block_later_probes.set()
         await session._stop_receive_pump()
 
 
-async def test_a_parse_fault_reply_to_the_probe_keeps_the_link(monkeypatch) -> None:
-    """Bytes that arrived but failed to parse are a reply from the node."""
+async def test_an_answered_probe_rearms_an_interrupted_drain_and_not_a_complete_one(
+    monkeypatch,
+) -> None:
+    """One answered probe issues one fetch after an interrupted drain;
+    a drain that ended with NO_MORE_MSGS stays parked."""
     park_quietly(monkeypatch)
+
+    # An interrupted drain: the elapsed window parked the pump, and each
+    # answered probe re-arms exactly one fetch until traffic answers.
+    fetch_calls = 0
+    probe_gate = asyncio.Event()
+
+    async def get_msg(*, timeout):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        # Every fetch round ends with no inbound traffic: the pump parks.
+        return event(EventType.ERROR, {"reason": "no_event_received"})
+
+    async def send_device_query():
+        # In flight (unanswered) until the test opens the gate.
+        await probe_gate.wait()
+        probe_gate.clear()
+        return event(EventType.DEVICE_INFO, {"fw ver": 13})
+
+    session = session_with_fetch(get_msg, send_device_query)
+    session._start_receive_pump()
+    try:
+        assert await wait_until(lambda: fetch_calls >= 1, timeout=2)
+        for _ in range(4):
+            await asyncio.sleep(0.05)
+        assert (
+            fetch_calls == 1
+        ), "the interrupted drain stays parked while no probe is answered"
+        probe_gate.set()
+        assert await wait_until(
+            lambda: fetch_calls == 2, timeout=2
+        ), "one answered probe must re-arm exactly one fetch"
+        # The re-armed round's window elapses too: the pump parks again, and
+        # the NEXT answered probe re-arms it again — one fetch per answer.
+        probe_gate.clear()
+        for _ in range(4):
+            await asyncio.sleep(0.05)
+        assert (
+            fetch_calls == 2
+        ), "the re-armed round parked again; an unanswered probe re-arms nothing"
+        probe_gate.set()
+        assert await wait_until(lambda: fetch_calls == 3, timeout=2)
+        assert session._diag.connected is True
+        assert not session._ensure_recovery_task.called
+    finally:
+        probe_gate.set()
+        await session._stop_receive_pump()
+
+    # A complete drain: it ended with the node's NO_MORE_MSGS, so no
+    # answered probe may fetch for it — the notification does.
+    complete_calls = 0
+
+    async def drained_queue(*, timeout):
+        nonlocal complete_calls
+        complete_calls += 1
+        return event(EventType.NO_MORE_MSGS)
+
+    async def always_answer():
+        return event(EventType.DEVICE_INFO, {"fw ver": 13})
+
+    complete_session = session_with_fetch(drained_queue, always_answer)
+    complete_session._start_receive_pump()
+    try:
+        assert await wait_until(lambda: complete_calls == 1, timeout=2)
+        for _ in range(6):
+            await asyncio.sleep(0.05)
+        assert (
+            complete_calls == 1
+        ), "an answered probe must not fetch for a NO_MORE_MSGS drain"
+        assert complete_session._diag.connected is True
+        assert not complete_session._ensure_recovery_task.called
+    finally:
+        await complete_session._stop_receive_pump()
+
+
+async def test_a_link_that_answers_probes_and_swallows_frames_consumes_one_message_per_probe_interval(
+    monkeypatch,
+) -> None:
+    """The loss bound: one popped message per answered probe interval."""
+    park_quietly(monkeypatch)
+    fetch_calls = 0
+    probe_gate = asyncio.Event()
+
+    async def get_msg(*, timeout):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        # The node pops a message and sends it; the link swallows the
+        # frame. From the SDK's side the fetch window simply elapses with
+        # no inbound traffic.
+        return event(EventType.ERROR, {"reason": "no_event_received"})
+
+    async def send_device_query():
+        # In flight (unanswered) until the test answers this one probe.
+        await probe_gate.wait()
+        probe_gate.clear()
+        return event(EventType.DEVICE_INFO, {"fw ver": 13})
+
+    session = session_with_fetch(get_msg, send_device_query)
+    session._start_receive_pump()
+    try:
+        # The first fetch runs on the initial wake; its window elapses
+        # with no traffic and the pump parks.
+        assert await wait_until(lambda: fetch_calls >= 1, timeout=2)
+        for _ in range(4):
+            await asyncio.sleep(0.05)
+        assert fetch_calls == 1
+        # Each answered probe re-arms exactly one fetch — one swallowed
+        # message per probe interval, never a re-issue streak.
+        for expected in (2, 3, 4):
+            probe_gate.set()
+            assert await wait_until(
+                lambda expected=expected: fetch_calls == expected, timeout=2
+            )
+            probe_gate.clear()
+            for _ in range(4):
+                await asyncio.sleep(0.05)
+            assert (
+                fetch_calls == expected
+            ), "an answered probe re-arms one fetch, not a re-issue streak"
+        assert session._diag.connected is True
+        assert not session._ensure_recovery_task.called
+    finally:
+        probe_gate.set()
+        await session._stop_receive_pump()
+
+
+async def test_an_answered_probe_on_a_connection_that_died_issues_no_fetch(
+    monkeypatch,
+) -> None:
+    """An answered probe cannot re-arm a fetch on a dead connection.
+
+    The probe's reply and a transport loss can land in either order; a
+    connection that is already down when the answer arrives must end the
+    pump without issuing any fetch — the recovery loop owns the retry.
+    """
+    park_quietly(monkeypatch)
+    get_msg_calls = 0
+    probe_entered = asyncio.Event()
+
+    async def get_msg(*, timeout):
+        nonlocal get_msg_calls
+        get_msg_calls += 1
+        return event(EventType.ERROR, {"reason": "no_event_received"})
+
+    async def send_device_query():
+        probe_entered.set()
+        # The transport dies as the reply arrives — the disconnect
+        # handler has already marked the connection down.
+        session._diag.connected = False
+        return event(EventType.DEVICE_INFO, {"fw ver": 13})
+
+    session = session_with_fetch(get_msg, send_device_query)
+    session._start_receive_pump()
+    try:
+        assert await wait_until(lambda: get_msg_calls >= 1, timeout=2)
+        assert await wait_until(
+            probe_entered.is_set, timeout=2
+        ), "the parked pump must probe the idle link"
+        assert await wait_until(lambda: session._fetch_task.done(), timeout=2)
+        # The answered probe never fetched: the pump ended on the
+        # connection check, not on a fetch round.
+        assert get_msg_calls == 1, (
+            f"an answered probe on a dead connection must issue no fetch "
+            f"(saw {get_msg_calls})"
+        )
+        assert session._diag.connected is False
+        assert not session._ensure_recovery_task.called, (
+            "the pump's own exit must not start recovery: the disconnect "
+            "handler owns it"
+        )
+    finally:
+        await session._stop_receive_pump()
+
+
+async def test_probe_replies_never_count_as_inbound_traffic(monkeypatch) -> None:
+    """Only published message types count as inbound traffic; a device
+    reply to a probe is never mistaken for a fetched frame."""
+    park_quietly(monkeypatch)
+    get_msg_calls = 0
     probe_calls = 0
 
     async def get_msg(*, timeout):
+        nonlocal get_msg_calls
+        get_msg_calls += 1
         return event(EventType.ERROR, {"reason": "no_event_received"})
 
     async def send_device_query():
         nonlocal probe_calls
         probe_calls += 1
-        # The node's bytes arrived but the SDK failed to parse them: the
-        # SDK dispatches a non-elapsed parse-fault reason. This is a
-        # genuine reply, not an unanswered query.
-        return event(EventType.ERROR, {"reason": "binary_parse_error: bad frame"})
+        return event(EventType.DEVICE_INFO, {"fw ver": 13})
 
     session = session_with_fetch(get_msg, send_device_query)
+    session._message_callback = None
     session._start_receive_pump()
     try:
-        assert await wait_until(lambda: probe_calls >= 3, timeout=3)
+        assert await wait_until(
+            lambda: probe_calls >= 2, timeout=2
+        ), "the parked pump must repeat its probes"
+        assert (
+            session._fetch_inbound_seen == 0
+        ), "a DEVICE_INFO probe reply must never bump the inbound counter"
+        # A message frame delivered through the event callback is what
+        # counts — published or not.
+        await session._on_sdk_event(event(EventType.CONTACT_MSG_RECV))
+        assert session._fetch_inbound_seen == 1
         assert session._diag.connected is True
-        assert not session._fetch_task.done()
-        session._ensure_recovery_task.assert_not_called()
     finally:
         await session._stop_receive_pump()
-
-
-async def test_local_probe_write_error_does_not_clear_reconnect_gate():
-    """The SDK reports a local send failure as a string under "error":
-    no reply came from the node, so the failure-driven gate stays."""
-    async def get_msg(*, timeout):
-        pytest.fail("a failed gate must not fetch")
-
-    async def send_device_query():
-        return event(EventType.ERROR, {"error": "broken pipe"})
-
-    session = session_with_fetch(get_msg, send_device_query)
-    session._receive_failure_pending = True
-    with pytest.raises(RuntimeError, match="unanswered"):
-        await session._probe_idle_link(session._meshcore)
-    assert session._receive_failure_pending is True

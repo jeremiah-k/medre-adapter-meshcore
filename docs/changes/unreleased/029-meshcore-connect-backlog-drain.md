@@ -5,12 +5,17 @@ After startup and reconnect, a single connection-scoped session receive pump
 each one to the adapter — uses the pinned SDK's public notification and fetch
 APIs to drain existing messages and handle later notifications. It starts
 after adapter startup, serializes native fetches with sends, and respects
-callback-capacity pressure. A fetch window that elapses with no event is an
-empty window, not a failure: the connection stays and the fetch is re-issued
-at a bounded rate, while a non-message reply other than an elapsed window
-still retires the connection for ordinary recovery. Idle rounds that bring
-no inbound traffic at all park the pump instead of popping further messages
-into a link that is not answering. Because a parked pump can no longer
+callback-capacity pressure. A fetch window that elapses with no inbound
+traffic parks the pump at once: the node's fetch is a destructive pop, so
+the window may have ended because the node popped a message whose frame
+was lost, and re-issuing used to pop several more queued messages into a
+link that was not returning what it popped. A frame that pops after its
+window still publishes through the SDK event callback and now wakes the
+pump, so a slow-but-delivering link resumes its interrupted drain on the
+same connection, and a window that elapses while traffic is still
+arriving re-issues at a bounded rate as before. A non-message reply other
+than an elapsed window still retires the connection for ordinary
+recovery. Because a parked pump can no longer
 tell a truly idle node from a link that died silently — the peer vanished
 without a FIN or RST, so nothing ever fails — a parked wait now expires
 into a probe at a fixed internal cadence: one cheap device query the
@@ -21,7 +26,13 @@ cancelled with the pump on stop, retirement, and reconnect. A probe that
 goes unanswered retires the connection through the same path as any other
 pump failure, so an idle MEDRE reconnects on its own instead of waiting for
 an outbound send to notice. A reply of any kind, including an error the
-node itself sends, proves the link is alive. Detection takes roughly
+node itself sends, proves the link is alive — and one answered probe now
+re-arms exactly one fetch for a drain the elapsed window interrupted, so a
+link that recovers resumes within one probe interval, while a link that
+answers probes and swallows message frames consumes at most one queued
+message per probe interval. A drain that ended with the node's
+NO_MORE_MSGS is complete; an answered probe never fetches for it.
+Detection takes roughly
 the probe interval plus one probe budget after the silence begins; that is
 a timing bound, not a guarantee.
 The probe now also earns a failed reconnect the right to fetch. The node's
