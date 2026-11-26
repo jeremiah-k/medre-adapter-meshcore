@@ -189,7 +189,9 @@ after taking that lock and, when the slot is gone, returns to the capacity
 wait instead of issuing a destructive fetch with no reservation. The pump
 waits while no slot is free, rather than deliberately
 popping more queued messages into an already-full adapter. SDK event
-callbacks remain the only publication path. No new event kind, delivery
+callbacks remain the only publication path.
+A retired connection's scheduled callbacks MUST NOT wake, publish through, or
+retire the replacement connection. No new event kind, delivery
 receipt, or replay authority is introduced. The destructive companion
 protocol cannot promise exactly-once or transactional handoff across
 disconnects, crashes or native queue overflow.

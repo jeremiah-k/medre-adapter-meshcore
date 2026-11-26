@@ -139,6 +139,26 @@ async def _cancel_start_retaining_owner(
 # ===================================================================
 
 
+async def test_retired_sdk_callbacks_cannot_affect_replacement_client() -> None:
+    mock_mc, retired = build_mock_meshcore_module()
+    session = MeshCoreSession(
+        _make_config(connection_type="tcp", host="localhost"), "teardown-reconnect"
+    )
+    session._meshcore = retired
+    session._message_callback = Mock()
+    session._subscribe_events(mock_mc)
+    callback = {call.args[0]: call.args[1] for call in retired.subscribe.call_args_list}
+    session._meshcore = Mock()
+    session._set_connected(True)
+
+    await callback[MockEventType.CONTACT_MSG_RECV](_sdk_dm_event("retired"))
+    await callback[MockEventType.DISCONNECTED](None)
+
+    assert session._diag.connected
+    assert session._fetch_inbound_seen == 0
+    session._message_callback.assert_not_called()
+
+
 async def test_stop_clears_message_callback_and_fences_late_sdk_events() -> None:
     """After stop(), _on_sdk_event never reaches the retired callback.
 

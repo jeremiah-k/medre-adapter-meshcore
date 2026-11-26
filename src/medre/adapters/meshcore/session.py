@@ -1975,50 +1975,28 @@ class MeshCoreSession:
         stored in canonical metadata.  Only aggregate counts and
         timestamps are recorded.
         """
-        if self._meshcore is None:
+        client = self._meshcore
+        if client is None:
             return
 
-        # Inbound messages (direct).
-        sub_dm = self._meshcore.subscribe(
-            mc.EventType.CONTACT_MSG_RECV,
-            self._on_sdk_event,
-        )
-        self._subscriptions.append(sub_dm)
+        def subscribe(
+            event_type: Any, callback: Callable[[Any], Awaitable[None]]
+        ) -> None:
+            async def on_event(event: Any) -> None:
+                # The SDK may already have scheduled this callback when
+                # we unsubscribe. Only the current client owns this pump.
+                if self._meshcore is client and not self._stop_requested:
+                    await callback(event)
 
-        # Inbound messages (channel).
-        sub_chan = self._meshcore.subscribe(
-            mc.EventType.CHANNEL_MSG_RECV,
-            self._on_sdk_event,
-        )
-        self._subscriptions.append(sub_chan)
+            self._subscriptions.append(client.subscribe(event_type, on_event))
 
-        # Disconnect detection.
-        sub_disc = self._meshcore.subscribe(
-            mc.EventType.DISCONNECTED,
-            self._on_disconnect_event,
-        )
-        self._subscriptions.append(sub_disc)
-
-        # Contact list updates (diagnostics only).
-        # Per meshcore_py, EventType.CONTACTS fires when the contact list
-        # changes.  We record the count and timestamp for observability.
+        subscribe(mc.EventType.CONTACT_MSG_RECV, self._on_sdk_event)
+        subscribe(mc.EventType.CHANNEL_MSG_RECV, self._on_sdk_event)
+        subscribe(mc.EventType.DISCONNECTED, self._on_disconnect_event)
         if hasattr(mc.EventType, "CONTACTS"):
-            sub_contacts = self._meshcore.subscribe(
-                mc.EventType.CONTACTS,
-                self._on_contacts_event,
-            )
-            self._subscriptions.append(sub_contacts)
-
-        # Self-info updates (diagnostics only).
-        # Per meshcore_py, EventType.SELF_INFO fires when the node's
-        # own info changes.  We update device_name / public_key_prefix
-        # for observability if the payload carries them.
+            subscribe(mc.EventType.CONTACTS, self._on_contacts_event)
         if hasattr(mc.EventType, "SELF_INFO"):
-            sub_self = self._meshcore.subscribe(
-                mc.EventType.SELF_INFO,
-                self._on_self_info_event,
-            )
-            self._subscriptions.append(sub_self)
+            subscribe(mc.EventType.SELF_INFO, self._on_self_info_event)
 
     def _capture_self_info(self, self_info: Any) -> None:
         """Extract safe diagnostics from an SDK self-info snapshot or event.
