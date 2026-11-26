@@ -120,6 +120,8 @@ healthy one.
 
 ## Ingress and evidence
 
+An identity that core reports as stored ends the publication: the dedup key stays committed, nothing is retried or counted as published, and the gate is released so the drain continues.
+
 The adapter exposes a prefetch capacity gate using its existing bounded
 callback-admission count. The pump reserves one admission slot through that
 gate before it issues a fetch — the companion pops each fetched message
@@ -145,6 +147,31 @@ callbacks remain the only publication path. No new event kind, delivery
 receipt, or replay authority is introduced. The destructive companion
 protocol cannot promise exactly-once or transactional handoff across
 disconnects, crashes or native queue overflow.
+
+A fetched event whose durable admission raises stays in its original
+bounded callback slot with its original canonical identity and its
+reservation. Retry uses capped backoff between 1 and 30 seconds, and the
+pump issues no further destructive fetch until that message is admitted or
+this adapter lifecycle ends; a warm reconnect inside the lifecycle moves
+neither the retained event nor the gate. A failure that is deterministic
+for the event — core's validation raises ``ValueError`` or ``TypeError``
+only for an event that can never be admitted — is never retried: one
+warning names the failure class without payload, the identity and the
+reservation are released, and the drain continues with the next message.
+Every other failure retains the event and retries. The first failed
+attempt logs one warning naming the exception class without payload and
+stating that native fetches are paused, recovery logs one info line, and
+no counters, health states, or configuration fields are added for this.
+Core's admission-pressure accounting counts every refused attempt, so a
+retained retry is counted per attempt; refused attempts must not be read
+as unique messages permanently lost. The retained message lives only in
+memory: stopping the adapter releases it unadmitted, and the documented
+loss bound stays at most one popped message per stop or crash. A fetched
+duplicate of an unsolicited publication whose publication has not
+completed promotes that publication to pump ownership instead of
+publishing a second copy; pending ownership is token-fenced, bounded by
+the outstanding publications, and a stale completion cannot evict a
+newer owner's reservation.
 
 ## Qualification
 

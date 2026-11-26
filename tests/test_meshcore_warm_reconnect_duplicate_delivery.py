@@ -258,6 +258,7 @@ async def test_doubled_dispatch_pair_stores_exactly_once(
 
     # The duplicate delivery ~1 ms later: identical payload.
     adapter._on_message(dict(packet))
+    assert not adapter._background_tasks
     assert len(inbound_collector.events) == 1
 
     await adapter.stop()

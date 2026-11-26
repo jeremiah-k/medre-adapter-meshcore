@@ -282,7 +282,7 @@ async def test_cancelled_stale_owner_keeps_recommitted_key(monkeypatch) -> None:
     calls: list[tuple[CanonicalEvent, str | None, object | None]] = []
     original_async = adapter._on_message_async
 
-    async def capturing_async(canonical, dedup_key=None, dedup_token=None):
+    async def capturing_async(canonical, dedup_key=None, dedup_token=None, **kwargs):
         calls.append((canonical, dedup_key, dedup_token))
         await original_async(canonical, dedup_key, dedup_token)
 

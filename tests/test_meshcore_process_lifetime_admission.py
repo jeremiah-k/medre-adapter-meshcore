@@ -99,7 +99,11 @@ DRAIN_BUDGET_SECONDS = 0.5
 # tracemalloc guards the growth of the remaining cycles and the residue
 # left once every strand settles.
 RETAINED_RATIO_BOUND = 2.0
-RETAINED_EXTRA_BYTES_BOUND = 256_000
+# Covers the bounded per-cycle pending-ownership structures (the promote
+# closure, the retry-admission lambda, and one pending-map tuple per
+# outstanding publication, all cleared at stop) on top of the older
+# footprint the bound was calibrated against.
+RETAINED_EXTRA_BYTES_BOUND = 296_000
 
 ADAPTER_ID = "mc-process-lifetime"
 LOGGER_NAME = f"test.{ADAPTER_ID}"
