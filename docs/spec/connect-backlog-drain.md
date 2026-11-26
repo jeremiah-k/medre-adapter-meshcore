@@ -78,16 +78,45 @@ one probe budget and is not probed to death. Exactly one probe runs at a
 time, under the same lock as fetches and sends — the SDK correlates
 responses by event type, not request identity — and never while a fetch is
 outstanding. A probe that goes unanswered (the SDK's own elapsed-wait
-report) and a local failure to send the query are transport failures:
-they retire the connection through the same retire path as any other pump
-failure, which runs ordinary recovery. A reply the node itself sent — a
-DEVICE_INFO answer, the wire's numeric error frame, or bytes that arrived
-but failed to parse — proves the link is alive and leaves the connection
-alone. Stop, retirement, and
+report) is a transport failure: it retires the connection through the same
+retire path as any other pump failure, which runs ordinary recovery. A
+reply of any other kind, including an error the node itself sends, proves
+the link is alive and leaves the connection alone. Stop, retirement, and
 reconnect cancel the probe with the pump; a probe reply that arrives after
 cancellation matches no subscription. Detection takes roughly the probe interval plus one probe budget after
 the silence begins; that is a timing bound, not a delivery or recovery
 guarantee.
+
+A connection that follows a failure-driven retirement must earn the right
+to fetch. The node's fetch is a destructive pop with no acknowledgement in
+the protocol, so a link whose server-to-client direction is still broken
+consumes one queued message per fetch round: the reconnect's handshake is
+answered, the first fetch reaches the node, the node pops a message and
+sends it, and the frame is swallowed. Before its first fetch on such a
+connection the pump therefore sends one liveness probe — the same device
+query the parked pump uses, under the same lock — and waits for the
+answer. A real reply, including an error the node itself sends, proves the
+link delivers; the backlog then drains normally, and from that point the
+connection fetches without a gate. An unanswered probe issues no fetch at
+all: the connection retires through the ordinary path and the backoff
+reconnect runs again, so a still-broken link loses nothing. A retirement
+is failure-driven when a fetch or probe failed on the connection, or when
+the transport died with destructive pops unanswered behind it — a fetch
+round still in flight, or completed fetch rounds that came back with no
+event at all, so their popped messages' frames may have been lost with the
+link. A fresh start and a reconnect
+after a clean disconnect — the peer closed, the host dropped the link, the
+adapter was stopped; no fetch was in flight and no fetch round had gone
+unanswered, so nothing was popped into the dead link — fetch immediately,
+with no probe. An SDK without the
+device query cannot be gated and keeps the immediate-fetch behaviour.
+
+The gate bounds loss on a link that delivers nothing. It cannot bound loss
+on a link that answers the probe and then swallows a message frame: such a
+link consumes at most one queued message per reconnect attempt, and
+recovery stays active, so the loss continues for as long as that link
+persists. No exchange short of popping a message can tell that link from a
+healthy one.
 
 ## Ingress and evidence
 
@@ -95,22 +124,27 @@ The adapter exposes a prefetch capacity gate using its existing bounded
 callback-admission count. The pump reserves one admission slot through that
 gate before it issues a fetch — the companion pops each fetched message
 destructively, so the slot the message will publish into must already
-exist. One slot covers one fetch: while the fetched message has not
-published yet, the pending slot is reused for the next round rather than
-reserved twice. The fetched message's publication consumes the reserved
-slot instead of reserving again; a drain that ends without a fetched
-message (empty queue, retirement, stop, or a fetched frame suppressed by
-dedup or decode) releases it. Unsolicited packets still reserve on
-publication and can still be refused under pressure as before. The pump
-waits while no slot is free, rather than deliberately popping more queued
-messages into an already-full adapter. SDK event callbacks remain the only
-publication path. The reservation covers the message a fetch popped; it is
-not a durable admission reservation for a frame that arrives after the pump
-stopped draining, and the protocol has no delivery receipt to close that
-gap. No new event kind, delivery receipt, or replay
-authority is introduced. The destructive companion protocol cannot promise
-exactly-once or transactional handoff across disconnects, crashes or native
-queue overflow.
+exist. The drain is stop-and-wait: while the fetched message's publication
+is still on its way to durable admission, the pump issues no further
+fetch. Core's live-adapter ingress commits the event durably before its
+publish callback returns, and the publication task's completion is the
+existing seam that signals exactly that, so the pump resumes only from the
+point where the message has left the adapter's hand for good. At most one
+popped message is ever in flight: if the process dies, committed messages
+survive in storage, the uncommitted remainder is still queued at the node,
+and the only possible loss is the single message that was in flight. The
+protocol has no delivery receipt, so even that bound is not a guarantee —
+a message already handed to the client process at the moment of a crash is
+lost, and that is at most one message per crash. A drain that ends without
+a fetched message (empty queue, retirement, stop, or a fetched frame
+suppressed by dedup or decode) releases the slot. Unsolicited packets
+still reserve on publication and can still be refused under pressure as
+before. The pump waits while no slot is free, rather than deliberately
+popping more queued messages into an already-full adapter. SDK event
+callbacks remain the only publication path. No new event kind, delivery
+receipt, or replay authority is introduced. The destructive companion
+protocol cannot promise exactly-once or transactional handoff across
+disconnects, crashes or native queue overflow.
 
 ## Qualification
 

@@ -26,6 +26,9 @@ def session_with_fetch(get_msg, capacity=None):
     session._diag = SimpleNamespace(connected=True)
     session._stop_requested = False
     session._send_lock = asyncio.Lock()
+    session._fetch_round_in_flight = False
+    session._pump_silent_rounds = 0
+    session._receive_failure_pending = False
     session._wait_for_receive_capacity = capacity
     session._release_receive_permit = None
     session._fetch_inbound_seen = 0

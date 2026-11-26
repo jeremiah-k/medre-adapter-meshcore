@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+
+import pytest
 from enum import Enum, auto
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -56,6 +58,9 @@ def session_with_fetch(get_msg, device_query=None, release=None):
     session._diag = SimpleNamespace(connected=True)
     session._stop_requested = False
     session._send_lock = asyncio.Lock()
+    session._fetch_round_in_flight = False
+    session._pump_silent_rounds = 0
+    session._receive_failure_pending = False
     session._wait_for_receive_capacity = None
     session._release_receive_permit = release
     session._fetch_inbound_seen = 0
@@ -294,3 +299,19 @@ async def test_a_parse_fault_reply_to_the_probe_keeps_the_link(monkeypatch) -> N
         session._ensure_recovery_task.assert_not_called()
     finally:
         await session._stop_receive_pump()
+
+
+async def test_local_probe_write_error_does_not_clear_reconnect_gate():
+    """The SDK reports a local send failure as a string under "error":
+    no reply came from the node, so the failure-driven gate stays."""
+    async def get_msg(*, timeout):
+        pytest.fail("a failed gate must not fetch")
+
+    async def send_device_query():
+        return event(EventType.ERROR, {"error": "broken pipe"})
+
+    session = session_with_fetch(get_msg, send_device_query)
+    session._receive_failure_pending = True
+    with pytest.raises(RuntimeError, match="unanswered"):
+        await session._probe_idle_link(session._meshcore)
+    assert session._receive_failure_pending is True

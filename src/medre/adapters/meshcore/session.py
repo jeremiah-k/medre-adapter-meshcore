@@ -76,7 +76,10 @@ not publish the command result a second time. An unanswered command is not
 proof of an empty queue, and the companion protocol cannot guarantee receipt.
 A parked pump probes the idle link at a fixed cadence with one cheap local
 device query, so a link that died silently retires through ordinary
-recovery instead of looking connected forever.
+recovery instead of looking connected forever. A connection that follows a
+failure-driven retirement answers one probe before its first fetch, so a
+link whose server-to-client direction is still broken loses nothing: the
+destructive pop never runs against an unproven link.
 
 Reconnect Policy
 ----------------
@@ -373,6 +376,24 @@ class MeshCoreSession:
         self._release_receive_permit = release_receive_permit
         self._fetch_wake: asyncio.Event | None = None
         self._fetch_task: asyncio.Task[None] | None = None
+        # True while a fetch round's destructive pop is outstanding, so a
+        # disconnect that lands inside the round is recognised as unclean:
+        # the node may have popped a message whose frame was lost with the
+        # link.
+        self._fetch_round_in_flight: bool = False
+        # Mirror of the pump's current streak of fetch rounds that came
+        # back with no event at all (not even an empty queue): each such
+        # round popped a message whose frame never arrived. A transport
+        # loss on a connection with a nonzero streak is unclean even when
+        # no fetch round is in flight at that moment.
+        self._pump_silent_rounds: int = 0
+        # A connection that follows a failure-driven retirement — a fetch or
+        # probe failure, or an unclean transport loss while a fetch was in
+        # flight — must earn the right to fetch: its first probe must be
+        # answered before the pump issues its first fetch. Cleared when a
+        # probe is answered, or when the session starts clean (a fresh
+        # start or a clean-disconnect reconnect never set it).
+        self._receive_failure_pending: bool = False
 
         # Lifecycle guards.
         self._started: bool = False
@@ -507,6 +528,10 @@ class MeshCoreSession:
 
         self._message_callback = message_callback
         self._stop_requested = False
+        # A fresh session start is clean: no earlier connection of this
+        # session popped anything into a broken link, so the first pump
+        # fetches immediately without a gate probe.
+        self._receive_failure_pending = False
 
         if self._config.connection_type == "fake":
             # Fake mode: no real SDK client needed.
@@ -1523,6 +1548,14 @@ class MeshCoreSession:
         probe that times out or errors is a silent-dead link and retires the
         connection. Only a real transport or protocol failure retires the
         connection.
+
+        A connection that follows a failure-driven retirement — its
+        predecessor died of a fetch or probe failure, or of a transport loss
+        while a fetch round was in flight — issues no fetch until one probe
+        is answered: the node's fetch is a destructive pop, and a link whose
+        server-to-client direction is still broken would swallow one queued
+        message per fetch. A fresh start or a reconnect after a clean
+        disconnect fetches immediately.
         """
         types = self._sdk_module.EventType
         message_types = {
@@ -1534,6 +1567,25 @@ class MeshCoreSession:
         idle_rounds = 0
         silent_rounds = 0
         try:
+            if (
+                self._meshcore is client
+                and self._diag.connected
+                and not self._stop_requested
+                and self._receive_failure_pending
+            ):
+                # This connection follows a failure-driven retirement, so
+                # the server-to-client direction is unproven: fetching
+                # into it would pop a queued message the link may never
+                # return. Earn the right to fetch with one liveness probe;
+                # an unanswered probe raises into the retire handler below
+                # without issuing any fetch. A clean start or a
+                # clean-disconnect reconnect never arrives here.
+                if getattr(client.commands, "send_device_query", None) is None:
+                    # Nothing to probe with on this SDK: fetch as before
+                    # rather than gate the drain forever.
+                    self._receive_failure_pending = False
+                else:
+                    await self._probe_idle_link(client)
             while (
                 self._meshcore is client
                 and self._diag.connected
@@ -1564,13 +1616,18 @@ class MeshCoreSession:
                         permit_ready = getattr(self, "_receive_permit_ready", None)
                         if permit_ready is not None and not permit_ready():
                             continue
-                        async with asyncio.timeout(_FETCH_ROUND_TIMEOUT + 0.5):
-                            event = await client.commands.get_msg(
-                                timeout=_FETCH_ROUND_TIMEOUT
-                            )
+                        self._fetch_round_in_flight = True
+                        try:
+                            async with asyncio.timeout(_FETCH_ROUND_TIMEOUT + 0.5):
+                                event = await client.commands.get_msg(
+                                    timeout=_FETCH_ROUND_TIMEOUT
+                                )
+                        finally:
+                            self._fetch_round_in_flight = False
                     if event.type == types.NO_MORE_MSGS:
                         idle_rounds = 0
                         silent_rounds = 0
+                        self._pump_silent_rounds = 0
                         self._release_fetch_permit()
                         break
                     if self._fetch_window_elapsed(event, types):
@@ -1582,8 +1639,14 @@ class MeshCoreSession:
                         # messages the link cannot return.
                         if self._fetch_inbound_seen != inbound_before or wake.is_set():
                             silent_rounds = 0
+                            self._pump_silent_rounds = 0
                         else:
                             silent_rounds += 1
+                            # Keep the streak where a disconnect handler can
+                            # see it: rounds like these popped messages the
+                            # link never returned, however the connection
+                            # ends.
+                            self._pump_silent_rounds = silent_rounds
                         self._logger.debug(
                             "MeshCoreSession %s: fetch window elapsed with no "
                             "event (%d consecutive idle round(s), %d silent); "
@@ -1641,6 +1704,10 @@ class MeshCoreSession:
                     type(exc).__name__,
                     exc,
                 )
+                # The retirement is failure-driven (a fetch or probe
+                # failed): the next connection must prove the link
+                # answers before its first fetch.
+                self._receive_failure_pending = True
                 self._set_connected(False)
                 self._ensure_recovery_task()
         finally:
@@ -1671,7 +1738,7 @@ class MeshCoreSession:
             await self._probe_idle_link(client)
 
     async def _probe_idle_link(self, client: Any) -> None:
-        """Confirm the parked link still answers one cheap local query.
+        """Confirm a parked link (or an unproven reconnect) still answers.
 
         The pinned SDK's device query is answered by the companion over the
         control connection itself — no radio traffic — and its
@@ -1687,7 +1754,8 @@ class MeshCoreSession:
         A reply the node itself sent — a ``DEVICE_INFO`` answer, the
         wire's numeric error frame, or bytes that arrived but failed to
         parse — proves the link is alive and leaves the connection
-        alone
+        alone — and clears the failure-driven gate, so a
+        reconnect that followed a failure may fetch.
  Stop, retire, and reconnect cancel the probe with
         the pump task, and the SDK unsubscribes the waiter on
         cancellation, so a late reply matches no subscription.
@@ -1741,6 +1809,7 @@ class MeshCoreSession:
             )
         ):
             raise RuntimeError(f"idle-link liveness probe unanswered ({reason})")
+        self._receive_failure_pending = False
     @staticmethod
     def _fetch_window_elapsed(event: Any, types: Any) -> bool:
         """Report whether the fetch returned because the window was idle.
@@ -1963,6 +2032,15 @@ class MeshCoreSession:
 
     async def _on_disconnect_event(self, event: Any) -> None:
         """Handle SDK disconnect event — trigger reconnect if appropriate."""
+        # A transport loss is unclean when this connection had destructive
+        # pops whose frames never arrived: a fetch round still in flight,
+        # or already-completed fetch rounds that came back with no event at
+        # all. The next connection must prove it can deliver before it
+        # fetches. A disconnect with no fetch in flight and no unanswered
+        # fetch rounds popped nothing and stays clean — the next connection
+        # fetches immediately.
+        if self._fetch_round_in_flight or self._pump_silent_rounds > 0:
+            self._receive_failure_pending = True
         self._set_connected(False)
         self._logger.warning("MeshCoreSession %s: SDK disconnected", self._adapter_id)
 

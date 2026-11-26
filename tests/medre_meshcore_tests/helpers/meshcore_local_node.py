@@ -64,8 +64,9 @@ def channel_message_payload(
 class LocalMeshCoreNode:
     """Tiny TCP endpoint implementing the protocol subset MEDRE consumes.
 
-    The endpoint intentionally implements only APPSTART, GET_MSG, direct text
-    sends and channel text sends. It is not a MeshCore simulator; it exists to
+    The endpoint intentionally implements only APPSTART, GET_MSG, the
+    DEVICE_QUERY the receive pump's liveness probe uses, direct text sends
+    and channel text sends. It is not a MeshCore simulator; it exists to
     exercise the real pinned Python SDK and MEDRE session boundary together.
     """
 
@@ -220,6 +221,9 @@ class LocalMeshCoreNode:
                 )
                 return
             await self._respond(writer, b"\x0a")  # NO_MORE_MSGS
+            return
+        if command == 0x16:  # DEVICE_QUERY — a real companion answers this
+            await self._respond(writer, b"\x0d\x02")  # DEVICE_INFO, fw_ver 2
             return
         if command == 0x02:  # direct text message
             self.send_commands.append(payload)

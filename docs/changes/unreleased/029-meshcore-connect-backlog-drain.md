@@ -23,7 +23,31 @@ pump failure, so an idle MEDRE reconnects on its own instead of waiting for
 an outbound send to notice. A reply of any kind, including an error the
 node itself sends, proves the link is alive. Detection takes roughly
 the probe interval plus one probe budget after the silence begins; that is
-a timing bound, not a guarantee. The pump reserves one
+a timing bound, not a guarantee.
+The probe now also earns a failed reconnect the right to fetch. The node's
+fetch is a destructive pop with no acknowledgement, so a reconnect into a
+link whose server-to-client direction is still broken used to swallow one
+queued message per retire-reconnect cycle: the handshake was answered, the
+first fetch popped a message into the broken direction, the round went
+idle, the probe failed, and the next cycle popped the next message. A
+connection that follows a failure-driven retirement — a fetch or probe
+failure, or a transport loss with unanswered destructive pops behind it (a
+fetch round still in flight, or fetch rounds that came back with no event
+at all) — now sends one probe before its first fetch and fetches only if
+that probe is
+answered; otherwise it retires having popped nothing. A fresh start and a
+reconnect after a clean disconnect (the peer closed, the host dropped the
+link, the adapter was stopped) still fetch immediately.
+The drain is now stop-and-wait. The pump used to fetch the next message
+while earlier fetched messages were still queued for publication, so a
+process crash inside a drain burst could lose every popped-but-uncommitted
+message at once. Core commits live adapter ingress durably before its
+publish callback returns, and the publication's completion already signals
+exactly that, so the pump now waits for it: at most one popped message is
+ever in flight, and a crash loses at most that one. Messages already
+handed to the client process at the moment of a crash are still lost —
+that is the protocol's no-acknowledgement boundary, not a guarantee.
+The pump reserves one
 bounded-admission slot before it fetches; the fetched message's publication
 consumes that slot instead of reserving again, so a message the node has
 already popped is not refused at admission, and a drain that ends without a
