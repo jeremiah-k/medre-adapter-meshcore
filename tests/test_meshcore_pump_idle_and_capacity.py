@@ -30,7 +30,8 @@ import logging
 from datetime import UTC, datetime
 from enum import Enum, auto
 from types import SimpleNamespace
-from unittest.mock import Mock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from medre.core.contracts.adapter import AdapterContext
 
@@ -38,11 +39,16 @@ from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.session import MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
 from tests.medre_meshcore_tests.helpers.async_utils import wait_until
+from tests.medre_meshcore_tests.helpers.meshcore_session import (
+    install_mock_module,
+    remove_mock_module,
+)
 
 
 class EventType(Enum):
     CHANNEL_MSG_RECV = auto()
     CONTACT_MSG_RECV = auto()
+    CHANNEL_DATA_RECV = auto()
     NO_MORE_MSGS = auto()
     ERROR = auto()
 
@@ -282,6 +288,62 @@ async def test_ambiguous_fetch_response_releases_its_permit_before_retiring() ->
     await session._stop_receive_pump()
 
 
+# ===================================================================
+# Binary channel-data frames: popped, never relayed, never lost traffic.
+# ===================================================================
+
+
+async def test_channel_data_round_releases_its_permit_and_keeps_draining(
+    caplog,
+) -> None:
+    """A popped binary channel-data frame is accounted, not treated as loss.
+
+    The adapter publishes text messages only, so nothing consumes the
+    round's permit through a publication — the pump releases it before
+    the next fetch, logs one DEBUG line for the pop, and the drain
+    continues on the same connection with no failure accounting.
+    """
+    timeline: list[str] = []
+    fetch_calls = 0
+
+    async def get_msg(*, timeout):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        timeline.append(f"fetch{fetch_calls}")
+        if fetch_calls == 1:
+            return event(EventType.CHANNEL_DATA_RECV)
+        return event(EventType.NO_MORE_MSGS)
+
+    def release() -> None:
+        timeline.append(f"release{fetch_calls}")
+
+    session = session_with_fetch(get_msg, release=release)
+    with caplog.at_level(logging.DEBUG):
+        session._start_receive_pump()
+        try:
+            assert await wait_until(lambda: len(timeline) >= 4, timeout=2)
+        finally:
+            await session._stop_receive_pump()
+    # The channel-data round releases its permit before the next fetch:
+    # at a full pool the slot is free while the drain continues.
+    assert timeline[0] == "fetch1"
+    assert timeline.index("release1") < timeline.index(
+        "fetch2"
+    ), f"a channel-data round must release its permit before the next fetch: {timeline}"
+    # One DEBUG line accounts for the popped frame.
+    assert any(
+        "channel-data" in record.getMessage() and record.levelno == logging.DEBUG
+        for record in caplog.records
+    ), "the popped channel-data frame must be logged at DEBUG"
+    # The pop is neither lost traffic nor a failure: the silent-round
+    # mirror stays clear, the drain ended normally on NO_MORE_MSGS, and
+    # the connection is still up.
+    assert session._pump_silent_rounds == 0
+    assert session._pump_drain_incomplete is False
+    assert session._diag.connected is True
+    assert not session._ensure_recovery_task.called
+
+
 async def test_a_notification_during_a_drain_drives_one_extra_round_after_no_more(
     monkeypatch,
 ) -> None:
@@ -499,3 +561,263 @@ async def test_duplicate_fetched_frame_releases_the_permit() -> None:
     finally:
         publisher.gate.set()
         await adapter.stop()
+
+
+# ===================================================================
+# Channel-data rounds against the real gate: the live pump, the real
+# bounded-admission pool, the real ingress path.
+# ===================================================================
+
+
+class PinnedEventType(Enum):
+    """The pinned SDK's event shape: explicit notification + empty-queue."""
+
+    CONTACT_MSG_RECV = "contact_message"
+    CHANNEL_MSG_RECV = "channel_message"
+    CHANNEL_DATA_RECV = "channel_data"
+    DEVICE_INFO = "device_info"
+    DISCONNECTED = "disconnected"
+    MESSAGES_WAITING = "messages_waiting"
+    NO_MORE_MSGS = "no_more_messages"
+    ERROR = "command_error"
+    CONTACTS = "contacts"
+    SELF_INFO = "self_info"
+
+
+class _RecordingPublisher:
+    """Publishes immediately; records every admitted body."""
+
+    def __init__(self) -> None:
+        self.published: list[str] = []
+
+    async def __call__(self, canonical) -> None:
+        self.published.append(str(canonical.payload.get("body")))
+
+
+class _FirstCallHeldPublisher:
+    """Holds the first publication on a test gate; records every body."""
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.published: list[str] = []
+        self._runs = 0
+
+    async def __call__(self, canonical) -> None:
+        self._runs += 1
+        self.entered.set()
+        if self._runs == 1:
+            await self.gate.wait()
+        self.published.append(str(canonical.payload.get("body")))
+
+
+def _scripted_instance(get_msg) -> tuple[AsyncMock, dict[Any, list[Any]]]:
+    """A mock SDK client whose fetches follow the caller's coroutine."""
+    instance = AsyncMock()
+    instance.disconnect = AsyncMock()
+    instance.self_info = {}
+    instance.start_auto_message_fetching = AsyncMock()
+    instance.stop_auto_message_fetching = AsyncMock()
+    instance.unsubscribe = MagicMock()
+    # A synchronous local lookup: never an unawaited coroutine.
+    instance.get_contact_by_key_prefix = MagicMock(return_value=None)
+
+    subscriptions: dict[Any, list[Any]] = {}
+
+    def subscribe(event_type: Any, callback: Any, *_args: Any, **_kwargs: Any) -> Any:
+        subscriptions.setdefault(event_type, []).append(callback)
+        return MagicMock()
+
+    instance.subscribe = MagicMock(side_effect=subscribe)
+
+    commands = AsyncMock()
+    commands.get_msg = AsyncMock(side_effect=get_msg)
+    commands.send_device_query = AsyncMock(
+        return_value=SimpleNamespace(type=PinnedEventType.DEVICE_INFO, payload={})
+    )
+    instance.commands = commands
+    return instance, subscriptions
+
+
+async def _start_scripted_adapter(
+    instance: AsyncMock,
+    publisher: Any,
+    sink: _PressureSink,
+    *,
+    max_pending: int,
+) -> MeshCoreAdapter:
+    """Start the real adapter against the scripted SDK client."""
+    mock_mc = MagicMock()
+    mock_mc.EventType = PinnedEventType
+    mock_mc.MeshCore = MagicMock(return_value=instance)
+    mock_mc.MeshCore.create_tcp = AsyncMock(return_value=instance)
+    install_mock_module(mock_mc)
+    context: dict[str, Any] = {
+        "adapter_id": "channel-data",
+        "publish_inbound": publisher,
+        "logger": logging.getLogger("test.channel-data"),
+        "clock": lambda: datetime.now(UTC),
+        "shutdown_event": asyncio.Event(),
+    }
+    ctx = AdapterContext(**context)
+    ctx.report_producer_pressure = sink
+    adapter = MeshCoreAdapter(
+        MeshCoreConfig(
+            adapter_id="channel-data",
+            connection_type="tcp",
+            host="127.0.0.1",
+            port=1,
+            max_pending_ingress_callbacks=max_pending,
+        )
+    )
+    try:
+        with patch("medre.adapters.meshcore.session.HAS_MESHCORE", True):
+            await adapter.start(ctx)
+    except Exception:
+        remove_mock_module()
+        raise
+    return adapter
+
+
+async def _stop_scripted_adapter(adapter: MeshCoreAdapter, publisher: Any) -> None:
+    gate = getattr(publisher, "gate", None)
+    if gate is not None:
+        gate.set()
+    await adapter.stop()
+    remove_mock_module()
+
+
+async def test_channel_data_drain_at_capacity_one_frees_the_slot_between_rounds(
+    monkeypatch,
+) -> None:
+    """At one admission slot, a channel-data round frees it before the
+    next fetch, and concurrent traffic still publishes mid-round."""
+    publisher = _RecordingPublisher()
+    sink = _PressureSink()
+    proceed = asyncio.Event()
+    second_fetch_started = asyncio.Event()
+    fetch_calls = 0
+    release_at_fetch: list[int] = []
+
+    async def get_msg(**_kwargs: Any) -> SimpleNamespace:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 1:
+            return SimpleNamespace(type=PinnedEventType.CHANNEL_DATA_RECV, payload={})
+        second_fetch_started.set()
+        await proceed.wait()
+        return SimpleNamespace(type=PinnedEventType.NO_MORE_MSGS, payload={})
+
+    # Record each permit release against the fetch round it belongs to.
+    original_release = MeshCoreAdapter._release_fetch_permit
+
+    def release_spy(self: MeshCoreAdapter, epoch: int) -> None:
+        release_at_fetch.append(fetch_calls)
+        original_release(self, epoch)
+
+    monkeypatch.setattr(MeshCoreAdapter, "_release_fetch_permit", release_spy)
+
+    instance, _subscriptions = _scripted_instance(get_msg)
+    adapter = await _start_scripted_adapter(instance, publisher, sink, max_pending=1)
+    try:
+        assert await wait_until(second_fetch_started.is_set, timeout=2)
+        # The pump holds its permit while fetch 2 is in flight; a
+        # concurrent unsolicited message consumes it and publishes.
+        adapter._on_message(_packet(201))
+        assert await wait_until(
+            lambda: len(publisher.published) == 1, timeout=2
+        ), "concurrent traffic must publish during a channel-data drain"
+        assert sink.outcome_count("overflow") == 0
+        proceed.set()
+        assert await wait_until(
+            lambda: adapter._session._pump_parked, timeout=2
+        ), "the drain must end on the node's NO_MORE_MSGS"
+        # The channel-data round released its permit before the next
+        # fetch: a release is recorded while only fetch 1 had been issued.
+        assert 1 in release_at_fetch, (
+            "a channel-data round must release its permit before the "
+            f"next fetch; releases at fetch rounds {release_at_fetch}"
+        )
+        assert adapter._pump_permit_pending is False
+        assert adapter._pending_callback_admissions == 0
+    finally:
+        await _stop_scripted_adapter(adapter, publisher)
+
+
+async def test_channel_data_drain_at_larger_capacity_never_double_holds_a_slot(
+    monkeypatch,
+) -> None:
+    """At two slots, a channel-data round frees its slot even while a
+    stalled publication holds the other one, and traffic still flows."""
+    publisher = _FirstCallHeldPublisher()
+    sink = _PressureSink()
+    proceed = asyncio.Event()
+    fetch_calls = 0
+    release_at_fetch: list[int] = []
+    admissions_at_release: list[int] = []
+
+    async def get_msg(**_kwargs: Any) -> SimpleNamespace:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 1:
+            # The first, notification-driven drain ends empty; the test
+            # then holds one slot and wakes the pump for the second.
+            return SimpleNamespace(type=PinnedEventType.NO_MORE_MSGS, payload={})
+        if fetch_calls == 2:
+            await proceed.wait()
+            return SimpleNamespace(type=PinnedEventType.CHANNEL_DATA_RECV, payload={})
+        return SimpleNamespace(type=PinnedEventType.NO_MORE_MSGS, payload={})
+
+    original_release = MeshCoreAdapter._release_fetch_permit
+
+    def release_spy(self: MeshCoreAdapter, epoch: int) -> None:
+        release_at_fetch.append(fetch_calls)
+        admissions_at_release.append(self._pending_callback_admissions)
+        original_release(self, epoch)
+
+    monkeypatch.setattr(MeshCoreAdapter, "_release_fetch_permit", release_spy)
+
+    instance, subscriptions = _scripted_instance(get_msg)
+    adapter = await _start_scripted_adapter(instance, publisher, sink, max_pending=2)
+    try:
+        # The first drain ends on NO_MORE_MSGS; the pump parks.
+        assert await wait_until(lambda: adapter._session._pump_parked, timeout=2)
+        # A stalled publication occupies one of the two slots.
+        adapter._on_message(_packet(301))
+        assert await asyncio.wait_for(publisher.entered.wait(), 2), (
+            "the held publication must occupy one slot before the "
+            "channel-data drain starts"
+        )
+        assert adapter._pending_callback_admissions == 1
+        # A fresh notification starts a new drain; its first round pops a
+        # binary channel-data frame. With a slot free, the gate reserves.
+        notify = subscriptions[PinnedEventType.MESSAGES_WAITING][0]
+        await notify(SimpleNamespace())
+        assert await wait_until(lambda: fetch_calls == 2, timeout=2)
+        proceed.set()
+        # The channel-data round releases its slot while the held
+        # publication still occupies the other one: a release is recorded
+        # at fetch round 2 with both slots taken.
+        assert await wait_until(lambda: 2 in release_at_fetch, timeout=2), (
+            "a channel-data round must release its slot while the drain "
+            f"continues; releases at fetch rounds {release_at_fetch}"
+        )
+        release_index = release_at_fetch.index(2)
+        assert admissions_at_release[release_index] == 2, (
+            "the channel-data release must happen while the held "
+            f"publication still occupies the other slot: {admissions_at_release}"
+        )
+        # The freed slot keeps serving concurrent traffic: an unsolicited
+        # message reserves a slot and publishes while the held
+        # publication still occupies the other one.
+        adapter._on_message(_packet(302))
+        assert await wait_until(
+            lambda: len(publisher.published) >= 1, timeout=2
+        ), "concurrent traffic must publish during a channel-data drain"
+        assert sink.outcome_count("overflow") == 0
+        assert await wait_until(lambda: adapter._session._pump_parked, timeout=2)
+        assert adapter._pump_permit_pending is False
+        # Only the held publication still owns a slot.
+        assert adapter._pending_callback_admissions == 1
+    finally:
+        await _stop_scripted_adapter(adapter, publisher)

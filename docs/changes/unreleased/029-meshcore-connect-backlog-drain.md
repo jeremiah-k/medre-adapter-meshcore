@@ -65,6 +65,11 @@ already popped is not refused at admission, and a drain that ends without a
 fetched message gives the slot back. No fixed queue-depth assumption is
 needed. The SDK event decoder remains the only publication path. This is
 queue retrieval, not an exactly-once or durable delivery guarantee.
+Binary channel-data frames are popped and dropped: the adapter relays text
+messages only, the node's queue is FIFO and destructive, so the receive
+pump pops each such frame, releases its admission permit, logs one DEBUG
+line, and keeps draining — the pop is accounted for and never counts as
+lost traffic.
 At connect time the pinned SDK fetches nothing — its handshake only sends
 APP_START — so the pump's initial wakeup is the only connect-time fetch, and
 no SDK option is needed to keep it that way. Over BLE, a warm reconnect

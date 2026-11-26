@@ -76,6 +76,14 @@ elapsed window — a node ERROR reply, a malformed result, a transport-level
 failure — retires the connection for ordinary recovery. Stop and client
 replacement MUST cancel the old pump before disconnecting the SDK.
 
+A binary channel-data frame is popped but never relayed: the adapter
+publishes text messages only. The node's queue is FIFO and destructive, so
+the pump pops such a frame anyway, releases that round's reserved admission
+permit — nothing will publish from it — logs one DEBUG line, and continues
+the drain immediately. The pop is accounted for, so it is never mistaken
+for lost traffic, and it neither stalls the drain nor retires the
+connection.
+
 A parked wait is bounded. A link can die silently — the peer vanishes
 without a FIN or RST reaching us — so no fetch ever fails and no
 notification ever arrives, and the parked pump would make the session look
