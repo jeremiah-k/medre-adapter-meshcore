@@ -183,7 +183,11 @@ lost, and that is at most one message per crash. A drain that ends without
 a fetched message (empty queue, retirement, stop, or a fetched frame
 suppressed by dedup or decode) releases the slot. Unsolicited packets
 still reserve on publication and can still be refused under pressure as
-before. The pump waits while no slot is free, rather than deliberately
+before. A callback can consume the reserved slot while the pump
+waits behind the native command lock, so the pump rechecks its reservation
+after taking that lock and, when the slot is gone, returns to the capacity
+wait instead of issuing a destructive fetch with no reservation. The pump
+waits while no slot is free, rather than deliberately
 popping more queued messages into an already-full adapter. SDK event
 callbacks remain the only publication path. No new event kind, delivery
 receipt, or replay authority is introduced. The destructive companion
@@ -196,7 +200,7 @@ reservation. Retry uses capped backoff between 1 and 30 seconds, and the
 pump issues no further destructive fetch until that message is admitted or
 this adapter lifecycle ends; a warm reconnect inside the lifecycle moves
 neither the retained event nor the gate. A failure that is deterministic
-for the event — core's validation raises ``ValueError`` or ``TypeError``
+for the event — core's validation raises `ValueError` or `TypeError`
 only for an event that can never be admitted — is never retried: one
 warning names the failure class without payload, the identity and the
 reservation are released, and the drain continues with the next message.

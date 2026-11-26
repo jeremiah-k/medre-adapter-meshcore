@@ -35,6 +35,8 @@ from enum import Enum, auto
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from medre.adapters.meshcore.session import MeshCoreSession
 from tests.medre_meshcore_tests.helpers.async_utils import wait_until
 
@@ -506,3 +508,20 @@ async def test_probe_replies_never_count_as_inbound_traffic(monkeypatch) -> None
         assert session._diag.connected is True
     finally:
         await session._stop_receive_pump()
+
+
+async def test_local_probe_write_error_does_not_clear_reconnect_gate():
+    """The SDK reports a local send failure as a string under "error":
+    no reply came from the node, so the failure-driven gate stays."""
+
+    async def get_msg(*, timeout):
+        pytest.fail("a failed gate must not fetch")
+
+    async def send_device_query():
+        return event(EventType.ERROR, {"error": "broken pipe"})
+
+    session = session_with_fetch(get_msg, send_device_query)
+    session._receive_failure_pending = True
+    with pytest.raises(RuntimeError, match="unanswered"):
+        await session._probe_idle_link(session._meshcore)
+    assert session._receive_failure_pending is True
