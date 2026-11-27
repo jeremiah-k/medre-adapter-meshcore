@@ -64,8 +64,9 @@ def channel_message_payload(
 class LocalMeshCoreNode:
     """Tiny TCP endpoint implementing the protocol subset MEDRE consumes.
 
-    The endpoint intentionally implements only APPSTART, GET_MSG, direct text
-    sends and channel text sends. It is not a MeshCore simulator; it exists to
+    The endpoint intentionally implements only APPSTART, GET_MSG, the
+    DEVICE_QUERY the receive pump's liveness probe uses, direct text sends
+    and channel text sends. It is not a MeshCore simulator; it exists to
     exercise the real pinned Python SDK and MEDRE session boundary together.
     """
 
@@ -74,6 +75,7 @@ class LocalMeshCoreNode:
     hold_sends: bool = False
     disconnect_on_next_send: bool = False
     host: str = "127.0.0.1"
+    queued_messages: list[tuple[str, int]] = field(default_factory=list, init=False)
     server: asyncio.AbstractServer | None = field(default=None, init=False)
     port: int = field(default=0, init=False)
     connection_count: int = field(default=0, init=False)
@@ -133,6 +135,17 @@ class LocalMeshCoreNode:
     async def next_send_receipt(self) -> bytes:
         """Wait for the next direct/channel send command read from the socket."""
         return await self.send_receipts.get()
+
+    def queue_channel_message(self, text: str, *, channel_index: int = 0) -> None:
+        """Queue a channel message for later delivery through ``GET_MSG``.
+
+        The message stays in the node's own queue — like a companion that
+        buffered it while the transport was down — and is handed to the
+        client by the next ``GET_MSG`` command.  No ``MESSAGES_WAITING``
+        (0x83) notification is emitted, so the queued message can only be
+        fetched by an explicit ``GET_MSG`` round trip.
+        """
+        self.queued_messages.append((text, channel_index))
 
     async def inject_channel_message(
         self, text: str, *, channel_index: int = 0
@@ -200,7 +213,17 @@ class LocalMeshCoreNode:
             await self._respond(writer, response)
             return
         if command == 0x0A:  # GET_MSG
+            if self.queued_messages:
+                text, channel_index = self.queued_messages.pop(0)
+                await self._respond(
+                    writer,
+                    channel_message_payload(text, channel_index=channel_index),
+                )
+                return
             await self._respond(writer, b"\x0a")  # NO_MORE_MSGS
+            return
+        if command == 0x16:  # DEVICE_QUERY — a real companion answers this
+            await self._respond(writer, b"\x0d\x02")  # DEVICE_INFO, fw_ver 2
             return
         if command == 0x02:  # direct text message
             self.send_commands.append(payload)

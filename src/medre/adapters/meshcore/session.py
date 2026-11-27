@@ -67,6 +67,20 @@ The session supports four connection types via
     forwarded only when ``ble_pin`` is configured.  Between retry
     attempts, stale BlueZ state is cleaned before re-scanning.
 
+Inbound Backlog Drain
+----------------------
+One connection-scoped receive pump owns GET_NEXT_MSG on the pinned SDK.
+It starts after connection setup returns and wakes on MESSAGES_WAITING, draining
+until NO_MORE_MSGS. The SDK still decodes and dispatches messages; MEDRE does
+not publish the command result a second time. An unanswered command is not
+proof of an empty queue, and the companion protocol cannot guarantee receipt.
+A parked pump probes the idle link at a fixed cadence with one cheap local
+device query, so a link that died silently retires through ordinary
+recovery instead of looking connected forever. A connection that follows a
+failure-driven retirement answers one probe before its first fetch, so a
+link whose server-to-client direction is still broken loses nothing: the
+destructive pop never runs against an unproven link.
+
 Reconnect Policy
 ----------------
 On unexpected disconnect the session attempts bounded exponential backoff:
@@ -138,6 +152,33 @@ _SDK_LIFECYCLE_TIMEOUT: float = 5.0  # seconds
 _CONNECT_ATTEMPT_TIMEOUT: float = 15.0  # TCP / serial setup attempt
 _BLE_CONNECT_ATTEMPT_TIMEOUT: float = 45.0  # includes BlueZ cleanup and discovery
 
+# One bounded native request at a time. A successful backlog can be arbitrarily
+# deep; it does not extend the startup deadline or require a guessed queue cap.
+_FETCH_ROUND_TIMEOUT: float = 2.0
+
+# Pace retries when a text frame arrives in an elapsed fetch window.
+# A window with no distinct text parks immediately instead.
+_FETCH_IDLE_IMMEDIATE_REISSUES: int = 2
+_FETCH_IDLE_REISSUE_DELAY: float = 2.0
+
+# A parked wait never expires on its own, so a link that died silently —
+# the peer vanished without FIN/RST — would hold the pump parked and the
+# session looking connected forever. While the pump would otherwise sit
+# parked, it waits for the wakeup at most this long before sending one
+# liveness probe, and repeats at this cadence while the quiet continues.
+# The value equals the pinned SDK's own default command timeout (15 s): a
+# slow-but-alive companion answers inside it (the lab's 4 s per-direction
+# latency fault answers in ~8 s), while each probe also gets this same
+# budget before it is judged failed, so detection completes at roughly
+# this interval plus one probe budget after the silence begins. On a
+# healthy node the query answers in milliseconds; the budget is a
+# worst-case bound.
+_PROBE_IDLE_INTERVAL: float = 15.0
+
+# The SDK reports its own elapsed command wait as an ERROR event carrying one
+# of these reasons; nothing was received from the node.
+_PROBE_UNANSWERED_REASONS = frozenset({"timeout", "no_event_received"})
+
 # suggested_timeout clamping bounds (seconds).
 # The firmware returns milliseconds; we convert to seconds and clamp.
 # Floor: never sleep less than 0.5 s even if firmware suggests very short.
@@ -160,6 +201,9 @@ def _retry_delay_contact_key(contact_id: str) -> str:
 # Type alias for the inbound message callback.
 # The callback receives a plain dict (native payload), NOT an SDK Event object.
 # Both sync and async callables are accepted.
+# The adapter has already seen this identity. It may be an old response
+# rather than evidence that the current destructive pop returned.
+DUPLICATE_MESSAGE = object()
 MessageCallback = Callable[[dict[str, Any]], Any]
 
 
@@ -293,6 +337,9 @@ class MeshCoreSession:
         *,
         logger: logging.Logger | None = None,
         on_connection_change: Callable[[bool], None] | None = None,
+        wait_for_receive_capacity: Callable[[], Awaitable[None]] | None = None,
+        release_receive_permit: Callable[[], None] | None = None,
+        receive_permit_ready: Callable[[], bool] | None = None,
     ) -> None:
         self._config = config
         self._adapter_id = adapter_id
@@ -303,17 +350,65 @@ class MeshCoreSession:
 
         # SDK objects — only populated for real connection modes.
         self._meshcore: Any = None  # meshcore.MeshCore instance
+        # The imported SDK module of the live client.  Kept so the backlog
+        # drain can read the SDK event types without a second import.
+        self._sdk_module: Any = None
         self._subscriptions: list[Any] = []  # Subscription handles
 
         # Inbound callback set via start().
         self._message_callback: MessageCallback | None = None
         self._on_connection_change = on_connection_change
+        self._wait_for_receive_capacity = wait_for_receive_capacity
+        # Adapter-side release of the pump's inbound-capacity permit. The
+        # pump holds at most one permit from before a fetch until the
+        # fetched message's publication consumes it; drains that end
+        # without a fetched message release it through this callable.
+        self._release_receive_permit = release_receive_permit
+        self._receive_permit_ready = receive_permit_ready
+        self._fetch_wake: asyncio.Event | None = None
+        self._fetch_task: asyncio.Task[None] | None = None
+        # True while a fetch round's destructive pop is outstanding, so a
+        # disconnect that lands inside the round is recognised as unclean:
+        # the node may have popped a message whose frame was lost with the
+        # link.
+        self._fetch_round_in_flight: bool = False
+        # Mirror of the pump's current streak of fetch rounds that came
+        # back with no event at all (not even an empty queue): each such
+        # round popped a message whose frame never arrived. A transport
+        # loss on a connection with a nonzero streak is unclean even when
+        # no fetch round is in flight at that moment.
+        self._pump_silent_rounds: int = 0
+        # True when the last drain on this connection was interrupted by an
+        # elapsed fetch window instead of ending on the node's NO_MORE_MSGS:
+        # the node may still hold queued messages this connection never saw.
+        # An answered idle probe re-arms exactly one fetch for such a drain;
+        # a drain that ended with NO_MORE_MSGS is complete and an answered
+        # probe never fetches for it.
+        self._pump_drain_incomplete: bool = False
+        # True while the pump is parked — waiting for traffic, a
+        # notification, or an answered probe — so a distinct text frame
+        # through the event callback wakes it. A frame published while a
+        # drain is running is that drain's business; waking would only
+        # leave a stale wake behind after the drain's final empty-queue
+        # round.
+        self._pump_parked: bool = False
+        # A connection that follows a failure-driven retirement — a fetch or
+        # probe failure, or an unclean transport loss while a fetch was in
+        # flight — must earn the right to fetch: its first probe must be
+        # answered before the pump issues its first fetch. Cleared when a
+        # probe is answered, or when the session starts clean (a fresh
+        # start or a clean-disconnect reconnect never set it).
+        self._receive_failure_pending: bool = False
 
         # Lifecycle guards.
         self._started: bool = False
         self._stop_requested: bool = False
         self._reconnect_task: asyncio.Task[None] | None = None
         self._initial_start_task: asyncio.Task[Any] | None = None
+        # Distinct text and known duplicate callbacks have separate counts.
+        # Only distinct text is evidence that an unresolved pop returned.
+        self._fetch_inbound_seen: int = 0
+        self._fetch_duplicates_seen: int = 0
 
         # Send serialization: ensures pacing sleeps are not bypassed when
         # multiple send_text() calls overlap via pipeline fan-out.
@@ -438,6 +533,10 @@ class MeshCoreSession:
 
         self._message_callback = message_callback
         self._stop_requested = False
+        # A fresh session start is clean: no earlier connection of this
+        # session popped anything into a broken link, so the first pump
+        # fetches immediately without a gate probe.
+        self._receive_failure_pending = False
 
         if self._config.connection_type == "fake":
             # Fake mode: no real SDK client needed.
@@ -471,6 +570,7 @@ class MeshCoreSession:
         if self._stop_requested:
             return
         self._started = True
+        self._start_receive_pump()
         self._logger.info(
             "MeshCoreSession %s started (mode=%s, connected=%s)",
             self._adapter_id,
@@ -522,6 +622,8 @@ class MeshCoreSession:
             except asyncio.CancelledError:
                 pass
         self._reconnect_task = None
+
+        await self._stop_receive_pump()
 
         # Unsubscribe all callbacks.
         await self._unsubscribe_all()
@@ -826,6 +928,7 @@ class MeshCoreSession:
         ``last_error`` for diagnostics.
         """
         self._message_callback = None
+        await self._stop_receive_pump()
         self._set_connected(False)
         self._diag.reconnecting = False
         self._subscriptions.clear()
@@ -855,6 +958,8 @@ class MeshCoreSession:
         """
         if self._meshcore is None:
             return
+
+        await self._stop_receive_pump()
 
         # Unsubscribe all registered callbacks.
         for sub in list(self._subscriptions):
@@ -1194,6 +1299,9 @@ class MeshCoreSession:
 
         # Deferred import — the SDK is only touched inside this method.
         mc = cast(_MeshCoreModule, importlib.import_module("meshcore"))
+        # Retain the module so the backlog drain can read the SDK event
+        # types without importing the SDK a second time.
+        self._sdk_module = mc
 
         # Clean up any stale SDK client from a previous connection
         # (e.g. before reconnect).  On first connect _meshcore is None
@@ -1367,28 +1475,484 @@ class MeshCoreSession:
         # following await must stay observable rather than being overwritten.
         self._set_connected(True)
 
-        # Start auto message fetching to drain buffered messages from the device.
-        # Best-effort: failure is logged but does not prevent connection.
-        try:
-            if hasattr(self._meshcore, "start_auto_message_fetching"):
-                await asyncio.wait_for(
-                    self._meshcore.start_auto_message_fetching(),
-                    timeout=_SDK_LIFECYCLE_TIMEOUT,
+        # The pinned SDK exposes the notification and native fetch primitives.
+        # Do not start its auto-fetch loop as a second owner of GET_NEXT_MSG.
+        event_types = mc.EventType
+        if hasattr(event_types, "MESSAGES_WAITING") and hasattr(
+            event_types, "NO_MORE_MSGS"
+        ):
+            client = self._meshcore
+            wake = asyncio.Event()
+            wake.set()  # An already queued backlog need not send another push.
+            self._fetch_wake = wake
+
+            async def on_waiting(_event: Any) -> None:
+                if (
+                    self._meshcore is client
+                    and self._fetch_wake is wake
+                    and not self._pump_silent_rounds
+                ):
+                    wake.set()
+
+            self._subscriptions.append(
+                client.subscribe(event_types.MESSAGES_WAITING, on_waiting)
+            )
+        else:
+            # Compatibility for SDKs without the explicit notification API.
+            # This path uses the SDK alone; never start a competing drain.
+            try:
+                if hasattr(self._meshcore, "start_auto_message_fetching"):
+                    await asyncio.wait_for(
+                        self._meshcore.start_auto_message_fetching(),
+                        timeout=_SDK_LIFECYCLE_TIMEOUT,
+                    )
+            except Exception as exc:
+                self._logger.debug(
+                    "MeshCoreSession %s: legacy auto-fetch startup failed: %s",
+                    self._adapter_id,
+                    type(exc).__name__,
                 )
-        except TimeoutError:
-            self._logger.warning(
-                "MeshCoreSession %s: timed out starting auto_message_fetching",
-                self._adapter_id,
-            )
-        except Exception as exc:
-            self._logger.debug(
-                "MeshCoreSession %s: auto_message_fetching failed (non-fatal): %s",
-                self._adapter_id,
-                exc,
-            )
 
         if not self._diag.connected:
             raise MeshCoreConnectionError("Native transport disconnected during setup")
+
+    def _start_receive_pump(self) -> None:
+        """Schedule only after the connection setup owner has returned."""
+        if self._fetch_wake is None or self._stop_requested or not self._diag.connected:
+            return
+        if self._fetch_task is None or self._fetch_task.done():
+            self._fetch_task = asyncio.create_task(
+                self._receive_pump(self._meshcore, self._fetch_wake),
+                name=f"meshcore-receive:{self._adapter_id}",
+            )
+            self._fetch_task.add_done_callback(self._log_task_exception)
+
+    async def _stop_receive_pump(self) -> None:
+        self._fetch_wake = None
+        task, self._fetch_task = self._fetch_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _receive_pump(self, client: Any, wake: asyncio.Event) -> None:
+        """Own initial and notification-driven fetches on this SDK connection.
+
+        The event is cleared before draining so notifications that arrive during
+        a request (including NO_MORE_MSGS) cannot be lost. Each request is
+        serialized with native sends: the SDK correlates some replies by type,
+        not by command ID — one fetch runs at a time, and the next fetch is
+        issued only after the previous one returned.
+
+        A fetch window with no distinct text parks the pump. The current
+        permit stays reserved for a late reply. A distinct text callback can
+        resume the drain; repeated notifications and known duplicate replies
+        cannot account for the destructive pop. A paced retry is allowed
+        when new text arrives before an elapsed window closes. An answered
+        idle probe re-arms one interrupted fetch, and an unanswered probe
+        retires the connection. After NO_MORE_MSGS a probe checks reachability
+        without fetching.
+
+        A connection that follows a failure-driven retirement — its
+        predecessor died of a fetch or probe failure, or of a transport loss
+        while a fetch round was in flight — issues no fetch until one probe
+        is answered: the node's fetch is a destructive pop, and a link whose
+        server-to-client direction is still broken would swallow one queued
+        message per fetch. A fresh start or a reconnect after a clean
+        disconnect fetches immediately.
+
+        A binary channel-data frame is popped but never relayed: the
+        adapter publishes text messages only, and the node's FIFO queue
+        must still advance past the frame or every message queued behind
+        it would be stuck. Such a round releases its reserved permit —
+        nothing will publish from the frame — logs one DEBUG line, and
+        continues the drain immediately; the pop is accounted for, so it
+        is never mistaken for lost traffic, and it neither stalls the
+        drain nor retires the connection.
+        """
+        types = self._sdk_module.EventType
+        message_types = {
+            types.CONTACT_MSG_RECV,
+            types.CHANNEL_MSG_RECV,
+        }
+        channel_data_type = getattr(types, "CHANNEL_DATA_RECV", None)
+        idle_rounds = 0
+        # A notification is consumed for pacing independently of the
+        # extra drain needed when the empty-queue response races a push.
+        pending_notification = False
+        # A new connection starts with no drain history: nothing has been
+        # interrupted yet.
+        self._pump_drain_incomplete = False
+        self._pump_parked = False
+        self._pump_silent_rounds = 0
+        self._fetch_duplicates_seen = 0
+        try:
+            if (
+                self._meshcore is client
+                and self._diag.connected
+                and not self._stop_requested
+                and self._receive_failure_pending
+            ):
+                # This connection follows a failure-driven retirement, so
+                # the server-to-client direction is unproven: fetching
+                # into it would pop a queued message the link may never
+                # return. Earn the right to fetch with one liveness probe;
+                # an unanswered probe raises into the retire handler below
+                # without issuing any fetch. A clean start or a
+                # clean-disconnect reconnect never arrives here.
+                if getattr(client.commands, "send_device_query", None) is None:
+                    # Nothing to probe with on this SDK: fetch as before
+                    # rather than gate the drain forever.
+                    self._receive_failure_pending = False
+                else:
+                    if not await self._probe_idle_link(client):
+                        return
+            while (
+                self._meshcore is client
+                and self._diag.connected
+                and not self._stop_requested
+            ):
+                if not await self._await_wake_with_probe(client, wake):
+                    break
+                wake.clear()
+                pending_notification = False
+                while (
+                    self._meshcore is client
+                    and self._diag.connected
+                    and not self._stop_requested
+                ):
+                    self._pump_parked = False
+                    if self._wait_for_receive_capacity is not None:
+                        await self._wait_for_receive_capacity()
+                    async with self._send_lock:
+                        if (
+                            self._meshcore is not client
+                            or not self._diag.connected
+                            or self._stop_requested
+                        ):
+                            return
+                        # A late callback may consume a reserved permit while
+                        # this pump waits behind a send. Recheck without
+                        # awaiting inside the lock; wait for capacity outside.
+                        permit_ready = getattr(self, "_receive_permit_ready", None)
+                        if permit_ready is not None and not permit_ready():
+                            continue
+                        pending_notification |= wake.is_set()
+                        wake.clear()
+                        inbound_before = self._fetch_inbound_seen
+                        duplicates_before = self._fetch_duplicates_seen
+                        self._fetch_round_in_flight = True
+                        try:
+                            async with asyncio.timeout(_FETCH_ROUND_TIMEOUT + 0.5):
+                                event = await client.commands.get_msg(
+                                    timeout=_FETCH_ROUND_TIMEOUT
+                                )
+                        finally:
+                            self._fetch_round_in_flight = False
+                    if (
+                        self._meshcore is not client
+                        or not self._diag.connected
+                        or self._stop_requested
+                    ):
+                        return
+                    pending_notification |= wake.is_set()
+                    wake.clear()
+                    if event.type == types.NO_MORE_MSGS:
+                        idle_rounds = 0
+                        self._pump_silent_rounds = 0
+                        self._pump_drain_incomplete = False
+                        self._release_fetch_permit()
+                        # The drain is complete: the pump is parked until
+                        # the next notification.
+                        self._pump_parked = True
+                        if pending_notification:
+                            wake.set()
+                        break
+                    text_arrived = self._fetch_inbound_seen != inbound_before
+                    duplicate_reply = (
+                        event.type in message_types
+                        and self._fetch_duplicates_seen != duplicates_before
+                        and not text_arrived
+                    )
+                    if self._fetch_window_elapsed(event, types) or duplicate_reply:
+                        idle_rounds += 1
+                        if text_arrived:
+                            # Text delivery justifies a paced retry. A push
+                            # notification alone cannot account for a pop.
+                            self._pump_silent_rounds = 0
+                            self._logger.debug(
+                                "MeshCoreSession %s: fetch window elapsed with "
+                                "no event, but inbound traffic is arriving "
+                                "(%d consecutive idle round(s)); re-issuing "
+                                "at a bounded rate on the same connection",
+                                self._adapter_id,
+                                idle_rounds,
+                            )
+                            if idle_rounds > _FETCH_IDLE_IMMEDIATE_REISSUES:
+                                # Pace further re-issues: wait for a
+                                # notification or the floor delay, so a slow
+                                # link neither spins nor strands its backlog.
+                                try:
+                                    await asyncio.wait_for(
+                                        wake.wait(),
+                                        timeout=_FETCH_IDLE_REISSUE_DELAY,
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+                            await asyncio.sleep(0)
+                            continue
+                        # The pop remains unresolved. Preserve its slot for
+                        # a late reply and carry the uncertainty to a reconnect.
+                        idle_rounds = 0
+                        self._pump_silent_rounds += 1
+                        self._pump_drain_incomplete = True
+                        # A distinct text frame can wake the park. The
+                        # notification callback suppresses pushes here.
+                        self._pump_parked = True
+                        self._logger.debug(
+                            "MeshCoreSession %s: fetch window elapsed with "
+                            "no inbound traffic (%d unanswered round(s)); "
+                            "parking the receive pump until traffic or an "
+                            "answered probe",
+                            self._adapter_id,
+                            self._pump_silent_rounds,
+                        )
+                        break
+                    if event.type is channel_data_type:
+                        # Popped from the node's FIFO queue but never
+                        # relayed: the adapter publishes text messages
+                        # only. Release the round's permit — nothing
+                        # will publish from this frame — and continue
+                        # the drain; one DEBUG line accounts for the
+                        # pop so it cannot be mistaken for lost
+                        # traffic or a failure.
+                        idle_rounds = 0
+                        self._release_fetch_permit()
+                        self._logger.debug(
+                            "MeshCoreSession %s: fetched a binary "
+                            "channel-data frame; not relayed, the "
+                            "round's admission permit is released and "
+                            "the drain continues",
+                            self._adapter_id,
+                        )
+                        await asyncio.sleep(0)
+                        continue
+                    if event.type not in message_types:
+                        raise RuntimeError(
+                            "native fetch returned "
+                            f"{self._fetch_outcome_detail(event, types)}"
+                            " instead of a message or empty queue"
+                        )
+                    idle_rounds = 0
+                    self._pump_silent_rounds = 0
+                    # Publication stays in the SDK event callback; yield to
+                    # its dispatcher and to pending sends before fetching again.
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if (
+                self._meshcore is client
+                and self._diag.connected
+                and not self._stop_requested
+            ):
+                detail = self._sanitize_ble_exc(exc)
+                self._logger.warning(
+                    "MeshCoreSession %s: receive pump failed (%s); retiring connection",
+                    self._adapter_id,
+                    detail,
+                )
+                self._diag.last_error = detail
+                # The retirement is failure-driven (a fetch or probe
+                # failed): the next connection must prove the link
+                # answers before its first fetch.
+                self._receive_failure_pending = True
+                self._set_connected(False)
+                self._ensure_recovery_task()
+        finally:
+            self._release_fetch_permit()
+
+    async def _await_wake_with_probe(self, client: Any, wake: asyncio.Event) -> bool:
+        """Wait for the pump's wakeup, probing the idle link when it is quiet.
+
+        A parked wait never expires on its own, so a link that died
+        silently would hold the pump parked while the session looks
+        connected. This wait expires into one liveness probe every
+        ``_PROBE_IDLE_INTERVAL`` while the quiet continues; a failed probe
+        raises so the pump's ordinary retire path — the same handler a
+        fetch failure uses — runs the existing recovery loop. An answered
+        probe proves the link delivers, so it
+        re-arms exactly one fetch for a drain an elapsed window interrupted
+        (``_pump_drain_incomplete``): if the re-armed fetch's window elapses
+        with no traffic the pump parks again, and the next answered probe
+        re-arms it again. A drain that ended with the node's NO_MORE_MSGS is
+        complete; an answered probe never fetches for it — the notification
+        does.
+
+        Returns ``True`` when the pump may issue a fetch now — the wake
+        fired, or an answered probe re-armed an interrupted drain — and
+        ``False`` when the connection ended.
+        """
+        while (
+            self._meshcore is client
+            and self._diag.connected
+            and not self._stop_requested
+        ):
+            if wake.is_set():
+                return True
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=_PROBE_IDLE_INTERVAL)
+                return True
+            except TimeoutError:
+                pass
+            answered = await self._probe_idle_link(client)
+            if answered and self._pump_drain_incomplete:
+                return True
+        return False
+
+    async def _probe_idle_link(self, client: Any) -> bool:
+        """Confirm a parked link (or an unproven reconnect) still answers.
+
+        The pinned SDK's device query is answered by the companion over the
+        control connection itself — no radio traffic — and its
+        ``DEVICE_INFO`` reply type cannot be confused with a message event,
+        so a late or stray reply can never be mistaken for fetched traffic.
+        It runs under the send lock: one probe at a time, never concurrent
+        with a fetch or a send (the SDK correlates some replies by event
+        type, not request identity). The probe gets the same
+        ``_PROBE_IDLE_INTERVAL`` budget as the SDK's own default command
+        timeout; only an unanswered query (the SDK's own elapsed-wait
+        report) or a local failure to send the query is treated as a
+        silent-dead link: raise so the pump's existing retire path runs.
+        A reply the node itself sent — a ``DEVICE_INFO`` answer, the
+        wire's numeric error frame, or bytes that arrived but failed to
+        parse — proves the link is alive and leaves the connection alone
+        — and clears the failure-driven gate, so a reconnect that
+        followed a failure may fetch. Stop, retire, and reconnect cancel
+        the probe with the pump task, and the SDK unsubscribes the
+        waiter on cancellation, so a late reply matches no subscription.
+
+        Returns ``True`` when a probe ran and a reply that is neither an
+        elapsed wait nor a local send failure came back — the link is
+        proven to deliver — and ``False`` when no probe ran (the SDK has
+        no device query, or the connection ended first), so the caller
+        must not treat quiet as an answer.
+        """
+        device_query = getattr(client.commands, "send_device_query", None)
+        if device_query is None:
+            # Without the SDK's local query there is nothing safe to probe
+            # with; the wait repeats without a probe and cannot retire a
+            # silent link.
+            return False
+        async with self._send_lock:
+            if (
+                self._meshcore is not client
+                or not self._diag.connected
+                or self._stop_requested
+            ):
+                return False
+            self._logger.debug(
+                "MeshCoreSession %s: probing the idle receive link",
+                self._adapter_id,
+            )
+            try:
+                # The SDK's send() waits _PROBE_IDLE_INTERVAL internally (its
+                # default command timeout) and then reports an ERROR event.
+                # This outer guard sits strictly above that bound, mirroring
+                # the fetch round guard: it exists only to bound a hung
+                # writer, never to race the SDK's own timeout.
+                async with asyncio.timeout(_PROBE_IDLE_INTERVAL + 0.5):
+                    result = await device_query()
+            except TimeoutError as exc:
+                raise RuntimeError("idle-link liveness probe timed out") from exc
+            if (
+                self._meshcore is not client
+                or not self._diag.connected
+                or self._stop_requested
+            ):
+                return False
+        types = self._sdk_module.EventType
+        result_type = getattr(result, "type", None)
+        payload = getattr(result, "payload", None)
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        # The pinned SDK reports three shapes on this query's ERROR
+        # event: an elapsed wait carries a reason of "timeout" or
+        # "no_event_received"; a local failure to send or wait carries a
+        # string under "error"; a reply the node itself sent carries an
+        # int under "error_code" (the wire's error frame), and bytes
+        # that arrived but failed to parse carry a non-elapsed reason.
+        # Only an elapsed wait or a local failure to send means no reply
+        # came from the node; any other reply proves the link is alive
+        # and clears the failure-driven gate.
+        if result_type is None or result_type not in (
+            getattr(types, "DEVICE_INFO", None),
+            types.ERROR,
+        ):
+            raise RuntimeError("idle-link liveness probe returned an unexpected result")
+        if result_type == types.ERROR and (
+            reason in _PROBE_UNANSWERED_REASONS
+            or (
+                isinstance(payload, dict)
+                and "error" in payload
+                and type(payload["error"]) is not int
+                and type(payload.get("error_code")) is not int
+            )
+        ):
+            raise RuntimeError(f"idle-link liveness probe unanswered ({reason})")
+        self._receive_failure_pending = False
+        self._logger.debug(
+            "MeshCoreSession %s: idle-link probe answered %s; the link is alive",
+            self._adapter_id,
+            getattr(result_type, "name", result_type),
+        )
+        return True
+
+    @staticmethod
+    def _fetch_window_elapsed(event: Any, types: Any) -> bool:
+        """Report whether the fetch returned because the window was idle.
+
+        ``meshcore`` maps an elapsed command-response wait to an ``ERROR``
+        event whose payload reason is ``no_event_received`` (or ``timeout``).
+        Those describe transport uncertainty, not a remote rejection, so the
+        pump treats them as an empty window rather than a failure.
+        """
+        if event.type != types.ERROR:
+            return False
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            return False
+        return payload.get("reason") in _TRANSIENT_SDK_SEND_REASONS
+
+    @staticmethod
+    def _fetch_outcome_detail(event: Any, types: Any) -> str:
+        """Summarize a non-message fetch outcome for the retire log."""
+        if event.type == types.ERROR:
+            payload = getattr(event, "payload", None)
+            if isinstance(payload, dict):
+                reason = payload.get("reason") or payload.get("error")
+                if reason is not None:
+                    return f"ERROR({reason})"
+            return "ERROR"
+        return str(getattr(event.type, "name", event.type))
+
+    def _release_fetch_permit(self) -> None:
+        """Release this pump's unconsumed inbound-capacity permit.
+
+        The pump holds at most one permit, acquired before a fetch and
+        consumed by the fetched message's publication. Drains that end
+        without a fetched message — an empty queue, a retirement, stop —
+        release the permit here and on the pump's exit path.
+        """
+        release = self._release_receive_permit
+        if release is None:
+            return
+        try:
+            release()
+        except Exception as exc:
+            self._logger.debug(
+                "MeshCoreSession %s: fetch permit release failed: %s",
+                self._adapter_id,
+                exc,
+            )
 
     def _subscribe_events(self, mc: Any) -> None:
         """Subscribe to SDK event types for inbound messages + disconnects.
@@ -1405,50 +1969,28 @@ class MeshCoreSession:
         stored in canonical metadata.  Only aggregate counts and
         timestamps are recorded.
         """
-        if self._meshcore is None:
+        client = self._meshcore
+        if client is None:
             return
 
-        # Inbound messages (direct).
-        sub_dm = self._meshcore.subscribe(
-            mc.EventType.CONTACT_MSG_RECV,
-            self._on_sdk_event,
-        )
-        self._subscriptions.append(sub_dm)
+        def subscribe(
+            event_type: Any, callback: Callable[[Any], Awaitable[None]]
+        ) -> None:
+            async def on_event(event: Any) -> None:
+                # The SDK may already have scheduled this callback when
+                # we unsubscribe. Only the current client owns this pump.
+                if self._meshcore is client and not self._stop_requested:
+                    await callback(event)
 
-        # Inbound messages (channel).
-        sub_chan = self._meshcore.subscribe(
-            mc.EventType.CHANNEL_MSG_RECV,
-            self._on_sdk_event,
-        )
-        self._subscriptions.append(sub_chan)
+            self._subscriptions.append(client.subscribe(event_type, on_event))
 
-        # Disconnect detection.
-        sub_disc = self._meshcore.subscribe(
-            mc.EventType.DISCONNECTED,
-            self._on_disconnect_event,
-        )
-        self._subscriptions.append(sub_disc)
-
-        # Contact list updates (diagnostics only).
-        # Per meshcore_py, EventType.CONTACTS fires when the contact list
-        # changes.  We record the count and timestamp for observability.
+        subscribe(mc.EventType.CONTACT_MSG_RECV, self._on_sdk_event)
+        subscribe(mc.EventType.CHANNEL_MSG_RECV, self._on_sdk_event)
+        subscribe(mc.EventType.DISCONNECTED, self._on_disconnect_event)
         if hasattr(mc.EventType, "CONTACTS"):
-            sub_contacts = self._meshcore.subscribe(
-                mc.EventType.CONTACTS,
-                self._on_contacts_event,
-            )
-            self._subscriptions.append(sub_contacts)
-
-        # Self-info updates (diagnostics only).
-        # Per meshcore_py, EventType.SELF_INFO fires when the node's
-        # own info changes.  We update device_name / public_key_prefix
-        # for observability if the payload carries them.
+            subscribe(mc.EventType.CONTACTS, self._on_contacts_event)
         if hasattr(mc.EventType, "SELF_INFO"):
-            sub_self = self._meshcore.subscribe(
-                mc.EventType.SELF_INFO,
-                self._on_self_info_event,
-            )
-            self._subscriptions.append(sub_self)
+            subscribe(mc.EventType.SELF_INFO, self._on_self_info_event)
 
     def _capture_self_info(self, self_info: Any) -> None:
         """Extract safe diagnostics from an SDK self-info snapshot or event.
@@ -1516,6 +2058,7 @@ class MeshCoreSession:
         is a plain dict — no SDK objects leak into the adapter layer.
         """
         if self._message_callback is None:
+            self._note_text_delivery()
             return
 
         try:
@@ -1530,6 +2073,10 @@ class MeshCoreSession:
 
             self._diag.last_message_time = datetime.now(timezone.utc)
             result = self._message_callback(payload)
+            if result is DUPLICATE_MESSAGE:
+                self._fetch_duplicates_seen += 1
+                return
+            self._note_text_delivery()
             if asyncio.iscoroutine(result):
                 task = asyncio.ensure_future(result)
                 task.add_done_callback(self._log_task_exception)
@@ -1543,6 +2090,12 @@ class MeshCoreSession:
                 self._adapter_id,
                 exc,
             )
+
+    def _note_text_delivery(self) -> None:
+        self._fetch_inbound_seen += 1
+        self._pump_silent_rounds = 0
+        if self._pump_parked and self._fetch_wake is not None:
+            self._fetch_wake.set()
 
     def _log_task_exception(self, task: asyncio.Task[Any]) -> None:
         """Done callback for fire-and-forget tasks — logs exceptions
@@ -1560,6 +2113,15 @@ class MeshCoreSession:
 
     async def _on_disconnect_event(self, event: Any) -> None:
         """Handle SDK disconnect event — trigger reconnect if appropriate."""
+        # A transport loss is unclean when this connection had destructive
+        # pops whose frames never arrived: a fetch round still in flight,
+        # or already-completed fetch rounds that came back with no event at
+        # all. The next connection must prove it can deliver before it
+        # fetches. A disconnect with no fetch in flight and no unanswered
+        # fetch rounds popped nothing and stays clean — the next connection
+        # fetches immediately.
+        if self._fetch_round_in_flight or self._pump_silent_rounds > 0:
+            self._receive_failure_pending = True
         self._set_connected(False)
         self._logger.warning("MeshCoreSession %s: SDK disconnected", self._adapter_id)
 
@@ -1679,6 +2241,7 @@ class MeshCoreSession:
                     )
                     self._diag.reconnecting = False
                     self._diag.reconnect_attempts = 0
+                    self._start_receive_pump()
                     return
                 except Exception as exc:
                     self._diag.reconnect_attempts += 1
