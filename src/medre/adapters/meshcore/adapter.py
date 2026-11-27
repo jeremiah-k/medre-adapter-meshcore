@@ -657,7 +657,7 @@ class MeshCoreAdapter(AdapterContract):
             adapter_id=self.adapter_id,
             platform=self.platform,
             role=self.role,
-            version="0.2.0",
+            version="0.2.1",
             capabilities=self._capabilities,
             health=health,
         )
