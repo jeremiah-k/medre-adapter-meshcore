@@ -448,10 +448,11 @@ async def test_an_answered_probe_on_a_connection_that_died_issues_no_fetch(
         probe_entered.set()
         # The transport dies as the reply arrives — the disconnect
         # handler has already marked the connection down.
-        session._diag.connected = False
+        await session._on_disconnect_event(None)
         return event(EventType.DEVICE_INFO, {"fw ver": 13})
 
     session = session_with_fetch(get_msg, send_device_query)
+    session._started = True
     session._start_receive_pump()
     try:
         assert await wait_until(lambda: get_msg_calls >= 1, timeout=2)
@@ -466,10 +467,8 @@ async def test_an_answered_probe_on_a_connection_that_died_issues_no_fetch(
             f"(saw {get_msg_calls})"
         )
         assert session._diag.connected is False
-        assert not session._ensure_recovery_task.called, (
-            "the pump's own exit must not start recovery: the disconnect "
-            "handler owns it"
-        )
+        assert session._receive_failure_pending
+        session._ensure_recovery_task.assert_called_once()
     finally:
         await session._stop_receive_pump()
 

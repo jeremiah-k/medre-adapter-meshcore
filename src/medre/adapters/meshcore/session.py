@@ -1617,7 +1617,8 @@ class MeshCoreSession:
                     # rather than gate the drain forever.
                     self._receive_failure_pending = False
                 else:
-                    await self._probe_idle_link(client)
+                    if not await self._probe_idle_link(client):
+                        return
             while (
                 self._meshcore is client
                 and self._diag.connected
@@ -1881,6 +1882,12 @@ class MeshCoreSession:
                     result = await device_query()
             except TimeoutError as exc:
                 raise RuntimeError("idle-link liveness probe timed out") from exc
+            if (
+                self._meshcore is not client
+                or not self._diag.connected
+                or self._stop_requested
+            ):
+                return False
         types = self._sdk_module.EventType
         result_type = getattr(result, "type", None)
         payload = getattr(result, "payload", None)
@@ -1894,6 +1901,11 @@ class MeshCoreSession:
         # Only an elapsed wait or a local failure to send means no reply
         # came from the node; any other reply proves the link is alive
         # and clears the failure-driven gate.
+        if result_type is None or result_type not in (
+            getattr(types, "DEVICE_INFO", None),
+            types.ERROR,
+        ):
+            raise RuntimeError("idle-link liveness probe returned an unexpected result")
         if result_type == types.ERROR and (
             reason in _PROBE_UNANSWERED_REASONS
             or (
@@ -1908,7 +1920,7 @@ class MeshCoreSession:
         self._logger.debug(
             "MeshCoreSession %s: idle-link probe answered %s; the link is alive",
             self._adapter_id,
-            self._fetch_outcome_detail(result, types),
+            getattr(result_type, "name", result_type),
         )
         return True
 
