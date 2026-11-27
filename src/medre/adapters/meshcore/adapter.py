@@ -97,7 +97,7 @@ from medre.adapters.meshcore.packet_classifier import (
     ClassificationResult,
     MeshCorePacketClassifier,
 )
-from medre.adapters.meshcore.session import MeshCoreSession
+from medre.adapters.meshcore.session import DUPLICATE_MESSAGE, MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
 
 try:  # Optional core seam — absent on older medre cores.
@@ -264,18 +264,13 @@ class MeshCoreAdapter(AdapterContract):
         # publication task's done callback and reset at session
         # boundaries, so a new session inherits no stale reservations.
         self._pending_callback_admissions: int = 0
-        # The receive pump's own reservation: one fetched message holds one
-        # admission slot from before its fetch until its publication. The
-        # publication consumes the permit instead of re-reserving, so a
-        # message the node has already popped is never refused at admission.
+        # The pump reserves one slot before a destructive pop and holds
+        # it through an unresolved reply. A matching publication consumes
+        # that slot and keeps the gate closed through durable admission.
         self._pump_permit_pending: bool = False
-        # Stop-and-wait drain bound: while one fetched message's publication
-        # is still on its way to durable admission, the pump issues no
-        # further fetch. The node's fetch is a destructive pop with no
-        # acknowledgement in the protocol, so every message popped but not
-        # yet durable is lost if the process dies; this flag holds the
-        # in-flight count at that one message.
-        self._pump_publication_outstanding: bool = False
+        # A duplicate can promote an already pending publication while
+        # the actual fetched frame also owns a slot. Both must settle.
+        self._pump_publications: int = 0
         self._receive_capacity = asyncio.Event()
         self._receive_capacity.set()
         # A completed task must release only the slot reserved in its own
@@ -355,7 +350,7 @@ class MeshCoreAdapter(AdapterContract):
         self._callback_admission_epoch += 1
         self._pending_callback_admissions = 0
         self._pump_permit_pending = False
-        self._pump_publication_outstanding = False
+        self._pump_publications = 0
         self._receive_capacity = asyncio.Event()
         self._receive_capacity.set()
         self._producer_scheduled_count = 0
@@ -436,6 +431,7 @@ class MeshCoreAdapter(AdapterContract):
         self.ctx = ctx
 
         health_epoch = self._health_lifecycle_epoch
+        admission_epoch = self._callback_admission_epoch
         # While start() is in flight, inbound callbacks are buffered (see
         # _buffer_prestart_packet) instead of dropped: a legacy
         # compatibility SDK may pop a device-queue frame before _started is set.
@@ -444,7 +440,7 @@ class MeshCoreAdapter(AdapterContract):
         # constructor error must close the pre-start window immediately.
         session: MeshCoreSession | None = None
 
-        def receive(packet: dict[str, Any]) -> None:
+        def receive(packet: dict[str, Any]) -> object | None:
             # Fence by lifecycle epoch, not by capturing the session:
             # exactly one session is installed per epoch (start() and
             # stop() each bump the epoch before changing ``_session``),
@@ -455,16 +451,14 @@ class MeshCoreAdapter(AdapterContract):
             # adapter drops it.  Frames past this fence still face every
             # ``_on_message`` gate.
             if health_epoch == self._health_lifecycle_epoch:
-                self._on_message(packet)
+                return self._on_message(packet)
+            return None
 
         async def wait_for_receive_capacity() -> None:
             # The pump reserves its admission slot here, before issuing the
-            # fetch: the node pops the message destructively, so the slot it
-            # will publish into must already exist. While a fetched message
-            # is still on its way to durable admission, the pump waits: at
-            # most one popped message is ever in flight, so a crash of this
-            # process loses at most that one. Once the publication commits
-            # durably its slot frees and the next fetch may reserve again.
+            # fetch: the node pops destructively, so its slot must already
+            # exist. Wait until every pump-owned publication settles before
+            # starting another fetch.
             while health_epoch == self._health_lifecycle_epoch and self._started:
                 if self._pump_publication_outstanding:
                     # Clear before waiting: a set event would return without
@@ -490,7 +484,9 @@ class MeshCoreAdapter(AdapterContract):
                 logger=ctx.logger,
                 on_connection_change=lambda _: self._report_native_health(health_epoch),
                 wait_for_receive_capacity=wait_for_receive_capacity,
-                release_receive_permit=lambda: self._release_fetch_permit(health_epoch),
+                release_receive_permit=lambda: self._release_fetch_permit(
+                    admission_epoch
+                ),
                 receive_permit_ready=lambda: (
                     health_epoch == self._health_lifecycle_epoch
                     and self._pump_permit_pending
@@ -601,7 +597,7 @@ class MeshCoreAdapter(AdapterContract):
         self._callback_admission_epoch += 1
         self._pending_callback_admissions = 0
         self._pump_permit_pending = False
-        self._pump_publication_outstanding = False
+        self._pump_publications = 0
 
         # Stop the session (handles SDK disconnect + cleanup).
         if self._session is not None:
@@ -895,6 +891,10 @@ class MeshCoreAdapter(AdapterContract):
             self._pending_callback_admissions -= 1
             self._receive_capacity.set()
 
+    @property
+    def _pump_publication_outstanding(self) -> bool:
+        return self._pump_publications > 0
+
     def _release_fetch_permit(self, epoch: int) -> None:
         """Release the receive pump's unconsumed inbound-capacity permit.
 
@@ -937,7 +937,7 @@ class MeshCoreAdapter(AdapterContract):
         if epoch == self._callback_admission_epoch:
             self._release_callback_slot()
             if pump_owned:
-                self._pump_publication_outstanding = False
+                self._pump_publications -= 1
             if task.cancelled() and not publication_started:
                 self._producer_cancelled_before_admission_count += 1
         if task.cancelled() and not publication_started:
@@ -1098,7 +1098,7 @@ class MeshCoreAdapter(AdapterContract):
             )
         return discarded
 
-    def _on_message(self, packet: dict[str, Any]) -> None:
+    def _on_message(self, packet: dict[str, Any]) -> object | None:
         """Process an inbound MeshCore event payload from the session.
 
         Classifies the packet, decodes it via the codec, and publishes
@@ -1106,7 +1106,7 @@ class MeshCoreAdapter(AdapterContract):
 
         This is the **session callback** — it receives plain dicts from
         :class:`~medre.adapters.meshcore.session.MeshCoreSession`, never
-        SDK objects.
+        SDK objects. A known duplicate returns a marker to the receive pump.
 
         Admission is bounded: after successful decode, the callback
         reserves one slot (a non-blocking check on the owner loop) and
@@ -1134,9 +1134,9 @@ class MeshCoreAdapter(AdapterContract):
             # losing it (see _buffer_prestart_packet).
             if self._starting:
                 self._buffer_prestart_packet(packet)
-            return
+            return None
         if self.ctx is None:
-            return
+            return None
 
         try:
             classification = self._classifier.classify(packet)
@@ -1144,7 +1144,7 @@ class MeshCoreAdapter(AdapterContract):
 
             # Gate: only relay action packets enter the codec pipeline
             if classification.action != "relay":
-                return
+                return None
 
             # Dedup: suppress redeliveries of an already-published
             # message identity.  The key is the MEDRE-derived identity
@@ -1168,14 +1168,14 @@ class MeshCoreAdapter(AdapterContract):
                 if dedup_key in self._inbound_dedup:
                     self._inbound_dedup.move_to_end(dedup_key)
                 if self._pump_permit_pending:
-                    # A fetched duplicate of an unsolicited publication is
-                    # not yet durable. Transfer drain ownership to that task
-                    # before releasing the unused extra reservation.
+                    # The duplicate may be a delayed delivery from an
+                    # earlier fetch. Keep the slot for the outstanding reply.
+                    # If this identity is still pending, protect its admission
+                    # as well without taking another callback slot.
                     pending = self._pending_dedup_publications.get(dedup_key)
                     if pending is not None:
                         pending[1]()
-                self._release_fetch_permit(self._callback_admission_epoch)
-                return
+                return DUPLICATE_MESSAGE
 
             # Decode before committing dedup key so that decode failures
             # do not suppress redelivery of the same packet.
@@ -1202,7 +1202,7 @@ class MeshCoreAdapter(AdapterContract):
                 pump_owned_publication = True
             elif not self._reserve_callback_slot():
                 self._refuse_callback_admission()
-                return
+                return None
 
             # Commit dedup key only after successful decode and slot
             # reservation.  The key guards the async publish window
@@ -1222,8 +1222,9 @@ class MeshCoreAdapter(AdapterContract):
 
             def promote() -> None:
                 nonlocal pump_owned_publication
-                pump_owned_publication = True
-                self._pump_publication_outstanding = True
+                if not pump_owned_publication:
+                    pump_owned_publication = True
+                    self._pump_publications += 1
 
             async def publish() -> None:
                 nonlocal publication_started
@@ -1249,7 +1250,7 @@ class MeshCoreAdapter(AdapterContract):
             # A fetched message's publication holds the drain until it
             # commits durably: only one popped message is ever in flight.
             if pump_owned_publication:
-                self._pump_publication_outstanding = True
+                self._pump_publications += 1
             if dedup_key is not None and dedup_token is not None:
                 self._pending_dedup_publications[dedup_key] = (dedup_token, promote)
 
@@ -1289,6 +1290,7 @@ class MeshCoreAdapter(AdapterContract):
                     "MeshCoreAdapter %s: error processing inbound packet",
                     self.adapter_id,
                 )
+        return None
 
     async def _on_message_async(
         self,

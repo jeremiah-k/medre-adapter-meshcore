@@ -1,11 +1,11 @@
 """Receive-pump idle fetches and the pump's inbound-capacity permit.
 
 The node's fetch is a destructive pop, so a fetch window that elapses with
-no inbound traffic parks the pump at once: the window may have ended
+no distinct text parks the pump at once: the window may have ended
 because the node popped a message whose frame was lost, and re-issuing
 would pop another message into a link that is not returning what it pops.
-A window that elapses while traffic is still arriving — a late frame, or a
-notification — means the link is slow but delivering: the pump keeps the
+A window that elapses while distinct text is still arriving
+means the link is slow but delivering: the pump keeps the
 connection and re-issues at a bounded rate. A frame that pops after its
 window publishes through the SDK event callback, which wakes the pump, so
 a slow link resumes its interrupted drain on the same connection. Only a
@@ -15,7 +15,8 @@ The pump holds at most one inbound-capacity permit, acquired before it
 issues a fetch; the fetched message's publication consumes the permit
 instead of re-reserving, so a message the node has already popped is never
 refused at admission. A drain that ends without a fetched message releases
-the permit.
+the permit when the queue is empty or the pump retires. An unresolved pop
+retains it for a late reply.
 
 Deterministic SDK-shape tests: no network, no hardware, no fixed sleeps —
 condition-based waiting only. The idle/permit tests pin the empty-window
@@ -33,6 +34,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import pytest
 from medre.core.contracts.adapter import AdapterContext
 
 from medre.adapters.meshcore.adapter import MeshCoreAdapter
@@ -532,34 +534,24 @@ async def test_a_full_inbound_queue_blocks_the_gate_until_capacity_frees() -> No
         await adapter.stop()
 
 
-async def test_duplicate_fetched_frame_releases_the_permit() -> None:
-    """A fetched frame suppressed by dedup frees its admission permit."""
+async def test_known_duplicate_keeps_the_outstanding_reply_permit() -> None:
     publisher = _HeldPublisher()
     sink = _PressureSink()
-    adapter = await _start_adapter(publisher, sink, max_pending=2)
+    adapter = await _start_adapter(publisher, sink, max_pending=1)
     try:
-        gate = adapter._session._wait_for_receive_capacity
-        # A first copy publishes normally.
-        adapter._on_message(_packet(0))
-        assert await asyncio.wait_for(publisher.entered.wait(), 2)
-        # The pump's permit for the (redelivered) frame is pending.
-        await asyncio.wait_for(gate(), 2)
-        assert adapter._pump_permit_pending is True
-        assert adapter._pending_callback_admissions == 2
-        # The duplicate is fetched, then suppressed: fetched but not
-        # published, so the permit must be released, not held.
-        adapter._on_message(_packet(0))
-        assert adapter._pump_permit_pending is False
-        assert adapter._pending_callback_admissions == 1
-        assert adapter._receive_capacity.is_set()
-        assert sink.outcome_count("overflow") == 0
-        # The freed slot is acquirable again.
         publisher.gate.set()
+        adapter._on_message(_packet(0))
         await asyncio.wait_for(asyncio.gather(*tuple(adapter._background_tasks)), 2)
-        await asyncio.wait_for(gate(), 2)
-        assert adapter._pump_permit_pending is True
+        session = adapter._session
+        await asyncio.wait_for(session._wait_for_receive_capacity(), 2)
+        adapter._on_message(_packet(0))
+        assert adapter._pump_permit_pending
+        assert adapter._pending_callback_admissions == 1
+        assert not adapter._background_tasks
+        session._release_fetch_permit()
+        assert adapter._pending_callback_admissions == 0
+        assert sink.outcome_count("overflow") == 0
     finally:
-        publisher.gate.set()
         await adapter.stop()
 
 
@@ -821,3 +813,106 @@ async def test_channel_data_drain_at_larger_capacity_never_double_holds_a_slot(
         assert adapter._pending_callback_admissions == 1
     finally:
         await _stop_scripted_adapter(adapter, publisher)
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+async def test_unresolved_pop_holds_the_slot_until_the_late_message_commits(
+    duplicate, monkeypatch
+) -> None:
+    # Keep probes outside this test's budget. Only the true late frame
+    # may re-arm the drain here, even if the SDK returns the previous frame.
+    monkeypatch.setattr("medre.adapters.meshcore.session._PROBE_IDLE_INTERVAL", 60.0)
+    entered = asyncio.Event()
+    allow_commit = asyncio.Event()
+    drained = asyncio.Event()
+    started: list[str] = []
+    committed: list[str] = []
+    fetches: list[int] = []
+
+    async def publisher(canonical):
+        body = str(canonical.payload["body"])
+        started.append(body)
+        if len(started) == 2:
+            entered.set()
+            await allow_commit.wait()
+        committed.append(body)
+
+    def text(index):
+        return event(PinnedEventType.CHANNEL_MSG_RECV, _packet(index))
+
+    async def dispatch(frame):
+        for callback in subscriptions[frame.type]:
+            await callback(frame)
+
+    async def get_msg(*, timeout):
+        fetches.append(len(fetches))
+        if len(fetches) == 1:
+            frame = text(0)
+            await dispatch(frame)
+            return frame
+        if len(fetches) == 2:
+            assert len(committed) == 1
+            await dispatch(event(PinnedEventType.MESSAGES_WAITING))
+            if duplicate:
+                frame = text(0)
+                await dispatch(frame)
+                return frame
+            return event(PinnedEventType.ERROR, {"reason": "no_event_received"})
+        assert len(committed) == 2
+        drained.set()
+        return event(PinnedEventType.NO_MORE_MSGS)
+
+    instance, subscriptions = _scripted_instance(get_msg)
+    sink = _PressureSink()
+    adapter = await _start_scripted_adapter(instance, publisher, sink, max_pending=1)
+    try:
+        assert await wait_until(lambda: adapter._session._pump_parked, timeout=2)
+        assert fetches == [0, 1]
+        assert adapter._pump_permit_pending
+        for _ in range(3):
+            await dispatch(event(PinnedEventType.MESSAGES_WAITING))
+        assert not adapter._session._fetch_wake.is_set()
+
+        await dispatch(text(1))
+        await asyncio.wait_for(entered.wait(), 2)
+        assert adapter._pump_publication_outstanding
+        assert adapter._pending_callback_admissions == 1
+        assert sink.outcome_count("overflow") == 0
+        assert fetches == [0, 1]
+
+        allow_commit.set()
+        await asyncio.wait_for(drained.wait(), 2)
+        assert fetches == [0, 1, 2]
+        assert len(committed) == 2
+    finally:
+        allow_commit.set()
+        await _stop_scripted_adapter(adapter, publisher)
+
+
+async def test_receive_permit_uses_admission_epoch_after_cancelled_stop(monkeypatch):
+    adapter = await _start_adapter(_HeldPublisher(), _PressureSink(), max_pending=1)
+    context = adapter.ctx
+    stop_entered = asyncio.Event()
+
+    async def hold_stop(*args, **kwargs):
+        stop_entered.set()
+        await asyncio.Event().wait()
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(adapter, "_drain_background_tasks", hold_stop)
+            stopping = asyncio.create_task(adapter.stop())
+            await asyncio.wait_for(stop_entered.wait(), 2)
+            stopping.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stopping
+        await adapter.stop()
+        await adapter.start(context)
+        assert adapter._health_lifecycle_epoch != adapter._callback_admission_epoch
+        session = adapter._session
+        await asyncio.wait_for(session._wait_for_receive_capacity(), 2)
+        session._release_fetch_permit()
+        assert not adapter._pump_permit_pending
+        assert adapter._pending_callback_admissions == 0
+    finally:
+        await adapter.stop()

@@ -189,26 +189,24 @@ async def test_consumed_permit_is_reacquired_after_waiting_for_send_lock():
 
 
 @pytest.mark.asyncio
-async def test_one_notification_cannot_keep_silent_rounds_draining():
-    parked = asyncio.Event()
+async def test_a_notification_during_a_silent_round_does_not_rearm_the_fetch():
+    returned = asyncio.Event()
     calls = 0
 
     async def get_msg(*, timeout):
         nonlocal calls
         calls += 1
-        if calls == 1:
-            session._fetch_wake.set()
-        elif calls == 2:
-            parked.set()
+        session._fetch_wake.set()
+        returned.set()
         return SimpleNamespace(type=EventType.ERROR, payload={"reason": "timeout"})
 
     session = session_with_fetch(get_msg)
     session._start_receive_pump()
     try:
-        await asyncio.wait_for(parked.wait(), 2)
-        await asyncio.sleep(0)
-        assert calls == 2
+        await asyncio.wait_for(returned.wait(), 2)
+        assert calls == 1
         assert session._pump_parked
+        assert not session._fetch_wake.is_set()
     finally:
         await session._stop_receive_pump()
 

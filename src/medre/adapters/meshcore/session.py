@@ -156,18 +156,8 @@ _BLE_CONNECT_ATTEMPT_TIMEOUT: float = 45.0  # includes BlueZ cleanup and discove
 # deep; it does not extend the startup deadline or require a guessed queue cap.
 _FETCH_ROUND_TIMEOUT: float = 2.0
 
-# A fetch window that elapses with no inbound traffic at all parks the pump
-# at once: the node's fetch is a destructive pop, so the window may have
-# ended because it popped a message whose frame was lost, and re-issuing
-# would pop another message into a link that is not returning what it pops.
-# A window that elapses while inbound traffic is still arriving — a late
-# frame, or a notification — means the link is slow but delivering: the
-# pump keeps the connection and re-issues, because publication happens in
-# the SDK event callback whenever the frame actually arrives, even if it
-# pops after the window. That re-issue rate stays bounded: at most
-# _FETCH_IDLE_IMMEDIATE_REISSUES consecutive immediate re-issues, after
-# which each further re-issue waits for a notification or
-# _FETCH_IDLE_REISSUE_DELAY, whichever comes first.
+# Pace retries when a text frame arrives in an elapsed fetch window.
+# A window with no distinct text parks immediately instead.
 _FETCH_IDLE_IMMEDIATE_REISSUES: int = 2
 _FETCH_IDLE_REISSUE_DELAY: float = 2.0
 
@@ -211,6 +201,9 @@ def _retry_delay_contact_key(contact_id: str) -> str:
 # Type alias for the inbound message callback.
 # The callback receives a plain dict (native payload), NOT an SDK Event object.
 # Both sync and async callables are accepted.
+# The adapter has already seen this identity. It may be an old response
+# rather than evidence that the current destructive pop returned.
+DUPLICATE_MESSAGE = object()
 MessageCallback = Callable[[dict[str, Any]], Any]
 
 
@@ -393,7 +386,7 @@ class MeshCoreSession:
         # probe never fetches for it.
         self._pump_drain_incomplete: bool = False
         # True while the pump is parked — waiting for traffic, a
-        # notification, or an answered probe — so a frame publishing
+        # notification, or an answered probe — so a distinct text frame
         # through the event callback wakes it. A frame published while a
         # drain is running is that drain's business; waking would only
         # leave a stale wake behind after the drain's final empty-queue
@@ -412,10 +405,10 @@ class MeshCoreSession:
         self._stop_requested: bool = False
         self._reconnect_task: asyncio.Task[None] | None = None
         self._initial_start_task: asyncio.Task[Any] | None = None
-        # Bumped for every event the SDK dispatcher delivers, so the
-        # receive pump can tell an idle-but-delivering link (late responses
-        # keep arriving) from a silent one that returns nothing at all.
+        # Distinct text and known duplicate callbacks have separate counts.
+        # Only distinct text is evidence that an unresolved pop returned.
         self._fetch_inbound_seen: int = 0
+        self._fetch_duplicates_seen: int = 0
 
         # Send serialization: ensures pacing sleeps are not bypassed when
         # multiple send_text() calls overlap via pipeline fan-out.
@@ -1494,7 +1487,11 @@ class MeshCoreSession:
             self._fetch_wake = wake
 
             async def on_waiting(_event: Any) -> None:
-                if self._meshcore is client and self._fetch_wake is wake:
+                if (
+                    self._meshcore is client
+                    and self._fetch_wake is wake
+                    and not self._pump_silent_rounds
+                ):
                     wake.set()
 
             self._subscriptions.append(
@@ -1546,26 +1543,14 @@ class MeshCoreSession:
         not by command ID — one fetch runs at a time, and the next fetch is
         issued only after the previous one returned.
 
-        A fetch window that elapses with no inbound traffic parks the pump
-        at once: the node's fetch is a destructive pop, so the window may
-        have ended because the node popped a message whose frame was lost,
-        and every further fetch would pop another message into a link that
-        is not returning what it pops. The reserved capacity permit is
-        released, as any interrupted drain's is, and a frame that pops
-        after the window still publishes through the SDK event callback —
-        which wakes the pump, so a slow-but-delivering link resumes its
-        interrupted drain on the same connection. A window that elapses
-        while inbound traffic is still arriving — a late frame, or a
-        notification — means the link is delivering, however slowly: the
-        pump keeps the connection and re-issues at a bounded rate. A parked
-        wait is bounded by the idle-link liveness probe: if nothing wakes
-        the pump within _PROBE_IDLE_INTERVAL, it asks the node one cheap
-        local query; a probe that times out or errors is a silent-dead link
-        and retires the connection. An answered probe re-arms exactly one
-        fetch for a drain the elapsed window interrupted; a drain that
-        ended with the node's NO_MORE_MSGS is complete and an answered
-        probe never fetches for it. Only a real transport or protocol
-        failure retires the connection.
+        A fetch window with no distinct text parks the pump. The current
+        permit stays reserved for a late reply. A distinct text callback can
+        resume the drain; repeated notifications and known duplicate replies
+        cannot account for the destructive pop. A paced retry is allowed
+        when new text arrives before an elapsed window closes. An answered
+        idle probe re-arms one interrupted fetch, and an unanswered probe
+        retires the connection. After NO_MORE_MSGS a probe checks reachability
+        without fetching.
 
         A connection that follows a failure-driven retirement — its
         predecessor died of a fetch or probe failure, or of a transport loss
@@ -1598,6 +1583,8 @@ class MeshCoreSession:
         # interrupted yet.
         self._pump_drain_incomplete = False
         self._pump_parked = False
+        self._pump_silent_rounds = 0
+        self._fetch_duplicates_seen = 0
         try:
             if (
                 self._meshcore is client
@@ -1649,12 +1636,10 @@ class MeshCoreSession:
                         permit_ready = getattr(self, "_receive_permit_ready", None)
                         if permit_ready is not None and not permit_ready():
                             continue
-                        # Keep the pending extra drain but consume each push
-                        # as liveness evidence at most once.
-                        notified = wake.is_set()
-                        pending_notification |= notified
+                        pending_notification |= wake.is_set()
                         wake.clear()
                         inbound_before = self._fetch_inbound_seen
+                        duplicates_before = self._fetch_duplicates_seen
                         self._fetch_round_in_flight = True
                         try:
                             async with asyncio.timeout(_FETCH_ROUND_TIMEOUT + 0.5):
@@ -1663,8 +1648,13 @@ class MeshCoreSession:
                                 )
                         finally:
                             self._fetch_round_in_flight = False
-                    notified = notified or wake.is_set()
-                    pending_notification |= notified
+                    if (
+                        self._meshcore is not client
+                        or not self._diag.connected
+                        or self._stop_requested
+                    ):
+                        return
+                    pending_notification |= wake.is_set()
                     wake.clear()
                     if event.type == types.NO_MORE_MSGS:
                         idle_rounds = 0
@@ -1677,12 +1667,17 @@ class MeshCoreSession:
                         if pending_notification:
                             wake.set()
                         break
-                    if self._fetch_window_elapsed(event, types):
+                    text_arrived = self._fetch_inbound_seen != inbound_before
+                    duplicate_reply = (
+                        event.type in message_types
+                        and self._fetch_duplicates_seen != duplicates_before
+                        and not text_arrived
+                    )
+                    if self._fetch_window_elapsed(event, types) or duplicate_reply:
                         idle_rounds += 1
-                        if self._fetch_inbound_seen != inbound_before or notified:
-                            # Late frames and notifications arriving between
-                            # rounds prove the link is slow but delivering;
-                            # re-issuing at a bounded rate keeps draining it.
+                        if text_arrived:
+                            # Text delivery justifies a paced retry. A push
+                            # notification alone cannot account for a pop.
                             self._pump_silent_rounds = 0
                             self._logger.debug(
                                 "MeshCoreSession %s: fetch window elapsed with "
@@ -1705,23 +1700,13 @@ class MeshCoreSession:
                                     pass
                             await asyncio.sleep(0)
                             continue
-                        # No inbound traffic at all: the window may have
-                        # ended because the node popped a message whose
-                        # frame was lost, and every further fetch would pop
-                        # another message into a link that is not returning
-                        # what it pops. Park at once instead. Keep the
-                        # silent round where a disconnect handler can see
-                        # it: this round popped a message the link never
-                        # returned, however the connection ends. Traffic or
-                        # a notification resumes the drain; so does one
-                        # answered liveness probe, because the last drain
-                        # ended without the node's NO_MORE_MSGS.
+                        # The pop remains unresolved. Preserve its slot for
+                        # a late reply and carry the uncertainty to a reconnect.
                         idle_rounds = 0
                         self._pump_silent_rounds += 1
                         self._pump_drain_incomplete = True
-                        self._release_fetch_permit()
-                        # Parked: a frame publishing through the event
-                        # callback now wakes the pump.
+                        # A distinct text frame can wake the park. The
+                        # notification callback suppresses pushes here.
                         self._pump_parked = True
                         self._logger.debug(
                             "MeshCoreSession %s: fetch window elapsed with "
@@ -1758,6 +1743,7 @@ class MeshCoreSession:
                             " instead of a message or empty queue"
                         )
                     idle_rounds = 0
+                    self._pump_silent_rounds = 0
                     # Publication stays in the SDK event callback; yield to
                     # its dispatcher and to pending sends before fetching again.
                     await asyncio.sleep(0)
@@ -2071,21 +2057,8 @@ class MeshCoreSession:
         forwards it to the registered message callback.  The payload
         is a plain dict — no SDK objects leak into the adapter layer.
         """
-        # The receive pump counts these deliveries to tell an idle-but-
-        # delivering link from a silent one; bump before any early exit.
-        self._fetch_inbound_seen += 1
-        # A frame that pops after its fetch window has elapsed still
-        # publishes here — and it proves the link delivers, so it wakes a
-        # parked pump: a slow-but-delivering link then resumes its
-        # interrupted drain on the same connection instead of waiting for
-        # a new notification. A frame published while a drain is running
-        # sets no wake: that drain fetches again anyway, and a wake set
-        # now would only survive as a stale one after the drain's final
-        # empty-queue round.
-        if self._pump_parked and self._fetch_wake is not None:
-            self._fetch_wake.set()
-
         if self._message_callback is None:
+            self._note_text_delivery()
             return
 
         try:
@@ -2100,6 +2073,10 @@ class MeshCoreSession:
 
             self._diag.last_message_time = datetime.now(timezone.utc)
             result = self._message_callback(payload)
+            if result is DUPLICATE_MESSAGE:
+                self._fetch_duplicates_seen += 1
+                return
+            self._note_text_delivery()
             if asyncio.iscoroutine(result):
                 task = asyncio.ensure_future(result)
                 task.add_done_callback(self._log_task_exception)
@@ -2113,6 +2090,12 @@ class MeshCoreSession:
                 self._adapter_id,
                 exc,
             )
+
+    def _note_text_delivery(self) -> None:
+        self._fetch_inbound_seen += 1
+        self._pump_silent_rounds = 0
+        if self._pump_parked and self._fetch_wake is not None:
+            self._fetch_wake.set()
 
     def _log_task_exception(self, task: asyncio.Task[Any]) -> None:
         """Done callback for fire-and-forget tasks — logs exceptions

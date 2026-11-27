@@ -35,46 +35,26 @@ client's notify session survives in the host stack and is re-armed on the
 next connection; the pinned SDK clears such a stale registration only when
 the same connection object reconnects, which this adapter's
 fresh-client-per-connect policy never does, and no public SDK API reaches a
-dropped client's session. A duplicated frame resolves one fetch round, so
-each duplicate costs one extra fetch; every round still pops at most one
-queued message in node order, the extra rounds run against the emptied
-queue and pop nothing, and the drain still ends on the node's NO_MORE_MSGS.
-The adapter's ingress deduplication collapses each duplicated pair to one
-stored event. Absorbing this host-stack artefact is not a delivery promise:
-the destructive pop protocol cannot promise exactly-once across reconnects.
+dropped client's session. The adapter recognizes known duplicate text by
+its ingress identity. If a duplicate arrives during another fetch, it may
+belong to an earlier request. The receive pump MUST park if the SDK returns
+only that duplicate, retaining the admission permit until distinct text
+arrives or an answered probe re-arms the fetch. Duplicate delivery does
+not publish a second copy of a known identity.
 
-A fetch window that elapses with no event is an empty window: the node had
-nothing ready within it, or it popped a message whose frame did not arrive
-in time. The SDK reports that state as an ERROR event whose payload reason
-says no event was received (or timed out). A frame that pops after the
-window still publishes through the SDK event callback, which sees every
-direct-message and channel-text frame the connection delivers — counted
-whether or not the frame publishes; frames the callback is not subscribed
-to, such as binary channel data or device replies, count as nothing — and
-that callback wakes the pump, so a slow-but-delivering link resumes its
-interrupted drain on the same connection, with no loss and no reconnect.
-A window
-that elapses while inbound traffic is still arriving — a late frame, or a
-notification — means the link is delivering, however slowly: the pump
-keeps the connection and re-issues the fetch, and the re-issue rate MUST
-stay bounded — a bounded number of consecutive immediate re-issues, after
-which each further round waits for a notification or a fixed floor delay —
-so a slow link neither spins nor strands its backlog. Each
-MESSAGES_WAITING notification is liveness evidence for at most one
-elapsed round: it is consumed for pacing once, and a notification that
-races the node's NO_MORE_MSGS answer triggers exactly one extra drain
-before the pump parks again. A window that
-elapses with no inbound traffic at all MUST park the pump at once: the
-node's fetch is a destructive pop, so the window may have ended because
-the node popped a message whose frame was lost, and every further fetch
-would pop another message into a link that is not returning what it pops.
-The reserved capacity permit is released, as any interrupted drain's is,
-and the silent round stays recorded, so a transport loss behind it is
-recognised as unclean. Repeated elapsed windows are logged at DEBUG, not
-as warnings. A reply that is neither a message, nor an empty queue, nor an
-elapsed window — a node ERROR reply, a malformed result, a transport-level
-failure — retires the connection for ordinary recovery. Stop and client
-replacement MUST cancel the old pump before disconnecting the SDK.
+A fetch window may elapse before a reply arrives. The SDK reports that
+state as ERROR with a reason of no_event_received or timeout. If distinct
+direct-message or channel text arrived during that window, the pump can
+retry on the same connection, with bounded immediate retries and pacing
+afterward. Otherwise the pump MUST park and retain its one admission permit
+for the late frame. A late distinct text frame consumes that permit, holds
+the drain until its admission is settled, and wakes the pump. A
+MESSAGES_WAITING notification alone MUST NOT re-arm a parked fetch with an
+unresolved pop. It still wakes a completed drain, and one that races
+NO_MORE_MSGS requests one additional drain. An answered idle probe re-arms
+one unresolved fetch at the normal probe cadence. Repeated elapsed windows
+are logged at DEBUG. Other fetch failures retire the connection. Stop and
+client replacement MUST cancel the old pump before disconnecting the SDK.
 
 A binary channel-data frame is popped but never relayed: the adapter
 publishes text messages only. The node's queue is FIFO and destructive, so
@@ -176,10 +156,16 @@ existing seam that signals exactly that, so the pump resumes only from the
 point where the message has left the adapter's hand for good. At most one
 popped message is ever in flight: if the process dies, committed messages
 survive in storage, the uncommitted remainder is still queued at the node,
-and the only possible loss is the single message that was in flight. The
-protocol has no delivery receipt, so even that bound is not a guarantee —
-a message already handed to the client process at the moment of a crash is
-lost, and that is at most one message per crash. A drain that ends without
+and on an orderly queue with one distinguishable reply per fetch, the only
+possible uncommitted popped message is the one in flight. The protocol
+has no delivery receipt. The SDK uses the same event types for fetched
+and unsolicited text and has no request identity. A distinct unsolicited
+frame arriving inside a fetch can therefore be mistaken for its reply.
+That overlap can consume the reservation before the fetched frame arrives,
+and capacity pressure can refuse the fetched frame. The one-in-flight
+claim assumes the companion returns queued text only in response to a
+fetch and one matching reply resolves each fetch before the next one. A
+late reply that overlaps a retry can also be ambiguous. A drain that ends without
 a fetched message (empty queue, retirement, stop, or a fetched frame
 suppressed by dedup or decode) releases the slot. Unsolicited packets
 still reserve on publication and can still be refused under pressure as
@@ -212,14 +198,12 @@ stating that native fetches are paused, recovery logs one info line, and
 no counters, health states, or configuration fields are added for this.
 Core's admission-pressure accounting counts every refused attempt, so a
 retained retry is counted per attempt; refused attempts must not be read
-as unique messages permanently lost. The retained message lives only in
-memory: stopping the adapter releases it unadmitted, and the documented
-loss bound stays at most one popped message per stop or crash. A fetched
-duplicate of an unsolicited publication whose publication has not
-completed promotes that publication to pump ownership instead of
-publishing a second copy; pending ownership is token-fenced, bounded by
-the outstanding publications, and a stale completion cannot evict a
-newer owner's reservation.
+as unique messages permanently lost. Retained publications live in memory and stop releases them. A duplicate
+of a pending unsolicited publication promotes that publication to pump
+ownership without taking another callback slot. The permit stays reserved
+for the outstanding reply. The pump waits for both publications if a
+distinct reply arrives before the promoted publication settles. Pending
+ownership is bounded by the callback pool and token-fenced.
 
 ## Qualification
 

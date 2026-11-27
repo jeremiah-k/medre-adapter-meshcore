@@ -249,7 +249,8 @@ async def test_fetched_duplicate_promotes_pending_unsolicited_publication():
         await asyncio.wait_for(gate(), 2)
         adapter._on_message(_packet(0))
         assert adapter._pump_publication_outstanding
-        assert adapter._pending_callback_admissions == 1
+        assert adapter._pending_callback_admissions == 2
+        assert adapter._pump_permit_pending
         gate_task = asyncio.create_task(gate())
         release.set()
         await asyncio.wait_for(gate_task, 3)

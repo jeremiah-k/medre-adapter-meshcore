@@ -9,20 +9,11 @@ respects callback-capacity pressure. At connect time the pinned SDK itself
 fetches nothing — its handshake only sends APP_START — so the pump's
 initial wakeup is the only connect-time fetch.
 
-A fetch window that elapses with no inbound traffic parks the pump at
-once: the node's fetch is a destructive pop, and a window that ends
-without returning anything may have popped a message whose frame was
-lost, so every further fetch would pop another message into a link that
-is not returning what it pops. The reserved admission permit is released
-and the silent round stays recorded, so a transport loss behind it is
-recognised as unclean. A window that elapses while inbound traffic
-continues arriving — a late frame, or a notification — means the link is
-delivering, however slowly: the pump keeps the connection and re-issues
-at a bounded rate. A frame that pops after its window publishes through
-the SDK event callback, which wakes the pump: a slow-but-delivering link
-resumes its interrupted drain on the same connection. A reply that is
-neither a message, nor an empty queue, nor an elapsed window retires the
-connection for ordinary recovery.
+An elapsed fetch or a known duplicate leaves the destructive pop
+unresolved. The pump parks and retains its admission slot for a late
+reply. A distinct text frame resumes the drain after publication. An
+answered idle probe can re-arm one fetch. Queue notifications wake a
+completed drain and cannot re-arm an unresolved one.
 
 Because a parked pump cannot tell a truly idle node from a link that died
 silently — the peer vanished without a FIN or RST, so nothing ever fails
@@ -50,22 +41,9 @@ probe before its first fetch and fetches only if that probe is answered;
 otherwise it retires having popped nothing. A fresh start and a reconnect
 after a clean disconnect fetch immediately.
 
-The drain is stop-and-wait: the pump reserves one bounded-admission slot
-before it fetches, the fetched message's publication consumes that slot
-instead of reserving again, and the pump waits for the publication's
-completion — the seam that signals core's durable admission commit —
-before the next fetch. At most one popped message is ever in flight, and
-a crash loses at most that one. Messages the client process had taken in
-before it died remain lost — that is the protocol's no-acknowledgement
-boundary, not a guarantee. A drain that ends without a fetched message
-gives the slot back. Binary channel-data frames are popped and dropped:
-the adapter relays text messages only, the node's queue is FIFO and
-destructive, so the pump pops each such frame, releases its admission
-permit, logs one DEBUG line, and keeps draining — the pop is accounted
-for and never counts as lost traffic. Over BLE, a warm reconnect after an
-unclean drop can make the host Bluetooth stack deliver every notification
-twice; each duplicate resolves one fetch round against a queue that pops
-in node order, and the adapter's ingress deduplication collapses each
-duplicated pair to one stored event. Absorbing that host-stack artefact
-is queue retrieval, not an exactly-once promise. The SDK event decoder
-remains the only publication path.
+The pump reserves one bounded admission slot before a destructive fetch
+and waits for durable admission before continuing. Known duplicate
+identities remain deduplicated. Binary channel-data frames release the
+slot and advance the queue without publication. The SDK does not carry
+request identity, so a distinct unsolicited frame or a late reply that
+overlaps a new request can still be mistaken for that request's reply.

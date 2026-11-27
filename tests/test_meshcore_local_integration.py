@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import Any
 
 import pytest
 from medre_meshcore_tests.helpers.async_utils import wait_until
-from medre_meshcore_tests.helpers.meshcore_local_node import LocalMeshCoreNode
+from medre_meshcore_tests.helpers.meshcore_local_node import (
+    LocalMeshCoreNode,
+    channel_message_payload,
+)
 
 from medre.adapters.meshcore import session as session_mod
+from medre.adapters.meshcore.adapter import MeshCoreAdapter
 from medre.adapters.meshcore.errors import MeshCoreConnectionError
 from medre.adapters.meshcore.session import MeshCoreSession
 from medre.config.adapters.meshcore import MeshCoreConfig
@@ -291,3 +296,71 @@ async def test_real_sdk_local_soak_repeated_lifecycle_and_send() -> None:
             await session.stop()
         assert node.connection_count == 10
         assert len(node.send_commands) == 10
+
+
+async def test_real_sdk_delayed_duplicate_cannot_advance_the_native_queue(
+    monkeypatch: pytest.MonkeyPatch, make_adapter_context: Any
+) -> None:
+    """Separate the node's destructive pop from the SDK's response waiter."""
+    send_second = asyncio.Event()
+    second_admitting = asyncio.Event()
+    commit_second = asyncio.Event()
+    committed: list[str] = []
+
+    async def publish(canonical):
+        body = str(canonical.payload["body"])
+        if body == "second":
+            second_admitting.set()
+            await commit_second.wait()
+        committed.append(body)
+
+    async with LocalMeshCoreNode() as node:
+        for text in ("first", "second", "third"):
+            node.queue_channel_message(text)
+        handle = node._handle_command
+
+        async def handle_fetch(payload, writer):
+            if payload != b"\x0a" or node.commands.count(b"\x0a") != 2:
+                await handle(payload, writer)
+                return
+            second, channel_index = node.queued_messages.pop(0)
+            assert second == "second"
+            await node._respond(writer, channel_message_payload("first"))
+            await send_second.wait()
+            await node._respond(
+                writer, channel_message_payload(second, channel_index=channel_index)
+            )
+
+        monkeypatch.setattr(node, "_handle_command", handle_fetch)
+        adapter = MeshCoreAdapter(
+            replace(_config(node), max_pending_ingress_callbacks=1)
+        )
+        context = make_adapter_context("meshcore-local-integration")
+        context.publish_inbound = publish
+        await adapter.start(context)
+        try:
+            session = adapter._session
+            assert session is not None
+            assert await wait_until(
+                lambda: session._pump_parked and session._pump_silent_rounds == 1,
+                timeout=2,
+            )
+            assert node.commands.count(b"\x0a") == 2
+            assert node.queued_messages == [("third", 0)]
+            send_second.set()
+            await asyncio.wait_for(second_admitting.wait(), 2)
+            assert session._receive_permit_ready is not None
+            assert not session._receive_permit_ready()
+            assert node.commands.count(b"\x0a") == 2
+            assert committed == ["first"]
+            commit_second.set()
+            assert await wait_until(
+                lambda: committed == ["first", "second", "third"]
+                and session._pump_parked,
+                timeout=2,
+            )
+            assert node.queued_messages == []
+        finally:
+            send_second.set()
+            commit_second.set()
+            await adapter.stop()

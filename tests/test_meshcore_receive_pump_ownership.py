@@ -44,6 +44,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from medre_meshcore_tests.helpers.async_utils import wait_until
 from medre_meshcore_tests.helpers.meshcore_session import (
     install_mock_module,
     remove_mock_module,
@@ -174,14 +175,19 @@ async def test_pump_never_publishes_fetch_results() -> None:
     """SDK events are the only publication path; the pump does not publish."""
     published: list[dict[str, Any]] = []
     mock_mc, instance = _mock_module(ExplicitEventType)
+    instance.commands.get_msg.side_effect = [
+        SimpleNamespace(
+            type=ExplicitEventType.CHANNEL_MSG_RECV, payload={"text": "queued"}
+        ),
+        SimpleNamespace(type=ExplicitEventType.NO_MORE_MSGS),
+    ]
     install_mock_module(mock_mc)
     session = _session()
     try:
         with patch("medre.adapters.meshcore.session.HAS_MESHCORE", True):
             await session.start(published.append)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        assert instance.commands.get_msg.await_count >= 1
+        assert await wait_until(lambda: session._pump_parked, timeout=2)
+        assert instance.commands.get_msg.await_count == 2
         assert published == []
     finally:
         await session.stop()
@@ -236,6 +242,17 @@ async def test_each_notification_drives_exactly_one_more_drain() -> None:
 async def test_replaced_client_cannot_fetch_again() -> None:
     """A client replaced mid-flight cannot issue another native fetch."""
     mock_mc, instance = _mock_module(ExplicitEventType)
+    entered = asyncio.Event()
+    reply = asyncio.Event()
+
+    async def get_msg(*, timeout):
+        entered.set()
+        await reply.wait()
+        return SimpleNamespace(
+            type=ExplicitEventType.CHANNEL_MSG_RECV, payload={"text": "late"}
+        )
+
+    instance.commands.get_msg.side_effect = get_msg
     install_mock_module(mock_mc)
     session = _session()
     try:
@@ -243,21 +260,15 @@ async def test_replaced_client_cannot_fetch_again() -> None:
             await session.start(lambda _payload: None)
         pump = session._fetch_task
         assert pump is not None
-        await asyncio.sleep(0.02)
-        calls = instance.commands.get_msg.await_count
-
-        # Replace the client underneath the running pump.
-        _replacement_module, replacement_instance = _mock_module(ExplicitEventType)
-        session._meshcore = replacement_instance
-        await asyncio.sleep(0.02)
-
-        assert instance.commands.get_msg.await_count == calls
-        assert replacement_instance.commands.get_msg.await_count == 0
-        # The pump parks on the retired client's wake event, which the
-        # stale client can no longer set; only _stop_receive_pump()
-        # retires it.  Either way no further native fetch is issued.
-        assert not pump.cancelled()
+        await asyncio.wait_for(entered.wait(), 2)
+        _, replacement = _mock_module(ExplicitEventType)
+        session._meshcore = replacement
+        reply.set()
+        await asyncio.wait_for(pump, 2)
+        assert instance.commands.get_msg.await_count == 1
+        assert replacement.commands.get_msg.await_count == 0
     finally:
+        reply.set()
         await session.stop()
         remove_mock_module()
 
