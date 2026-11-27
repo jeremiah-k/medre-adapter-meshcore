@@ -1769,17 +1769,13 @@ class MeshCoreSession:
                 and self._diag.connected
                 and not self._stop_requested
             ):
+                detail = self._sanitize_ble_exc(exc)
                 self._logger.warning(
-                    "MeshCoreSession %s: receive pump failed (%s: %s); retiring connection",
+                    "MeshCoreSession %s: receive pump failed (%s); retiring connection",
                     self._adapter_id,
-                    type(exc).__name__,
-                    exc,
+                    detail,
                 )
-                # The diagnostics surface carries why the pump retired:
-                # a fetch or probe failure names the SDK's ERROR payload
-                # reason in its message, a transport exception names
-                # itself.
-                self._diag.last_error = self._sanitize_ble_exc(exc)
+                self._diag.last_error = detail
                 # The retirement is failure-driven (a fetch or probe
                 # failed): the next connection must prove the link
                 # answers before its first fetch.

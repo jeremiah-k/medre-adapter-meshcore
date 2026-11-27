@@ -524,3 +524,18 @@ async def test_local_probe_write_error_does_not_clear_reconnect_gate():
     with pytest.raises(RuntimeError, match="unanswered"):
         await session._probe_idle_link(session._meshcore)
     assert session._receive_failure_pending is True
+
+
+async def test_pump_retirement_redacts_ble_pin(caplog):
+    pin = "123456"
+
+    async def get_msg(*, timeout):
+        raise OSError(f"native failure with {pin}")
+
+    session = session_with_fetch(get_msg)
+    session._config = SimpleNamespace(ble_pin=pin)
+    await session._receive_pump(session._meshcore, session._fetch_wake)
+
+    assert "receive pump failed (OSError: [details redacted])" in caplog.text
+    assert pin not in caplog.text
+    assert session._diag.last_error == "OSError: [details redacted]"
